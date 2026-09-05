@@ -65,8 +65,15 @@ async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ServerError> {
-    let _ = req; // initial_xml wiring deferred — Phase 4 stub ignores it
     let id = state.sessions.write().await.create().await;
+    if let Some(xml) = req.initial_xml {
+        let _ = state
+            .sessions
+            .write()
+            .await
+            .append_version(&id, "initial", None, &xml)
+            .await;
+    }
     Ok((StatusCode::CREATED, Json(CreateSessionResponse { session_id: id })))
 }
 
@@ -152,17 +159,96 @@ fn truncate_summary(s: &str, max_chars: usize) -> String {
 async fn patch(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(_req): Json<PatchRequest>,
+    Json(req): Json<PatchRequest>,
 ) -> Result<Json<PatchResponse>, ServerError> {
     let session_id = crate::state::SessionId(id);
-    let store = state.sessions.read().await;
-    if !store.contains(&session_id).await {
-        return Err(ServerError::SessionNotFound(session_id.clone()));
+
+    // 1. Verify session exists.
+    {
+        let store = state.sessions.read().await;
+        if !store.contains(&session_id).await {
+            return Err(ServerError::SessionNotFound(session_id.clone()));
+        }
     }
-    drop(store);
-    Err(ServerError::Internal(
-        "patch endpoint not yet implemented".into(),
-    ))
+
+    // 2. Get current XML.
+    let current_xml = state
+        .sessions
+        .read()
+        .await
+        .current_xml(&session_id)
+        .await
+        .ok_or_else(|| {
+            ServerError::BadRequest(
+                "session has no current XML — call /generate first".into(),
+            )
+        })?;
+
+    // 3. Parse and grab the model mutably.
+    let mut file = drawio_agent_xml_core::MxFile::parse(current_xml.as_bytes())
+        .map_err(|e| ServerError::BadRequest(format!("parse current XML: {e}")))?;
+    let model = file
+        .diagrams
+        .first_mut()
+        .ok_or_else(|| ServerError::BadRequest("no diagram in current XML".into()))?
+        .model
+        .as_mut()
+        .ok_or_else(|| ServerError::BadRequest("no model in current XML".into()))?;
+
+    let cell_id_refs: Vec<&str> = req.cell_ids.iter().map(|s| s.as_str()).collect();
+    // (The subgraph itself isn't sent to the LLM in this stub; we send the
+    // full current XML so the LLM stub can respond with a coherent diagram.
+    // A future iteration can serialize the subgraph more compactly.)
+    let _subgraph = model.extract_subgraph(&cell_id_refs);
+
+    // 4. Call LLM.
+    let llm_req = drawio_agent_llm_client::GenerateRequest {
+        user_prompt: format!("Patch: {}", req.instruction),
+        current_xml: Some(current_xml.clone()),
+        scope: Some(current_xml.clone()),
+        feedback: None,
+        json_mode: req.json_mode,
+    };
+    let resp = state
+        .llm
+        .generate_xml(llm_req)
+        .await
+        .map_err(|e| ServerError::Llm(e.to_string()))?;
+
+    // 5. Parse LLM response and extract the same subgraph.
+    let patched = drawio_agent_xml_core::MxFile::parse(resp.content.as_bytes())
+        .map_err(|e| ServerError::Llm(format!("parse LLM response: {e}")))?;
+    let patched_subgraph = patched
+        .diagrams
+        .first()
+        .ok_or_else(|| ServerError::Llm("no diagram in LLM response".into()))?
+        .model
+        .as_ref()
+        .ok_or_else(|| ServerError::Llm("no model in LLM response".into()))?
+        .extract_subgraph(&cell_id_refs);
+
+    // 6. Apply patched subgraph to the original model.
+    model.apply_subgraph(&patched_subgraph);
+
+    // 7. Serialize the updated file.
+    let updated_xml = file
+        .to_xml()
+        .map_err(|e| ServerError::Internal(format!("serialize updated XML: {e}")))?;
+
+    // 8. Store new version.
+    let summary = truncate_summary(&req.instruction, 80);
+    let version_id = state
+        .sessions
+        .write()
+        .await
+        .append_version(&session_id, "patch", Some(summary), &updated_xml)
+        .await
+        .ok_or_else(|| ServerError::Internal("session vanished mid-flight".into()))?;
+
+    Ok(Json(PatchResponse {
+        xml: updated_xml,
+        version_id,
+    }))
 }
 
 async fn render(
