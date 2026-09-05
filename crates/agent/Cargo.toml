@@ -1,0 +1,22 @@
+[package]
+name = "drawio-agent-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Agent Loop state machine: Generate -> Render -> Review -> Patch, iterate until pass or max iterations"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+drawio-agent-xml-core = { path = "../xml-core" }
+drawio-agent-llm-client = { path = "../llm-client" }
+drawio-agent-renderer = { path = "../renderer" }
+drawio-agent-trajectory = { path = "../trajectory" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
