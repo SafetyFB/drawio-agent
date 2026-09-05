@@ -42,6 +42,82 @@ impl MxGraphModel {
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Cell> {
         find_in_mut(&mut self.root, id)
     }
+
+    /// Extract a subgraph containing the requested cells and the edges
+    /// that connect them. Cells adjacent to the selection via edges are
+    /// returned in `context` (read-only on apply).
+    ///
+    /// Requested ids not found in the model are reported in `missing`.
+    /// Duplicate ids are deduplicated.
+    pub fn extract_subgraph(&self, ids: &[&str]) -> Subgraph {
+        use std::collections::HashSet;
+
+        let mut primary: Vec<Cell> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
+        let mut primary_set: HashSet<String> = HashSet::new();
+
+        for id in ids {
+            if let Some(cell) = self.get(id) {
+                if primary_set.insert(cell.id.clone()) {
+                    primary.push(cell.clone());
+                }
+            } else {
+                missing.push((*id).to_string());
+            }
+        }
+
+        // Walk the model collecting every edge, then partition by relation
+        // to the primary set.
+        let mut all_edges: Vec<&Cell> = Vec::new();
+        collect_edges(&self.root, &mut all_edges);
+
+        let mut edges: Vec<Cell> = Vec::new();
+        let mut context: Vec<Cell> = Vec::new();
+        let mut context_set: HashSet<String> = HashSet::new();
+
+        for edge in &all_edges {
+            let src = edge.source.as_deref();
+            let tgt = edge.target.as_deref();
+
+            let src_in = src.map_or(false, |id| primary_set.contains(id));
+            let tgt_in = tgt.map_or(false, |id| primary_set.contains(id));
+
+            if !src_in && !tgt_in {
+                continue;
+            }
+
+            edges.push((*edge).clone());
+
+            // Pull the non-primary endpoint into context (deduplicated).
+            let other_id = if src_in { tgt } else { src };
+            if let Some(id) = other_id {
+                if !primary_set.contains(id) && context_set.insert(id.to_string()) {
+                    if let Some(cell) = self.get(id) {
+                        context.push(cell.clone());
+                    }
+                }
+            }
+        }
+
+        Subgraph {
+            primary,
+            edges,
+            context,
+            missing,
+        }
+    }
+}
+
+/// A scope extracted from a model for selection-based editing.
+///
+/// `primary` and `edges` are mutable on apply; `context` is read-only
+/// context for the LLM and must not be modified on apply.
+#[derive(Debug, Clone, Default)]
+pub struct Subgraph {
+    pub primary: Vec<Cell>,
+    pub edges: Vec<Cell>,
+    pub context: Vec<Cell>,
+    pub missing: Vec<String>,
 }
 
 fn find_in<'a>(cell: &'a Cell, id: &str) -> Option<&'a Cell> {
@@ -66,6 +142,15 @@ fn find_in_mut<'a>(cell: &'a mut Cell, id: &str) -> Option<&'a mut Cell> {
         }
     }
     None
+}
+
+fn collect_edges<'a>(cell: &'a Cell, out: &mut Vec<&'a Cell>) {
+    if cell.edge {
+        out.push(cell);
+    }
+    for child in &cell.children {
+        collect_edges(child, out);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
