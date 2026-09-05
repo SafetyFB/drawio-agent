@@ -47,6 +47,7 @@ pub struct AppState {
     pub llm: Arc<dyn LlmProvider>,
     pub renderer: Arc<dyn RenderDriver>,
     pub events: EventBus,
+    pub trajectory: drawio_agent_trajectory::TrajectoryStore,
 }
 
 impl std::fmt::Debug for AppState {
@@ -64,6 +65,7 @@ impl AppState {
             llm,
             renderer: Arc::new(MockDriver::new()),
             events: EventBus::new(),
+            trajectory: drawio_agent_trajectory::TrajectoryStore::new(),
         }
     }
 }

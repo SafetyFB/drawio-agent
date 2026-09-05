@@ -53,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/render", post(render))
         .route("/api/sessions/:id/review", post(review))
         .route("/api/sessions/:id/events", get(events))
+        .route("/api/sessions/:id/trajectory", get(get_trajectory))
         .with_state(Arc::new(state))
 }
 
@@ -116,6 +117,8 @@ async fn generate(
     Path(id): Path<String>,
     Json(req): Json<GenerateRequest>,
 ) -> Result<Json<GenerateResponse>, ServerError> {
+    use std::time::Instant;
+
     let session_id = crate::state::SessionId(id);
     {
         let store = state.sessions.read().await;
@@ -130,9 +133,33 @@ async fn generate(
         feedback: None,
         json_mode: req.json_mode,
     };
+
+    // Trajectory: log LlmCallStarted before dispatch.
+    state
+        .trajectory
+        .record(
+            &session_id.0,
+            drawio_agent_trajectory::TrajectoryEvent::LlmCallStarted {
+                prompt_chars: req.prompt.chars().count(),
+                json_mode: req.json_mode,
+            },
+        )
+        .await;
+    let llm_started = Instant::now();
+
     let resp = match state.llm.generate_xml(llm_req).await {
         Ok(r) => r,
         Err(e) => {
+            state
+                .trajectory
+                .record(
+                    &session_id.0,
+                    drawio_agent_trajectory::TrajectoryEvent::Error {
+                        stage: "generate".into(),
+                        message: e.to_string(),
+                    },
+                )
+                .await;
             state
                 .events
                 .emit(
@@ -146,6 +173,21 @@ async fn generate(
             return Err(ServerError::Llm(e.to_string()));
         }
     };
+
+    // Trajectory: log LlmCallCompleted.
+    state
+        .trajectory
+        .record(
+            &session_id.0,
+            drawio_agent_trajectory::TrajectoryEvent::LlmCallCompleted {
+                input_tokens: resp.usage.input_tokens,
+                output_tokens: resp.usage.output_tokens,
+                duration_ms: llm_started.elapsed().as_millis() as u64,
+                finish_reason: None,
+            },
+        )
+        .await;
+
     let summary = truncate_summary(&req.prompt, 80);
     let version_id = state
         .sessions
@@ -237,11 +279,48 @@ async fn patch(
         feedback: None,
         json_mode: req.json_mode,
     };
-    let resp = state
-        .llm
-        .generate_xml(llm_req)
-        .await
-        .map_err(|e| ServerError::Llm(e.to_string()))?;
+
+    // Trajectory: log LlmCallStarted before dispatch.
+    state
+        .trajectory
+        .record(
+            &session_id.0,
+            drawio_agent_trajectory::TrajectoryEvent::LlmCallStarted {
+                prompt_chars: req.instruction.chars().count(),
+                json_mode: req.json_mode,
+            },
+        )
+        .await;
+    let llm_started = std::time::Instant::now();
+
+    let resp = match state.llm.generate_xml(llm_req).await {
+        Ok(r) => r,
+        Err(e) => {
+            state
+                .trajectory
+                .record(
+                    &session_id.0,
+                    drawio_agent_trajectory::TrajectoryEvent::Error {
+                        stage: "patch".into(),
+                        message: e.to_string(),
+                    },
+                )
+                .await;
+            return Err(ServerError::Llm(e.to_string()));
+        }
+    };
+    state
+        .trajectory
+        .record(
+            &session_id.0,
+            drawio_agent_trajectory::TrajectoryEvent::LlmCallCompleted {
+                input_tokens: resp.usage.input_tokens,
+                output_tokens: resp.usage.output_tokens,
+                duration_ms: llm_started.elapsed().as_millis() as u64,
+                finish_reason: None,
+            },
+        )
+        .await;
 
     // 5. Parse LLM response and extract the same subgraph.
     let patched = drawio_agent_xml_core::MxFile::parse(resp.content.as_bytes())
@@ -318,11 +397,44 @@ async fn render(
         })?;
 
     let opts = drawio_agent_renderer::RenderOptions::default();
-    let png = state
-        .renderer
-        .render(&xml, &opts)
-        .await
-        .map_err(|e| ServerError::Render(e.to_string()))?;
+
+    // Trajectory: log RenderStarted.
+    state
+        .trajectory
+        .record(
+            &session_id.0,
+            drawio_agent_trajectory::TrajectoryEvent::RenderStarted { scale: opts.scale },
+        )
+        .await;
+    let render_started = std::time::Instant::now();
+
+    let png = match state.renderer.render(&xml, &opts).await {
+        Ok(p) => p,
+        Err(e) => {
+            state
+                .trajectory
+                .record(
+                    &session_id.0,
+                    drawio_agent_trajectory::TrajectoryEvent::Error {
+                        stage: "render".into(),
+                        message: e.to_string(),
+                    },
+                )
+                .await;
+            return Err(ServerError::Render(e.to_string()));
+        }
+    };
+    state
+        .trajectory
+        .record(
+            &session_id.0,
+            drawio_agent_trajectory::TrajectoryEvent::RenderCompleted {
+                bytes: png.len(),
+                duration_ms: render_started.elapsed().as_millis() as u64,
+            },
+        )
+        .await;
+
     let len = png.len();
     let body = RenderResponse {
         png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
@@ -379,11 +491,46 @@ async fn review(
                     },
                 )
                 .await;
+            state
+                .trajectory
+                .record(
+                    &session_id.0,
+                    drawio_agent_trajectory::TrajectoryEvent::Error {
+                        stage: "render".into(),
+                        message: e.to_string(),
+                    },
+                )
+                .await;
             return Err(ServerError::Render(e.to_string()));
         }
     };
 
+    // Trajectory: log the render.
+    state
+        .trajectory
+        .record(
+            &session_id.0,
+            drawio_agent_trajectory::TrajectoryEvent::RenderCompleted {
+                bytes: png.len(),
+                duration_ms: 0, // review path is best-effort; not timed in this stub
+            },
+        )
+        .await;
+
     // 4. Call LLM for visual review (502 on failure; emit Error event).
+    // Trajectory record goes FIRST so we can borrow req.checks before
+    // moving it into the LLM request.
+    state
+        .trajectory
+        .record(
+            &session_id.0,
+            drawio_agent_trajectory::TrajectoryEvent::LlmCallStarted {
+                prompt_chars: req.checks.iter().map(|s| s.len()).sum(),
+                json_mode: false,
+            },
+        )
+        .await;
+    let review_started = std::time::Instant::now();
     let llm_req = drawio_agent_llm_client::ReviewRequest {
         image_png: png,
         xml: xml.clone(),
@@ -402,9 +549,31 @@ async fn review(
                     },
                 )
                 .await;
+            state
+                .trajectory
+                .record(
+                    &session_id.0,
+                    drawio_agent_trajectory::TrajectoryEvent::Error {
+                        stage: "review".into(),
+                        message: e.to_string(),
+                    },
+                )
+                .await;
             return Err(ServerError::Llm(e.to_string()));
         }
     };
+    state
+        .trajectory
+        .record(
+            &session_id.0,
+            drawio_agent_trajectory::TrajectoryEvent::LlmCallCompleted {
+                input_tokens: resp.usage.input_tokens,
+                output_tokens: resp.usage.output_tokens,
+                duration_ms: review_started.elapsed().as_millis() as u64,
+                finish_reason: None,
+            },
+        )
+        .await;
 
     // 5. Return the parsed ReviewResponse directly.
     Ok(Json(resp.content).into_response())
@@ -449,4 +618,20 @@ async fn events(
             }
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/sessions/:id/trajectory
+// ---------------------------------------------------------------------------
+
+async fn get_trajectory(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<drawio_agent_trajectory::Event>>, ServerError> {
+    let session_id = crate::state::SessionId(id);
+    if !state.sessions.read().await.contains(&session_id).await {
+        return Err(ServerError::SessionNotFound(session_id));
+    }
+    let events = state.trajectory.list(&session_id.0).await;
+    Ok(Json(events))
 }

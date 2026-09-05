@@ -1,8 +1,5 @@
-//! TDD #6: WebSocket event stream + EventBus broadcast semantics.
-//!
-//! Phase 4 server emits `VersionCreated` / `Error` events on action
-//! completion. Subscribers (e.g. the WebSocket handler) see them in
-//! arrival order, isolated per session.
+//! TDD #3: server integration — action handlers record to trajectory,
+//! and GET /api/sessions/:id/trajectory returns them.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -16,12 +13,11 @@ use drawio_agent_llm_client::{
 };
 use drawio_agent_renderer::{MockDriver, RenderDriver};
 use drawio_agent_server::{
-    state::WsEvent, AppState, CreateSessionRequest, GenerateRequest as GenReq,
-    PatchRequest as PatchReq, ReviewRequest as RevReq, SessionId,
+    AppState, CreateSessionRequest, GenerateRequest as GenReq, PatchRequest as PatchReq,
+    ReviewRequest as RevReq,
 };
-use serde_json::Value;
+use drawio_agent_trajectory::{Event, TrajectoryEvent, TrajectoryEventKind};
 use tower::ServiceExt;
-use uuid::Uuid;
 
 const FULL_XML: &str = r#"<mxfile host="app.diagrams.net">
   <diagram id="d" name="Page-1">
@@ -76,8 +72,11 @@ impl LlmProvider for TestLlm {
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| "<mxfile/>".to_string()),
-            usage: Usage::default(),
-            raw: Value::Null,
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+            },
+            raw: serde_json::Value::Null,
             duration_ms: 0,
         })
     }
@@ -100,7 +99,7 @@ impl LlmProvider for TestLlm {
                 issues: vec![],
             },
             usage: Usage::default(),
-            raw: Value::Null,
+            raw: serde_json::Value::Null,
             duration_ms: 0,
         })
     }
@@ -147,201 +146,109 @@ async fn create_session_with_xml(app: axum::Router, xml: &str) -> String {
     parsed.session_id.as_str().to_string()
 }
 
-async fn create_empty_session(app: axum::Router) -> String {
+async fn fetch_trajectory(app: axum::Router, sid: &str) -> (StatusCode, Vec<Event>) {
     let resp = app
         .oneshot(
             Request::builder()
-                .method("POST")
-                .uri("/api/sessions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&CreateSessionRequest::default()).unwrap(),
-                ))
+                .uri(format!("/api/sessions/{sid}/trajectory"))
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body = axum::body::to_bytes(resp.into_body(), 4096)
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), 65536)
         .await
         .unwrap();
-    let parsed: drawio_agent_server::CreateSessionResponse = serde_json::from_slice(&body).unwrap();
-    parsed.session_id.as_str().to_string()
+    let events: Vec<Event> = serde_json::from_slice(&body).unwrap_or_default();
+    (status, events)
 }
 
 // ---------------------------------------------------------------------------
-// EventBus unit-level tests (no HTTP)
+// New endpoint
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn eventbus_subscribed_receives_emitted_event() {
-    use drawio_agent_server::EventBus;
-
-    let bus = EventBus::new();
-    let sid = SessionId::new();
-    let mut rx = bus.subscribe(&sid).await.expect("subscribed");
-
-    let event = WsEvent::Error {
-        session_id: sid.clone(),
-        message: "boom".into(),
-    };
-    bus.emit(&sid, event.clone()).await;
-
-    let received = rx.recv().await.unwrap();
-    match received {
-        WsEvent::Error { message, .. } => assert_eq!(message, "boom"),
-        other => panic!("expected Error, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn eventbus_multiple_subscribers_all_receive_broadcast() {
-    use drawio_agent_server::EventBus;
-
-    let bus = EventBus::new();
-    let sid = SessionId::new();
-    let mut rx1 = bus.subscribe(&sid).await.unwrap();
-    let mut rx2 = bus.subscribe(&sid).await.unwrap();
-    let mut rx3 = bus.subscribe(&sid).await.unwrap();
-
-    let event = WsEvent::Error {
-        session_id: sid.clone(),
-        message: "broadcast".into(),
-    };
-    bus.emit(&sid, event).await;
-
-    for rx in [&mut rx1, &mut rx2, &mut rx3] {
-        let got = rx.recv().await.unwrap();
-        match got {
-            WsEvent::Error { message, .. } => assert_eq!(message, "broadcast"),
-            _ => panic!("wrong variant"),
-        }
-    }
-}
-
-#[tokio::test]
-async fn eventbus_events_isolated_between_sessions() {
-    use drawio_agent_server::EventBus;
-
-    let bus = EventBus::new();
-    let sid_a = SessionId::new();
-    let sid_b = SessionId::new();
-    let mut rx_a = bus.subscribe(&sid_a).await.unwrap();
-    let mut rx_b = bus.subscribe(&sid_b).await.unwrap();
-
-    bus.emit(
-        &sid_a,
-        WsEvent::Error {
-            session_id: sid_a.clone(),
-            message: "only_a".into(),
-        },
-    )
-    .await;
-
-    // rx_a gets the event; rx_b does not (within a short timeout).
-    let got_a = tokio::time::timeout(std::time::Duration::from_millis(50), rx_a.recv())
-        .await
-        .expect("rx_a timed out")
-        .expect("rx_a recv error");
-    match got_a {
-        WsEvent::Error { message, .. } => assert_eq!(message, "only_a"),
-        _ => panic!("wrong variant"),
-    }
-
-    let got_b = tokio::time::timeout(std::time::Duration::from_millis(50), rx_b.recv())
-        .await;
-    assert!(
-        got_b.is_err(),
-        "rx_b should NOT receive session_a's event, got {got_b:?}"
-    );
-}
-
-#[tokio::test]
-async fn eventbus_emit_on_unknown_session_lazily_creates_channel() {
-    use drawio_agent_server::EventBus;
-
-    let bus = EventBus::new();
-    let sid = SessionId::new();
-
-    // Emit before anyone subscribes — channel is created lazily.
-    bus.emit(
-        &sid,
-        WsEvent::Error {
-            session_id: sid.clone(),
-            message: "orphan".into(),
-        },
-    )
-    .await;
-
-    // A late subscriber now sees the orphan event in its lagged queue.
-    let mut rx = bus.subscribe(&sid).await.unwrap();
-    let got = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
-    // First recv on a fresh subscription: should yield a Lagged (we missed
-    // events while not subscribed) and then Closed when the sender is dropped
-    // — OR yield the buffered event depending on capacity. We just verify
-    // the subscribe path didn't panic.
-    let _ = got;
-}
-
-// ---------------------------------------------------------------------------
-// Integration tests: action handlers emit events
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn generate_emits_version_created_after_success() {
+async fn trajectory_endpoint_returns_404_for_unknown_session() {
     let llm = Arc::new(TestLlm::new());
-    let state = state_with(llm.clone(), Arc::new(MockDriver::new()));
-    let mut rx = state
-        .events
-        .subscribe(&SessionId::new()) // placeholder; will subscribe to real one below
-        .await;
-    let _ = rx; // discard
-
-    // Real flow: create session, subscribe, generate, expect event.
-    let app = router(state.clone());
-    let sid = create_session_with_xml(app.clone(), FULL_XML).await;
-
-    let session_id = SessionId(sid.clone());
-    let mut rx = state.events.subscribe(&session_id).await.unwrap();
-
-    app.clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/sessions/{sid}/generate"))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&GenReq {
-                        prompt: "x".into(),
-                        json_mode: false,
-                    })
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-        .await
-        .expect("event timed out")
-        .expect("recv error");
-    match event {
-        WsEvent::VersionCreated { kind, .. } => assert_eq!(kind, "generate"),
-        other => panic!("expected VersionCreated, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn generate_emits_error_on_llm_failure() {
-    let llm = Arc::new(TestLlm::new());
-    llm.set_failure("vlm is down");
     let state = state_with(llm, Arc::new(MockDriver::new()));
-    let app = router(state.clone());
+    let app = router(state);
+    let (status, _) = fetch_trajectory(app, "no-such").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
 
+#[tokio::test]
+async fn trajectory_endpoint_returns_empty_array_for_fresh_session() {
+    let llm = Arc::new(TestLlm::new());
+    let state = state_with(llm, Arc::new(MockDriver::new()));
+    let app = router(state);
     let sid = create_session_with_xml(app.clone(), FULL_XML).await;
-    let session_id = SessionId(sid.clone());
-    let mut rx = state.events.subscribe(&session_id).await.unwrap();
+
+    let (status, events) = fetch_trajectory(app, &sid).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(events.is_empty(), "no actions yet → no events");
+}
+
+// ---------------------------------------------------------------------------
+// Generate handler recording
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn generate_records_llm_started_and_completed() {
+    let llm = Arc::new(TestLlm::new());
+    let state = state_with(llm, Arc::new(MockDriver::new()));
+    let app = router(state);
+    let sid = create_session_with_xml(app.clone(), FULL_XML).await;
+
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid}/generate"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&GenReq {
+                        prompt: "draw a box".into(),
+                        json_mode: true,
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, events) = fetch_trajectory(app, &sid).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(events.len(), 2, "expected Started + Completed, got {events:?}");
+
+    match &events[0].kind {
+        TrajectoryEvent::LlmCallStarted { prompt_chars, json_mode } => {
+            assert_eq!(*prompt_chars, "draw a box".chars().count());
+            assert!(*json_mode);
+        }
+        other => panic!("expected LlmCallStarted, got {other:?}"),
+    }
+    match &events[1].kind {
+        TrajectoryEvent::LlmCallCompleted {
+            input_tokens,
+            output_tokens,
+            ..
+        } => {
+            assert_eq!(*input_tokens, 100);
+            assert_eq!(*output_tokens, 50);
+        }
+        other => panic!("expected LlmCallCompleted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn generate_records_error_event_on_llm_failure() {
+    let llm = Arc::new(TestLlm::new());
+    llm.set_failure("upstream gone");
+    let state = state_with(llm, Arc::new(MockDriver::new()));
+    let app = router(state);
+    let sid = create_session_with_xml(app.clone(), FULL_XML).await;
 
     app.clone()
         .oneshot(
@@ -361,28 +268,27 @@ async fn generate_emits_error_on_llm_failure() {
         .await
         .unwrap();
 
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-        .await
-        .expect("error event timed out")
-        .expect("recv error");
-    match event {
-        WsEvent::Error { message, .. } => assert!(
-            message.contains("vlm is down"),
-            "error msg: {message}"
-        ),
+    let (_, events) = fetch_trajectory(app, &sid).await;
+    assert_eq!(events.len(), 2);
+    match &events[1].kind {
+        TrajectoryEvent::Error { stage, message } => {
+            assert_eq!(stage, "generate");
+            assert!(message.contains("upstream gone"), "got: {message}");
+        }
         other => panic!("expected Error, got {other:?}"),
     }
 }
 
-#[tokio::test]
-async fn patch_emits_version_created_after_success() {
-    let llm = Arc::new(TestLlm::new());
-    let state = state_with(llm.clone(), Arc::new(MockDriver::new()));
-    let app = router(state.clone());
+// ---------------------------------------------------------------------------
+// Patch handler recording
+// ---------------------------------------------------------------------------
 
+#[tokio::test]
+async fn patch_records_llm_started_and_completed() {
+    let llm = Arc::new(TestLlm::new());
+    let state = state_with(llm, Arc::new(MockDriver::new()));
+    let app = router(state);
     let sid = create_session_with_xml(app.clone(), FULL_XML).await;
-    let session_id = SessionId(sid.clone());
-    let mut rx = state.events.subscribe(&session_id).await.unwrap();
 
     app.clone()
         .oneshot(
@@ -393,7 +299,7 @@ async fn patch_emits_version_created_after_success() {
                 .body(Body::from(
                     serde_json::to_vec(&PatchReq {
                         cell_ids: vec!["2".into()],
-                        instruction: "x".into(),
+                        instruction: "recolor".into(),
                         json_mode: false,
                     })
                     .unwrap(),
@@ -403,27 +309,86 @@ async fn patch_emits_version_created_after_success() {
         .await
         .unwrap();
 
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+    let (_, events) = fetch_trajectory(app, &sid).await;
+    assert_eq!(events.len(), 2, "patch → Started + Completed");
+    assert!(matches!(events[0].kind, TrajectoryEvent::LlmCallStarted { .. }));
+    assert!(matches!(events[1].kind, TrajectoryEvent::LlmCallCompleted { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// Render handler recording
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn render_records_render_started_and_completed() {
+    let llm = Arc::new(TestLlm::new());
+    let state = state_with(llm, Arc::new(MockDriver::new()));
+    let app = router(state);
+    let sid = create_session_with_xml(app.clone(), FULL_XML).await;
+
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid}/render"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
-        .expect("event timed out")
-        .expect("recv error");
-    match event {
-        WsEvent::VersionCreated { kind, .. } => assert_eq!(kind, "patch"),
-        other => panic!("expected VersionCreated, got {other:?}"),
+        .unwrap();
+
+    let (_, events) = fetch_trajectory(app, &sid).await;
+    assert_eq!(events.len(), 2, "render → Started + Completed");
+    assert!(matches!(events[0].kind, TrajectoryEvent::RenderStarted { .. }));
+    match &events[1].kind {
+        TrajectoryEvent::RenderCompleted { bytes, .. } => {
+            assert!(*bytes > 0);
+        }
+        other => panic!("expected RenderCompleted, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn review_emits_error_on_renderer_failure() {
+async fn render_records_error_on_renderer_failure() {
     let llm = Arc::new(TestLlm::new());
     let failing_renderer: Arc<dyn RenderDriver> =
-        Arc::new(MockDriver::new().with_error("chrome not found".to_string()));
+        Arc::new(MockDriver::new().with_error("chrome missing".to_string()));
     let state = state_with(llm, failing_renderer);
-    let app = router(state.clone());
-
+    let app = router(state);
     let sid = create_session_with_xml(app.clone(), FULL_XML).await;
-    let session_id = SessionId(sid.clone());
-    let mut rx = state.events.subscribe(&session_id).await.unwrap();
+
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid}/render"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (_, events) = fetch_trajectory(app, &sid).await;
+    assert_eq!(events.len(), 2, "Started + Error");
+    match &events[1].kind {
+        TrajectoryEvent::Error { stage, message } => {
+            assert_eq!(stage, "render");
+            assert!(message.contains("chrome missing"), "got: {message}");
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Review handler recording
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn review_records_llm_started_and_completed() {
+    let llm = Arc::new(TestLlm::new());
+    let state = state_with(llm, Arc::new(MockDriver::new()));
+    let app = router(state);
+    let sid = create_session_with_xml(app.clone(), FULL_XML).await;
 
     app.clone()
         .oneshot(
@@ -434,7 +399,7 @@ async fn review_emits_error_on_renderer_failure() {
                 .body(Body::from(
                     serde_json::to_vec(&RevReq {
                         xml: None,
-                        checks: vec![],
+                        checks: vec!["overlap".into(), "text_overflow".into()],
                     })
                     .unwrap(),
                 ))
@@ -443,31 +408,26 @@ async fn review_emits_error_on_renderer_failure() {
         .await
         .unwrap();
 
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-        .await
-        .expect("event timed out")
-        .expect("recv error");
-    match event {
-        WsEvent::Error { message, .. } => {
-            assert!(
-                message.contains("chrome not found"),
-                "got: {message}"
-            );
-        }
-        other => panic!("expected Error, got {other:?}"),
-    }
+    let (_, events) = fetch_trajectory(app, &sid).await;
+    let kinds: Vec<TrajectoryEventKind> = events.iter().map(|e| e.kind.kind()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            TrajectoryEventKind::RenderCompleted,
+            TrajectoryEventKind::LlmCallStarted,
+            TrajectoryEventKind::LlmCallCompleted,
+        ],
+        "got {kinds:?}"
+    );
 }
 
 #[tokio::test]
-async fn review_emits_error_on_llm_failure() {
+async fn review_records_error_on_llm_failure() {
     let llm = Arc::new(TestLlm::new());
-    llm.set_failure("vlm down");
+    llm.set_failure("vlm offline");
     let state = state_with(llm, Arc::new(MockDriver::new()));
-    let app = router(state.clone());
-
+    let app = router(state);
     let sid = create_session_with_xml(app.clone(), FULL_XML).await;
-    let session_id = SessionId(sid.clone());
-    let mut rx = state.events.subscribe(&session_id).await.unwrap();
 
     app.clone()
         .oneshot(
@@ -487,18 +447,15 @@ async fn review_emits_error_on_llm_failure() {
         .await
         .unwrap();
 
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-        .await
-        .expect("event timed out")
-        .expect("recv error");
-    match event {
-        WsEvent::Error { message, .. } => {
-            assert!(message.contains("vlm down"), "got: {message}");
-        }
-        other => panic!("expected Error, got {other:?}"),
-    }
+    let (_, events) = fetch_trajectory(app, &sid).await;
+    let kinds: Vec<TrajectoryEventKind> = events.iter().map(|e| e.kind.kind()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            TrajectoryEventKind::RenderCompleted,
+            TrajectoryEventKind::LlmCallStarted,
+            TrajectoryEventKind::Error,
+        ],
+        "got {kinds:?}"
+    );
 }
-
-// Suppress unused-warning on `Uuid` import (kept for clarity).
-#[allow(dead_code)]
-fn _phantom(_u: Uuid) {}

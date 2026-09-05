@@ -20,6 +20,7 @@ base64 = { workspace = true }
 drawio-agent-xml-core = { path = "../xml-core" }
 drawio-agent-llm-client = { path = "../llm-client" }
 drawio-agent-renderer = { path = "../renderer" }
+drawio-agent-trajectory = { path = "../trajectory" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
