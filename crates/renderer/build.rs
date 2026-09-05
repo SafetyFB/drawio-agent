@@ -13,11 +13,62 @@
 
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::Digest;
+
+/// Maximum total time we'll spend on a single download.
+const DOWNLOAD_OVERALL_TIMEOUT: Duration = Duration::from_secs(1800); // 30 min
+/// Log progress every N bytes or every N seconds, whichever comes first.
+const PROGRESS_LOG_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Stream-copy from `reader` to `writer` in 64KB chunks, logging progress to
+/// cargo's warning stream and enforcing an overall wall-clock timeout.
+///
+/// Replaces the naive `io::copy` (which would silently die on ureq's
+/// per-read timeout during slow CDN responses — see Phase 13 wrap-up).
+fn download_with_progress<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    label: &str,
+) -> io::Result<()> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    let start = Instant::now();
+    let mut last_log = Instant::now();
+    let mut next_log_threshold: u64 = PROGRESS_LOG_BYTES;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        total += n as u64;
+        let elapsed = start.elapsed();
+        if elapsed > DOWNLOAD_OVERALL_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{label}: overall timeout after {total} bytes ({:.1}s elapsed)",
+                    elapsed.as_secs_f64()
+                ),
+            ));
+        }
+        if total >= next_log_threshold || last_log.elapsed() > PROGRESS_LOG_INTERVAL {
+            eprintln!(
+                "cargo:warning={label}: {} MB downloaded in {:.1}s",
+                total / (1024 * 1024),
+                elapsed.as_secs_f64(),
+            );
+            last_log = Instant::now();
+            next_log_threshold = total.saturating_add(PROGRESS_LOG_BYTES);
+        }
+    }
+    Ok(())
+}
 
 #[path = "src/checksum.rs"]
 mod checksum;
@@ -123,10 +174,12 @@ fn ensure_bundled() -> Result<Option<PathBuf>, String> {
 
     let zip_path = tmp_dir.join("headless-shell.zip");
 
-    // HEAD probe first to fail fast with a clear message.
+    // HEAD probe first to fail fast with a clear message. Per-read timeout
+    // is set very high so slow CDN responses don't trip ureq before our
+    // own overall timeout fires (see `download_with_progress`).
     let client = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(600))
-        .timeout_read(Duration::from_secs(300))
+        .timeout(Duration::from_secs(3600))
+        .timeout_read(Duration::from_secs(3600))
         .build();
     let head_resp = client.head(&url).call();
     if let Err(e) = head_resp {
@@ -140,7 +193,8 @@ fn ensure_bundled() -> Result<Option<PathBuf>, String> {
         .call()
         .map_err(|e| format!("GET {url}: {e}"))?;
     let mut zip_file = File::create(&zip_path).map_err(|e| format!("create zip: {e}"))?;
-    io::copy(&mut resp.into_reader(), &mut zip_file).map_err(|e| format!("download: {e}"))?;
+    download_with_progress(&mut resp.into_reader(), &mut zip_file, "chrome-headless-shell")
+        .map_err(|e| format!("download: {e}"))?;
     drop(zip_file);
 
     // 4. Extract. The zip's top-level folder is

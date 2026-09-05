@@ -9,7 +9,7 @@ use std::env;
 /// Hardcoded expected hashes. Empty string = "no pin yet" (escape hatch).
 pub const CHECKSUMS: &[(&str, &str)] = &[
     ("mac-x64", "b01ce7b6b2d0a1e343ac2f9f71c948c6735462420478ff8c87f479b23b4d980d"),
-    ("mac-arm64", "0000000000000000000000000000000000000000000000000000000000000000"),
+    ("mac-arm64", "1671bf74f9d78a4b3a4f1c1d3f33fb5ed30220535656a7db07a845389322f8dd"),
     ("linux64", "64887dbeca3bc2230fa0ec57d20b0a4f2eb9ce039a432a3814270588a3ebc562"),
     ("win64", "639c00793220b678cd010a35276627cd00c998f849c740452451ef419bb32a1a"),
 ];
