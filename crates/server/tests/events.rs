@@ -757,3 +757,52 @@ async fn trajectory_event_serializes_as_json_with_kind_tag() {
     assert!(json["event"].is_object(), "got {json}");
     assert_eq!(json["event"]["kind"], "llm_call_started");
 }
+
+#[tokio::test]
+async fn trajectory_event_carries_seq_and_at_ms_for_client_ordering() {
+    // The Trajectory WS payload must include `seq` (monotonic) and
+    // `at_ms` (Unix epoch milliseconds) so clients can order events
+    // deterministically — especially after reconnect, where arrival
+    // order is unreliable.
+    let event = WsEvent::Trajectory(Box::new(drawio_agent_trajectory::Event {
+        id: uuid::Uuid::nil(),
+        seq: 42,
+        at: std::time::SystemTime::UNIX_EPOCH,
+        session_id: "abc".into(),
+        kind: drawio_agent_trajectory::TrajectoryEvent::LlmCallStarted {
+            prompt_chars: 7,
+            json_mode: false,
+        },
+    }));
+
+    let json = serde_json::to_value(&event).expect("serialize");
+    assert_eq!(json["seq"], 42, "seq field missing or wrong: {json}");
+    assert_eq!(json["at_ms"], 0, "at_ms for UNIX_EPOCH should be 0: {json}");
+}
+
+#[tokio::test]
+async fn trajectory_event_at_ms_advances_with_system_time() {
+    // at_ms should reflect the SystemTime at which the event was recorded
+    // (NOT just always 0). Use a recent timestamp to verify.
+    let now = std::time::SystemTime::now();
+    let now_ms = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let event = WsEvent::Trajectory(Box::new(drawio_agent_trajectory::Event {
+        id: uuid::Uuid::nil(),
+        seq: 1,
+        at: now,
+        session_id: "abc".into(),
+        kind: drawio_agent_trajectory::TrajectoryEvent::RenderStarted { scale: 1.0 },
+    }));
+
+    let json = serde_json::to_value(&event).expect("serialize");
+    let at = json["at_ms"].as_i64().expect("at_ms should be i64");
+    // Within 1s tolerance for test runtime.
+    assert!(
+        (at - now_ms).abs() < 1000,
+        "at_ms {at} not within 1s of expected {now_ms}"
+    );
+}

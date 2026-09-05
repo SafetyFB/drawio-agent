@@ -39,8 +39,13 @@
   function updateInputs(id) { inputs.forEach(i => { if (i) i.value = id; }); }
 
   function signature(event) {
-    try { return `${event.kind}|${JSON.stringify(event)}`; }
-    catch { return `${event.kind}|${String(event)}`; }
+    // `seq` is monotonic per-session (set by the trajectory store on the
+    // server). Two events with the same seq are the same event — never
+    // re-add. Fall back to kind+payload if seq is missing (synthetic
+    // version_created / error events synthesised by this client).
+    if (event.seq != null) return `seq:${event.seq}`;
+    try { return `synthetic:${event.kind}|${JSON.stringify(event)}`; }
+    catch { return `synthetic:${event.kind}|${String(event)}`; }
   }
 
   function summarize(kind, payload) {
@@ -75,19 +80,25 @@
   function createEventNode(event) {
     const kind = event.kind || 'Unknown';
     const payload = { ...event };
-    ['kind','id','seq','at','session_id'].forEach(k => delete payload[k]);
+    // Strip envelope metadata before pretty-printing the payload.
+    ['kind','id','seq','at','at_ms','session_id'].forEach(k => delete payload[k]);
 
     const node = document.createElement('article');
     node.className = 'event';
     node.style.setProperty('--event-color', EVENT_COLORS[kind] || '#9aa0a6');
 
-    const at = event.at || new Date().toISOString();
+    // Prefer at_ms (number) from the WS payload; fall back to REST's `at`
+    // (whatever shape SystemTime serialises to); else now.
+    let atIso;
+    if (event.at_ms != null) atIso = new Date(event.at_ms).toISOString();
+    else if (event.at) atIso = new Date(event.at).toISOString();
+    else atIso = new Date().toISOString();
     const row = document.createElement('div');
     row.className = 'event-row';
     row.tabIndex = 0;
     row.setAttribute('role', 'button');
     row.setAttribute('aria-expanded', 'false');
-    row.innerHTML = `<time class="event-time" datetime="${at}" title="${new Date(at).toLocaleString()}">${formatRelative(at)}</time><span class="event-chip">${kind}</span><span class="event-summary">${summarize(kind, event)}</span>`;
+    row.innerHTML = `<time class="event-time" datetime="${atIso}" title="${new Date(atIso).toLocaleString()}">${formatRelative(atIso)}</time><span class="event-chip">${kind}</span><span class="event-summary">${summarize(kind, event)}</span>`;
 
     const detail = document.createElement('div');
     detail.className = 'event-detail';
@@ -104,7 +115,9 @@
 
   function render() {
     timeline.innerHTML = '';
-    [...events].sort((a, b) => new Date(b.at || 0) - new Date(a.at || 0)).forEach(e => timeline.appendChild(createEventNode(e)));
+    // Sort by `seq` descending — deterministic regardless of arrival order
+    // (REST history + WS live stream can interleave during reconnect).
+    [...events].sort((a, b) => (b.seq ?? -1) - (a.seq ?? -1)).forEach(e => timeline.appendChild(createEventNode(e)));
   }
 
   function addEvent(event) {
@@ -169,11 +182,13 @@
         const msg = JSON.parse(event.data);
         if (!msg || typeof msg !== 'object') return;
         if (msg.type === 'trajectory' && msg.event && typeof msg.event === 'object') {
-          addEvent(msg.event);
+          // Flatten seq/at_ms from the envelope into the event record so the
+          // dedup signature and timeline ordering have them in one place.
+          addEvent({ ...msg.event, seq: msg.seq, at_ms: msg.at_ms });
         } else if (msg.type === 'version_created') {
-          addEvent({ kind: 'StateTransition', from: null, to: `version ${msg.version_id}`, at: new Date().toISOString() });
+          addEvent({ kind: 'StateTransition', from: null, to: `version ${msg.version_id}`, seq: null, at_ms: Date.now() });
         } else if (msg.type === 'error') {
-          addEvent({ kind: 'Error', stage: 'server', message: msg.message || 'unknown error', at: new Date().toISOString() });
+          addEvent({ kind: 'Error', stage: 'server', message: msg.message || 'unknown error', seq: null, at_ms: Date.now() });
         }
       } catch (err) { console.warn('malformed WS message:', err); }
     });

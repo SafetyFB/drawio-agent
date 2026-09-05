@@ -41,6 +41,15 @@ fn now_iso() -> String {
     format!("1970-01-01T00:00:00Z+{secs}s")
 }
 
+/// Convert a `SystemTime` to milliseconds since the Unix epoch (i64).
+/// Pre-epoch times coerce to 0 so the wire format stays a JSON number.
+fn system_time_ms(t: &std::time::SystemTime) -> i64 {
+    use std::time::UNIX_EPOCH;
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Metadata returned by `GET /api/sessions/:id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -128,8 +137,10 @@ impl Serialize for WsEvent {
                 s.end()
             }
             WsEvent::Trajectory(event) => {
-                let mut s = serializer.serialize_struct("WsEvent", 2)?;
+                let mut s = serializer.serialize_struct("WsEvent", 4)?;
                 s.serialize_field("type", "trajectory")?;
+                s.serialize_field("seq", &event.seq)?;
+                s.serialize_field("at_ms", &system_time_ms(&event.at))?;
                 s.serialize_field("event", &event.kind)?;
                 s.end()
             }
