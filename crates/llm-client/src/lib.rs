@@ -8,8 +8,10 @@
 use serde::{Deserialize, Serialize};
 
 mod price;
+mod session_usage;
 
 pub use price::{PriceBook, PriceEntry};
+pub use session_usage::SessionUsage;
 
 /// Token usage returned by every LLM call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
