@@ -1,0 +1,25 @@
+[package]
+name = "drawio-agent-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "HTTP + WebSocket server for the Draw.io Agent"
+
+[dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+uuid = { workspace = true }
+base64 = { workspace = true }
+drawio-agent-xml-core = { path = "../xml-core" }
+drawio-agent-llm-client = { path = "../llm-client" }
+drawio-agent-renderer = { path = "../renderer" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
