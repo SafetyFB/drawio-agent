@@ -21,7 +21,8 @@ pub mod state;
 
 pub use routes::router;
 pub use state::{
-    SessionData, SessionId, SessionMeta, SessionStore, VersionEntry, VersionMeta, WsEvent,
+    EventBus, SessionData, SessionId, SessionMeta, SessionStore, VersionEntry, VersionMeta,
+    WsEvent,
 };
 
 /// Errors surfaced by the server (per-route handlers translate to HTTP status).
@@ -45,6 +46,7 @@ pub struct AppState {
     pub sessions: Arc<RwLock<SessionStore>>,
     pub llm: Arc<dyn LlmProvider>,
     pub renderer: Arc<dyn RenderDriver>,
+    pub events: EventBus,
 }
 
 impl std::fmt::Debug for AppState {
@@ -61,6 +63,7 @@ impl AppState {
             sessions: Arc::new(RwLock::new(SessionStore::new())),
             llm,
             renderer: Arc::new(MockDriver::new()),
+            events: EventBus::new(),
         }
     }
 }

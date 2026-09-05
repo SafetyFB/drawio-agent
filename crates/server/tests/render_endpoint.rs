@@ -68,6 +68,7 @@ fn state_with_renderer(renderer: Arc<dyn RenderDriver>) -> Arc<AppState> {
         )),
         llm: Arc::new(StubLlm),
         renderer,
+        events: drawio_agent_server::EventBus::new(),
     })
 }
 

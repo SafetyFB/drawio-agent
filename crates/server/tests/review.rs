@@ -109,6 +109,7 @@ fn state_with(llm: Arc<TestLlm>, renderer: Arc<dyn RenderDriver>) -> Arc<AppStat
         )),
         llm: llm,
         renderer,
+        events: drawio_agent_server::EventBus::new(),
     })
 }
 

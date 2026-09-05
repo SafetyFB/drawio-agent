@@ -8,13 +8,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
+use axum::extract::ws::{Message, WebSocketUpgrade};
 use serde::Serialize;
 use serde_json::json;
+use tokio::sync::broadcast;
 
 use crate::{
-    AppState, CreateSessionRequest, CreateSessionResponse, GenerateRequest, GenerateResponse,
-    PatchRequest, PatchResponse, RenderResponse, ReviewRequest, SessionInfoResponse, ServerError,
-    VersionsResponse,
+    state::WsEvent, AppState, CreateSessionRequest, CreateSessionResponse, GenerateRequest,
+    GenerateResponse, PatchRequest, PatchResponse, RenderResponse, ReviewRequest,
+    SessionInfoResponse, ServerError, VersionsResponse,
 };
 
 /// Error body returned to clients.
@@ -50,6 +52,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/patch", post(patch))
         .route("/api/sessions/:id/render", post(render))
         .route("/api/sessions/:id/review", post(review))
+        .route("/api/sessions/:id/events", get(events))
         .with_state(Arc::new(state))
 }
 
@@ -127,11 +130,22 @@ async fn generate(
         feedback: None,
         json_mode: req.json_mode,
     };
-    let resp = state
-        .llm
-        .generate_xml(llm_req)
-        .await
-        .map_err(|e| ServerError::Llm(e.to_string()))?;
+    let resp = match state.llm.generate_xml(llm_req).await {
+        Ok(r) => r,
+        Err(e) => {
+            state
+                .events
+                .emit(
+                    &session_id,
+                    WsEvent::Error {
+                        session_id: session_id.clone(),
+                        message: e.to_string(),
+                    },
+                )
+                .await;
+            return Err(ServerError::Llm(e.to_string()));
+        }
+    };
     let summary = truncate_summary(&req.prompt, 80);
     let version_id = state
         .sessions
@@ -140,11 +154,25 @@ async fn generate(
         .append_version(&session_id, "generate", Some(summary), &resp.content)
         .await
         .ok_or_else(|| ServerError::Internal("session vanished mid-flight".into()))?;
+    state
+        .events
+        .emit(
+            &session_id,
+            WsEvent::VersionCreated {
+                session_id: session_id.clone(),
+                version_id,
+                kind: "generate".into(),
+            },
+        )
+        .await;
     Ok(Json(GenerateResponse {
         xml: resp.content,
         version_id,
     }))
 }
+
+/// Insert event-emit calls into patch + review. These mirror the generate
+/// pattern: emit `VersionCreated` on success, `Error` on LLM failure.
 
 /// Truncate a user prompt to `max_chars` for use as a version summary.
 fn truncate_summary(s: &str, max_chars: usize) -> String {
@@ -244,6 +272,17 @@ async fn patch(
         .append_version(&session_id, "patch", Some(summary), &updated_xml)
         .await
         .ok_or_else(|| ServerError::Internal("session vanished mid-flight".into()))?;
+    state
+        .events
+        .emit(
+            &session_id,
+            WsEvent::VersionCreated {
+                session_id: session_id.clone(),
+                version_id,
+                kind: "patch".into(),
+            },
+        )
+        .await;
 
     Ok(Json(PatchResponse {
         xml: updated_xml,
@@ -325,26 +364,89 @@ async fn review(
             })?,
     };
 
-    // 3. Render XML to PNG (503 on failure).
+    // 3. Render XML to PNG (503 on failure; emit Error event).
     let opts = drawio_agent_renderer::RenderOptions::default();
-    let png = state
-        .renderer
-        .render(&xml, &opts)
-        .await
-        .map_err(|e| ServerError::Render(e.to_string()))?;
+    let png = match state.renderer.render(&xml, &opts).await {
+        Ok(p) => p,
+        Err(e) => {
+            state
+                .events
+                .emit(
+                    &session_id,
+                    WsEvent::Error {
+                        session_id: session_id.clone(),
+                        message: e.to_string(),
+                    },
+                )
+                .await;
+            return Err(ServerError::Render(e.to_string()));
+        }
+    };
 
-    // 4. Call LLM for visual review (502 on failure).
+    // 4. Call LLM for visual review (502 on failure; emit Error event).
     let llm_req = drawio_agent_llm_client::ReviewRequest {
         image_png: png,
         xml: xml.clone(),
         checks: req.checks,
     };
-    let resp = state
-        .llm
-        .review_visual(llm_req)
-        .await
-        .map_err(|e| ServerError::Llm(e.to_string()))?;
+    let resp = match state.llm.review_visual(llm_req).await {
+        Ok(r) => r,
+        Err(e) => {
+            state
+                .events
+                .emit(
+                    &session_id,
+                    WsEvent::Error {
+                        session_id: session_id.clone(),
+                        message: e.to_string(),
+                    },
+                )
+                .await;
+            return Err(ServerError::Llm(e.to_string()));
+        }
+    };
 
     // 5. Return the parsed ReviewResponse directly.
     Ok(Json(resp.content).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket events
+// ---------------------------------------------------------------------------
+
+async fn events(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let session_id = crate::state::SessionId(id);
+
+    // Verify the session exists (404 if not).
+    if !state.sessions.read().await.contains(&session_id).await {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    }
+
+    ws.on_upgrade(move |mut socket| async move {
+        // Subscribe directly via the EventBus (avoids SessionStore lock).
+        let mut rx = match state.events.subscribe(&session_id).await {
+            Some(rx) => rx,
+            None => return,
+        };
+        // Forward events until the client disconnects or the channel closes.
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let json = match serde_json::to_string(&event) {
+                        Ok(j) => j,
+                        Err(_) => continue,
+                    };
+                    if socket.send(Message::Text(json)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }

@@ -1,13 +1,14 @@
 //! In-memory session storage for the Draw.io Agent server.
 //!
-//! Phase 4 skeleton: HashMap<SessionId, SessionData> behind RwLock.
-//! Persistence (SQLite, etc.) is intentionally out of scope.
+//! Phase 4 skeleton: HashMap<SessionId, SessionData> behind RwLock,
+//! plus a separate EventBus for WebSocket pub/sub. Persistence (SQLite,
+//! etc.) is intentionally out of scope.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
 
 /// Stable session identifier (UUIDv4 string).
@@ -169,5 +170,54 @@ impl SessionStore {
             .get(id)
             .map(|d| d.versions.iter().map(|v| v.meta.clone()).collect())
             .unwrap_or_default()
+    }
+}
+
+/// Per-session pub/sub bus for WebSocket events. Kept separate from
+/// `SessionStore` so WS handlers don't need to hold a RwLock on the
+/// session data just to subscribe.
+#[derive(Clone, Default)]
+pub struct EventBus {
+    senders: Arc<Mutex<HashMap<SessionId, broadcast::Sender<WsEvent>>>>,
+}
+
+impl std::fmt::Debug for EventBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventBus").finish_non_exhaustive()
+    }
+}
+
+impl EventBus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Idempotently create the channel for `id`. Subsequent calls return
+    /// the existing sender so multiple action handlers can register
+    /// independently.
+    pub async fn get_or_create(&self, id: &SessionId) -> broadcast::Sender<WsEvent> {
+        let mut senders = self.senders.lock().await;
+        senders
+            .entry(id.clone())
+            .or_insert_with(|| {
+                let (tx, _rx) = broadcast::channel(64);
+                tx
+            })
+            .clone()
+    }
+
+    /// Subscribe to events for a session. Lazily creates the channel if
+    /// it doesn't exist yet (so subscribers can register before any emit).
+    /// Always returns `Some`.
+    pub async fn subscribe(&self, id: &SessionId) -> Option<broadcast::Receiver<WsEvent>> {
+        Some(self.get_or_create(id).await.subscribe())
+    }
+
+    /// Ensure the channel exists (idempotent) and publish an event to all
+    /// current subscribers. `tx.send` returns `Err` if there are no
+    /// receivers, which we swallow.
+    pub async fn emit(&self, id: &SessionId, event: WsEvent) {
+        let tx = self.get_or_create(id).await;
+        let _ = tx.send(event);
     }
 }
