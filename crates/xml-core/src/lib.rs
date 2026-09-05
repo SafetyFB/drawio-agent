@@ -31,6 +31,43 @@ pub struct MxGraphModel {
     pub root: Cell,
 }
 
+impl MxGraphModel {
+    /// Find a cell by id via depth-first search.
+    /// Returns `None` if no cell with that id exists.
+    pub fn get(&self, id: &str) -> Option<&Cell> {
+        find_in(&self.root, id)
+    }
+
+    /// Mutable counterpart of [`get`].
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut Cell> {
+        find_in_mut(&mut self.root, id)
+    }
+}
+
+fn find_in<'a>(cell: &'a Cell, id: &str) -> Option<&'a Cell> {
+    if cell.id == id {
+        return Some(cell);
+    }
+    for child in &cell.children {
+        if let Some(found) = find_in(child, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn find_in_mut<'a>(cell: &'a mut Cell, id: &str) -> Option<&'a mut Cell> {
+    if cell.id == id {
+        return Some(cell);
+    }
+    for child in &mut cell.children {
+        if let Some(found) = find_in_mut(child, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cell {
     pub id: String,
