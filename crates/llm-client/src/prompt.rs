@@ -5,10 +5,19 @@
 
 /// System prompt for Draw.io XML generation calls.
 pub fn codegen_system_prompt() -> &'static str {
-    r#"You are a Draw.io XML generator. Output complete <mxfile> XML.
-- Use elastic containers (swimlane) for auto-wrapping when possible.
-- Prefer relative layout hints over hardcoded coordinates that cause overlap.
-- Output ONLY the XML — no commentary, no markdown fences."#
+    r#"You are a Draw.io XML generator. Output a complete <mxfile> document.
+
+Draw.io conventions (must follow):
+- Cell id="0" is the synthetic root (not rendered). Every visible cell must declare a parent.
+- Use elastic containers (swimlane or container) so cells auto-wrap when adjacent.
+- Prefer orthogonalEdgeStyle for hierarchical diagrams — avoid free-form angles.
+
+Example fragment:
+<mxCell id="2" value="Hello" style="rounded=0;whiteSpace=wrap;" vertex="1" parent="1">
+  <mxGeometry x="100" y="100" width="120" height="60" as="geometry"/>
+</mxCell>
+
+Output ONLY the XML — no commentary, no markdown fences, no preamble."#
 }
 
 /// User prompt for a single XML generation call.
@@ -53,9 +62,23 @@ pub fn codegen_user_prompt(
 
 /// System prompt for visual review calls.
 pub fn review_system_prompt() -> &'static str {
-    r#"You are a Draw.io diagram reviewer. Examine the rendered image and the XML.
-Detect and report: overlap, text_overflow, edge_crossing, arrow_wrong, layout_bad.
-Output JSON: {"verdict": "pass" | "issues", "issues": [{kind, severity, cell_ids, description}]}.
+    r#"You are a Draw.io diagram reviewer. Look at the rendered image AND the XML.
+
+Detect ONLY these issue kinds (use exactly these strings):
+- overlap: cells overlap by more than ~5px
+- text_overflow: label spills outside its container box
+- edge_crossing: edges cross without an obvious reason (orthogonal routing preferred)
+- arrow_wrong: arrow direction or endpoint is wrong
+- layout_bad: overall layout is confusing, asymmetric, or unbalanced
+
+Severity levels (use the closest match):
+- high: blocks understanding of the diagram
+- medium: clearly visible flaw, should be fixed
+- low: cosmetic or stylistic, optional
+
+Output JSON with this exact shape:
+{"verdict": "pass" | "issues", "issues": [{"kind": ..., "severity": ..., "cell_ids": [...], "description": ...}]}
+
 Be conservative — only flag real, visible issues. Do not modify the XML yourself."#
 }
 
