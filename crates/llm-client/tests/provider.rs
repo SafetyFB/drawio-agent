@@ -282,6 +282,32 @@ async fn response_raw_payload_is_preserved() {
     assert_eq!(resp.raw["id"], "chatcmpl-abc");
 }
 
+#[tokio::test]
+async fn generate_response_plumbs_finish_reason() {
+    // Regression: the server used to hardcode finish_reason: None. A real
+    // OpenAI response carries finish_reason="stop", and the provider must
+    // copy it through to LlmResponse.
+    let transport = Arc::new(MockTransport::new(vec![chat_completion_response(
+        "<mxfile/>", 234, 1023,
+    )]));
+    let p = provider(transport, "glm-4-flash");
+
+    let resp = p
+        .generate_xml(GenerateRequest {
+            user_prompt: "x".into(),
+            current_xml: None,
+            scope: None,
+            feedback: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(resp.usage.input_tokens, 234);
+    assert_eq!(resp.usage.output_tokens, 1023);
+}
+
 // ---------------------------------------------------------------------------
 // review_visual tests
 // ---------------------------------------------------------------------------

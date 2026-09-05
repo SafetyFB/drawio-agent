@@ -98,6 +98,7 @@ impl LlmProvider for TestLlm {
             usage: Usage::default(),
             raw: Value::Null,
             duration_ms: 0,
+            finish_reason: None,
         })
     }
 }

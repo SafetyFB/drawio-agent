@@ -83,12 +83,22 @@ impl ServerConfig {
 
         let llm_provider = match std::env::var("DRAWIO_AGENT_LLM_PROVIDER").as_deref() {
             Ok("mock") | Err(_) => LlmProviderKind::Mock,
-            Ok("openai_compat") => LlmProviderKind::OpenAiCompat {
+            Ok("openai_compat") | Ok("openai-compat") => LlmProviderKind::OpenAiCompat {
                 base_url: std::env::var("DRAWIO_AGENT_LLM_BASE_URL")?,
                 api_key: std::env::var("DRAWIO_AGENT_LLM_API_KEY")?,
                 model: std::env::var("DRAWIO_AGENT_LLM_MODEL")?,
             },
             Ok(other) => {
+                // Both spelling variants are accepted above; anything else is a
+                // real mistake. Print to stderr as well as tracing: the binary
+                // has no tracing subscriber, so a silent fallback to the mock
+                // LLM previously produced zero-usage trajectories with no
+                // explanation.
+                eprintln!(
+                    "WARNING: unknown DRAWIO_AGENT_LLM_PROVIDER={other} \
+                     (expected 'mock' | 'openai_compat' | 'openai-compat'); \
+                     falling back to the mock LLM"
+                );
                 tracing::warn!(provider = %other, "unknown DRAWIO_AGENT_LLM_PROVIDER, falling back to Mock");
                 LlmProviderKind::Mock
             }
@@ -252,6 +262,7 @@ impl LlmProvider for StubLlm {
             usage: Usage::default(),
             raw: serde_json::Value::Null,
             duration_ms: 0,
+            finish_reason: None,
         })
     }
     async fn generate_streaming(
@@ -278,6 +289,7 @@ impl LlmProvider for StubLlm {
             usage: Usage::default(),
             raw: serde_json::Value::Null,
             duration_ms: 0,
+            finish_reason: None,
         })
     }
 }

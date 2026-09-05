@@ -145,8 +145,6 @@ async fn generate(
     Path(id): Path<String>,
     Json(req): Json<GenerateRequest>,
 ) -> Result<Json<GenerateResponse>, ServerError> {
-    use std::time::Instant;
-
     let session_id = crate::state::SessionId(id);
     {
         let store = state.sessions.read().await;
@@ -172,7 +170,6 @@ async fn generate(
         },
     )
     .await;
-    let llm_started = Instant::now();
 
     let resp = match state.llm.generate_xml(llm_req).await {
         Ok(r) => r,
@@ -208,8 +205,8 @@ async fn generate(
         drawio_agent_trajectory::TrajectoryEvent::LlmCallCompleted {
             input_tokens: resp.usage.input_tokens,
             output_tokens: resp.usage.output_tokens,
-            duration_ms: llm_started.elapsed().as_millis() as u64,
-            finish_reason: None,
+            duration_ms: resp.duration_ms,
+            finish_reason: resp.finish_reason.clone(),
         },
     )
     .await;
@@ -316,7 +313,6 @@ async fn patch(
         },
     )
     .await;
-    let llm_started = std::time::Instant::now();
 
     let resp = match state.llm.generate_xml(llm_req).await {
         Ok(r) => r,
@@ -340,8 +336,8 @@ async fn patch(
         drawio_agent_trajectory::TrajectoryEvent::LlmCallCompleted {
             input_tokens: resp.usage.input_tokens,
             output_tokens: resp.usage.output_tokens,
-            duration_ms: llm_started.elapsed().as_millis() as u64,
-            finish_reason: None,
+            duration_ms: resp.duration_ms,
+            finish_reason: resp.finish_reason.clone(),
         },
     )
     .await;
@@ -550,7 +546,6 @@ async fn review(
         },
     )
     .await;
-    let review_started = std::time::Instant::now();
     let llm_req = drawio_agent_llm_client::ReviewRequest {
         image_png: png,
         xml: xml.clone(),
@@ -588,8 +583,8 @@ async fn review(
         drawio_agent_trajectory::TrajectoryEvent::LlmCallCompleted {
             input_tokens: resp.usage.input_tokens,
             output_tokens: resp.usage.output_tokens,
-            duration_ms: review_started.elapsed().as_millis() as u64,
-            finish_reason: None,
+            duration_ms: resp.duration_ms,
+            finish_reason: resp.finish_reason.clone(),
         },
     )
     .await;

@@ -63,6 +63,8 @@ pub async fn run<D: AgentDeps + ?Sized>(
                                 state.phase,
                                 r.usage.input_tokens,
                                 r.usage.output_tokens,
+                                r.duration_ms,
+                                r.finish_reason.clone(),
                             ),
                         )
                         .await;
@@ -145,6 +147,8 @@ pub async fn run<D: AgentDeps + ?Sized>(
                     state.phase,
                     review_estimate_input(&review),
                     review_estimate_output(&review),
+                    0,
+                    None,
                 ),
             )
             .await;
@@ -181,7 +185,13 @@ pub async fn run<D: AgentDeps + ?Sized>(
                 store
                     .record(
                         "agent",
-                        complete_event(state.phase, r.usage.input_tokens, r.usage.output_tokens),
+                        complete_event(
+                            state.phase,
+                            r.usage.input_tokens,
+                            r.usage.output_tokens,
+                            r.duration_ms,
+                            r.finish_reason.clone(),
+                        ),
                     )
                     .await;
                 state.current_xml = Some(r.content);
@@ -223,14 +233,20 @@ fn make_event(phase: LoopPhase, payload_size: usize, json_mode: bool) -> Traject
 }
 
 /// Build a trajectory event marking the COMPLETION of a phase.
-fn complete_event(phase: LoopPhase, input_tokens: u64, output_tokens: u64) -> TrajectoryEvent {
+fn complete_event(
+    phase: LoopPhase,
+    input_tokens: u64,
+    output_tokens: u64,
+    duration_ms: u64,
+    finish_reason: Option<String>,
+) -> TrajectoryEvent {
     match phase {
         LoopPhase::Generate | LoopPhase::Patch | LoopPhase::Review => {
             TrajectoryEvent::LlmCallCompleted {
                 input_tokens,
                 output_tokens,
-                duration_ms: 0,
-                finish_reason: None,
+                duration_ms,
+                finish_reason,
             }
         }
         LoopPhase::Render => TrajectoryEvent::RenderCompleted {
@@ -252,7 +268,7 @@ fn complete_event_bytes(phase: LoopPhase, bytes: usize) -> TrajectoryEvent {
             bytes,
             duration_ms: 0,
         },
-        _ => complete_event(phase, 0, 0),
+        _ => complete_event(phase, 0, 0, 0, None),
     }
 }
 

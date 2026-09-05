@@ -92,6 +92,7 @@ impl AgentDeps for StubDeps {
             },
             raw: serde_json::Value::Null,
             duration_ms: 0,
+            finish_reason: None,
         })
     }
 
@@ -134,6 +135,7 @@ impl AgentDeps for StubDeps {
             usage: Usage::default(),
             raw: serde_json::Value::Null,
             duration_ms: 0,
+            finish_reason: None,
         })
     }
 }

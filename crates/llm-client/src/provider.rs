@@ -75,6 +75,8 @@ pub struct LlmResponse<T> {
     /// The full response body, preserved for callers that need raw access.
     pub raw: Value,
     pub duration_ms: u64,
+    /// `finish_reason` from `choices[0].finish_reason` (e.g. `"stop"`).
+    pub finish_reason: Option<String>,
 }
 
 /// A single chunk in a streaming response.
@@ -156,6 +158,11 @@ impl OpenAiCompatProvider {
         ];
         let response = self.transport.post_json(&url, headers, body).await?;
         if !(200..300).contains(&response.status) {
+            tracing::error!(
+                status = response.status,
+                body = %response.body,
+                "llm provider returned non-2xx status"
+            );
             return Err(ProviderError::Transport(TransportError::Status {
                 status: response.status,
                 body: response.body.to_string(),
@@ -187,21 +194,27 @@ impl LlmProvider for OpenAiCompatProvider {
             body["response_format"] = json!({"type": "json_object"});
         }
         let raw = self.post(&body).await?;
-        let usage = parse_usage(&raw);
+        // Measure provider-side wall-clock time so the trajectory reflects
+        // the actual LLM call latency regardless of who records it.
         let duration_ms = start.elapsed().as_millis() as u64;
 
+        // Parse content BEFORE usage: a missing `choices` is the more likely
+        // (and more actionable) failure, so it must be reported first.
         let content = if req.json_mode {
             let content_str = parse_content(&raw)?;
             parse_json_codegen_content(&content_str)?
         } else {
             parse_content(&raw)?
         };
+        let usage = parse_usage(&raw)?;
+        let finish_reason = parse_finish_reason(&raw);
 
         Ok(LlmResponse {
             content,
             usage,
             raw,
             duration_ms,
+            finish_reason,
         })
     }
 
@@ -260,13 +273,15 @@ impl LlmProvider for OpenAiCompatProvider {
         let content_str = parse_content(&raw)?;
         let content = serde_json::from_str(&content_str)
             .map_err(|e| ProviderError::Provider(format!("invalid review JSON: {e}")))?;
-        let usage = parse_usage(&raw);
+        let usage = parse_usage(&raw)?;
+        let finish_reason = parse_finish_reason(&raw);
         let duration_ms = start.elapsed().as_millis() as u64;
         Ok(LlmResponse {
             content,
             usage,
             raw,
             duration_ms,
+            finish_reason,
         })
     }
 }
@@ -282,10 +297,18 @@ fn parse_content(body: &Value) -> Result<String, TransportError> {
         .and_then(Value::as_str);
     match content {
         Some(content) => Ok(content.to_string()),
-        None => Err(TransportError::Invalid(
-            "no assistant message content in choices".to_string(),
-        )),
+        None => Err(TransportError::Invalid(format!(
+            "OpenAI response missing 'choices[0].message.content': {}",
+            body_preview(body)
+        ))),
     }
+}
+
+/// Extract `choices[0].finish_reason` as a string, if present.
+fn parse_finish_reason(body: &Value) -> Option<String> {
+    body.pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Parse the assistant content as the codegen JSON envelope
@@ -364,19 +387,81 @@ fn parse_sse_stream(
     }
 }
 
-/// Extract `usage.prompt_tokens` / `usage.completion_tokens`; missing values
-/// default to zero.
-fn parse_usage(body: &Value) -> Usage {
-    let input_tokens = body
-        .pointer("/usage/prompt_tokens")
+/// Extract `usage.prompt_tokens` / `usage.completion_tokens`. Errors when
+/// the `usage` object is entirely absent so a silent zero-usage regression
+/// surfaces in server logs instead of a plausible-but-wrong 0/0.
+fn parse_usage(body: &Value) -> Result<Usage, TransportError> {
+    let usage = body.get("usage").ok_or_else(|| {
+        TransportError::Invalid(format!("OpenAI response missing 'usage': {}", body_preview(body)))
+    })?;
+    let input_tokens = usage
+        .get("prompt_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let output_tokens = body
-        .pointer("/usage/completion_tokens")
+    let output_tokens = usage
+        .get("completion_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    Usage {
+    Ok(Usage {
         input_tokens,
         output_tokens,
+    })
+}
+
+/// First 500 chars of a raw JSON body, for error messages and logs.
+fn body_preview(value: &Value) -> String {
+    value.to_string().chars().take(500).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A realistic OpenAI chat-completions response body, exactly as the API
+    /// sends it. Guards against the field-name regression (e.g. an LLM-client
+    /// side that reads `usage.input_tokens` when the API sends
+    /// `usage.prompt_tokens`) that produced silent zero-usage trajectory
+    /// events in production.
+    const OPENAI_COMPLETIONS_BODY: &str = r#"{
+        "id": "chatcmpl-abc123",
+        "object": "chat.completion",
+        "created": 1725612345,
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "<mxfile>...</mxfile>"},
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 234,
+            "completion_tokens": 1023,
+            "total_tokens": 1257
+        }
+    }"#;
+
+    #[test]
+    fn parse_usage_reads_openai_field_names() {
+        let body: Value = serde_json::from_str(OPENAI_COMPLETIONS_BODY).unwrap();
+        let usage = parse_usage(&body).unwrap();
+        assert_eq!(usage.input_tokens, 234);
+        assert_eq!(usage.output_tokens, 1023);
+        assert_eq!(usage.total(), 1257);
+    }
+
+    #[test]
+    fn parse_content_extracts_assistant_message() {
+        let body: Value = serde_json::from_str(OPENAI_COMPLETIONS_BODY).unwrap();
+        assert_eq!(parse_content(&body).unwrap(), "<mxfile>...</mxfile>");
+        assert_eq!(parse_finish_reason(&body).as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn parse_usage_errors_when_usage_object_missing() {
+        let body: Value = serde_json::from_str(r#"{"choices": []}"#).unwrap();
+        let err = parse_usage(&body).unwrap_err();
+        assert!(
+            err.to_string().contains("usage"),
+            "error should name the missing field: {err}"
+        );
     }
 }

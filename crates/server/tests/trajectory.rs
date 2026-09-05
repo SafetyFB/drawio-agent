@@ -78,6 +78,7 @@ impl LlmProvider for TestLlm {
             },
             raw: serde_json::Value::Null,
             duration_ms: 0,
+            finish_reason: None,
         })
     }
     async fn generate_streaming(
@@ -101,6 +102,7 @@ impl LlmProvider for TestLlm {
             usage: Usage::default(),
             raw: serde_json::Value::Null,
             duration_ms: 0,
+            finish_reason: None,
         })
     }
 }

@@ -60,6 +60,7 @@ impl LlmProvider for StubLlm {
             usage: Usage { input_tokens: 50, output_tokens: 20 },
             raw: Value::Null,
             duration_ms: 0,
+            finish_reason: None,
         })
     }
     async fn generate_streaming(&self, _req: GenerateRequest) -> Result<LlmStream, ProviderError> { unimplemented!() }
@@ -89,6 +90,7 @@ impl LlmProvider for StubLlm {
             usage: Usage::default(),
             raw: Value::Null,
             duration_ms: 0,
+            finish_reason: None,
         })
     }
 }

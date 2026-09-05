@@ -29,6 +29,7 @@ struct TestLlm {
     last_json_mode: std::sync::Mutex<Option<bool>>,
     response_xml: std::sync::Mutex<Option<String>>,
     fail_with: std::sync::Mutex<Option<String>>,
+    finish_reason: std::sync::Mutex<Option<String>>,
 }
 
 impl TestLlm {
@@ -41,6 +42,10 @@ impl TestLlm {
 
     fn set_failure(&self, msg: &str) {
         *self.fail_with.lock().unwrap() = Some(msg.to_string());
+    }
+
+    fn set_finish_reason(&self, reason: &str) {
+        *self.finish_reason.lock().unwrap() = Some(reason.to_string());
     }
 
     fn call_count(&self) -> u32 {
@@ -86,6 +91,7 @@ impl LlmProvider for TestLlm {
             },
             raw: Value::Null,
             duration_ms: 42,
+            finish_reason: self.finish_reason.lock().unwrap().clone(),
         })
     }
 
@@ -405,3 +411,63 @@ async fn generate_records_summary_in_version_history() {
 
 #[allow(dead_code)]
 fn _phantom(_id: Uuid) {}
+
+#[tokio::test]
+async fn generate_trajectory_carries_real_duration_and_finish_reason() {
+    // Regression: LlmCallCompleted used to hardcode duration_ms=0 and
+    // finish_reason=None, so a real LLM call looked instant and unreasoned
+    // in the trajectory even though the provider measured both.
+    let llm = Arc::new(TestLlm::new(SAMPLE_XML));
+    llm.set_finish_reason("stop");
+    let state = test_state(llm.clone());
+    let app = router(state);
+    let sid = create_session(app.clone()).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid}/generate"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&GenReq {
+                        prompt: "draw".into(),
+                        json_mode: false,
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Fetch the trajectory and inspect the LlmCallCompleted event.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/sessions/{sid}/trajectory"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 65536)
+        .await
+        .unwrap();
+    let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+
+    let completed = events
+        .iter()
+        .find(|e| e["kind"]["kind"] == "llm_call_completed")
+        .expect("llm_call_completed event present");
+    assert_eq!(
+        completed["kind"]["finish_reason"], "stop",
+        "finish_reason must be plumbed through: {completed}"
+    );
+    assert!(
+        completed["kind"]["duration_ms"].as_u64().unwrap_or(0) > 0,
+        "duration_ms must be non-zero: {completed}"
+    );
+}
