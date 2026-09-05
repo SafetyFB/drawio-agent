@@ -1,23 +1,67 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Draw.io Agent Server</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 4rem auto; padding: 0 1rem; color: #222; }
-    h1 { font-size: 1.4rem; }
-    code { background: #f4f4f4; padding: 0.1rem 0.3rem; border-radius: 3px; }
-    a { color: #06c; }
-    .ok { color: #1a7f37; }
-  </style>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trajectory Viewer · drawio-agent</title>
+  <link rel="stylesheet" href="trajectory.css">
 </head>
 <body>
-  <h1>Draw.io Agent Server</h1>
-  <p class="ok">running</p>
-  <p>
-    API base path: <code>/api</code><br>
-    WebSocket events: <code>/api/sessions/&lt;id&gt;/events</code><br>
-    Health: <a href="/health">/health</a>
-  </p>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <h1>Trajectory Viewer</h1>
+    </div>
+    <div class="session-controls">
+      <label for="session-input" class="sr-only">Session ID</label>
+      <input
+        id="session-input"
+        type="text"
+        placeholder="paste a session id"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <button id="connect-btn" type="button">Connect</button>
+      <div
+        id="status"
+        class="status disconnected"
+        role="status"
+        aria-label="Disconnected"
+      >
+        <span class="status-dot" aria-hidden="true"></span>
+        <span class="status-text">disconnected</span>
+      </div>
+    </div>
+    <p class="hint">
+      Need a session? <code>POST /api/sessions</code> to create one, then paste the id above.
+    </p>
+  </header>
+
+  <main id="main">
+    <section id="empty-state" class="empty-state">
+      <h2>Trajectory Viewer</h2>
+      <p>Watch a drawio-agent session unfold in real time.</p>
+      <div class="empty-input">
+        <input
+          id="empty-session-input"
+          type="text"
+          placeholder="paste a session id"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button id="empty-connect-btn" type="button">Connect</button>
+      </div>
+    </section>
+
+    <section id="timeline" class="timeline" aria-live="polite" aria-atomic="false"></section>
+  </main>
+
+  <footer class="footer">
+    <span>drawio-agent v0.1.0</span>
+    <span class="footer-sep" aria-hidden="true">·</span>
+    <span id="bind-addr">127.0.0.1:8080</span>
+  </footer>
+
+  <script src="trajectory.js"></script>
 </body>
 </html>
