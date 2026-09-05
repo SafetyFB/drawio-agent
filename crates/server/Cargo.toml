@@ -32,3 +32,5 @@ path = "src/bin/server.rs"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }

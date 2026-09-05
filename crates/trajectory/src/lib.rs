@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod event;
+pub mod serde_helpers;
 pub mod store;
 
 pub use event::{TrajectoryEvent, TrajectoryEventKind};
@@ -75,8 +76,37 @@ pub struct Event {
     pub id: Uuid,
     /// Monotonic sequence number within a session (starts at 0).
     pub seq: u64,
-    /// Wall-clock time the event was recorded.
+    /// Wall-clock time the event was recorded. Serialized as i64
+    /// milliseconds since the UNIX epoch so JS `new Date(at)` works.
+    #[serde(with = "crate::serde_helpers::system_time_ms")]
     pub at: std::time::SystemTime,
     pub session_id: SessionKey,
     pub kind: TrajectoryEvent,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn event_at_round_trips_as_milliseconds() {
+        let original = Event {
+            id: Uuid::nil(),
+            seq: 7,
+            at: UNIX_EPOCH + Duration::from_millis(1725612345678),
+            session_id: "abc".into(),
+            kind: TrajectoryEvent::LlmCallStarted {
+                prompt_chars: 1,
+                json_mode: false,
+            },
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(
+            json.contains("\"at\":1725612345678"),
+            "at must serialize as a plain integer (ms), got: {json}"
+        );
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.at, original.at);
+    }
 }

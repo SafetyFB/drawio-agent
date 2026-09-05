@@ -714,11 +714,10 @@ async fn events(
     }
 
     ws.on_upgrade(move |mut socket| async move {
-        // Subscribe directly via the EventBus (avoids SessionStore lock).
-        let mut rx = match state.events.subscribe(&session_id).await {
-            Some(rx) => rx,
-            None => return,
-        };
+        // Force-create the channel and subscribe unconditionally. A session
+        // with no events yet must simply wait for the first emit — returning
+        // early here would close the socket immediately on an empty session.
+        let mut rx = state.events.get_or_create(&session_id).await.subscribe();
         // Forward events until the client disconnects or the channel closes.
         loop {
             match rx.recv().await {

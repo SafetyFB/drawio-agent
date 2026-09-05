@@ -459,3 +459,52 @@ async fn review_records_error_on_llm_failure() {
         "got {kinds:?}"
     );
 }
+
+#[tokio::test]
+async fn trajectory_endpoint_at_is_i64_milliseconds_for_js() {
+    // Bug A: `at` used to serialize as a {secs, nanos} object, which JS
+    // `new Date({...})` rejects with Invalid Date. It must be a plain i64
+    // milliseconds-since-epoch number on the wire.
+    let llm = Arc::new(TestLlm::new());
+    let state = state_with(llm, Arc::new(MockDriver::new()));
+    let app = router(state);
+    let sid = create_session_with_xml(app.clone(), FULL_XML).await;
+
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid}/generate"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&GenReq {
+                        prompt: "draw".into(),
+                        json_mode: false,
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/sessions/{sid}/trajectory"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 65536)
+        .await
+        .unwrap();
+    let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert!(!events.is_empty(), "expected at least one event");
+    assert!(
+        events[0]["at"].is_i64(),
+        "at should be an i64 (ms since epoch), got: {}",
+        events[0]["at"]
+    );
+}
