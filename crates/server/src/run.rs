@@ -9,11 +9,12 @@ use std::sync::Arc;
 use drawio_agent_llm_client::{
     HttpTransport, LlmProvider, OpenAiCompatProvider, ProviderConfig, Usage,
 };
-use drawio_agent_renderer::{MockDriver, RenderDriver};
+use drawio_agent_renderer::{HeadlessChromiumDriver, MockDriver, RenderDriver};
 use crate::{build_router, AppState, EventBus, SessionStore};
 use drawio_agent_trajectory::TrajectoryStore;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -34,7 +35,31 @@ pub enum ConfigError {
 pub struct ServerConfig {
     pub bind_addr: SocketAddr,
     pub llm_provider: LlmProviderKind,
-    pub static_dir: PathBuf,
+    pub renderer: RendererKind,
+    pub static_dir: Option<PathBuf>,
+}
+
+/// Which renderer backend to use.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RendererKind {
+    /// Canned PNG bytes; deterministic, no browser required.
+    #[default]
+    Mock,
+    /// Real headless Chromium via CDP.
+    Chromium,
+}
+
+impl std::str::FromStr for RendererKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "mock" => Ok(Self::Mock),
+            "chromium" => Ok(Self::Chromium),
+            other => Err(format!("unknown renderer kind: {other}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69,23 +94,35 @@ impl ServerConfig {
             }
         };
 
+        // Renderer: $DRAWIO_AGENT_RENDERER (mock|chromium), default mock.
+        let renderer = match std::env::var("DRAWIO_AGENT_RENDERER") {
+            Ok(s) => s.parse::<RendererKind>().unwrap_or_else(|e| {
+                warn!(renderer = %s, "unknown DRAWIO_AGENT_RENDERER ({e}), falling back to Mock");
+                RendererKind::Mock
+            }),
+            Err(_) => RendererKind::Mock,
+        };
+
         // Static dir: $DRAWIO_AGENT_STATIC_DIR or <manifest>/static.
         let static_dir = match std::env::var("DRAWIO_AGENT_STATIC_DIR") {
-            Ok(s) => PathBuf::from(s),
+            Ok(s) => Some(PathBuf::from(s)),
             Err(_) => {
                 let manifest = std::env::var("CARGO_MANIFEST_DIR")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("."));
-                manifest.join("static")
+                Some(manifest.join("static"))
             }
         };
-        if !static_dir.exists() {
-            return Err(ConfigError::StaticDir(static_dir.display().to_string()));
+        if let Some(dir) = &static_dir {
+            if !dir.exists() {
+                return Err(ConfigError::StaticDir(dir.display().to_string()));
+            }
         }
 
         Ok(Self {
             bind_addr,
             llm_provider,
+            renderer,
             static_dir,
         })
     }
@@ -96,9 +133,11 @@ impl ServerConfig {
 /// no-op stub that returns `<mxfile/>` for any prompt (useful for
 /// local smoke-testing without API keys).
 ///
-/// The renderer is always [`MockDriver`] for the Phase 6 stub (the
-/// real Chromium integration is deferred; see `crates/renderer`).
-pub fn build_app_state(config: &ServerConfig) -> AppState {
+/// The renderer is [`HeadlessChromiumDriver`] when configured; launch
+/// failures fall back to [`MockDriver`] so the server still starts.
+pub async fn build_app_state(
+    config: &ServerConfig,
+) -> Result<AppState, Box<dyn std::error::Error + Send + Sync>> {
     let llm: Arc<dyn LlmProvider> = match &config.llm_provider {
         LlmProviderKind::Mock => Arc::new(StubLlm),
         LlmProviderKind::OpenAiCompat {
@@ -119,14 +158,26 @@ pub fn build_app_state(config: &ServerConfig) -> AppState {
             ))
         }
     };
-    let renderer: Arc<dyn RenderDriver> = Arc::new(MockDriver::new());
-    AppState {
+    let renderer: Arc<dyn RenderDriver> = match config.renderer {
+        RendererKind::Mock => Arc::new(MockDriver::new()),
+        RendererKind::Chromium => match HeadlessChromiumDriver::launch().await {
+            Ok(d) => {
+                info!(target: "renderer", "headless chromium launched");
+                Arc::new(d) as Arc<dyn RenderDriver>
+            }
+            Err(e) => {
+                warn!(target: "renderer", "chromium launch failed ({e}); falling back to mock");
+                Arc::new(MockDriver::new())
+            }
+        },
+    };
+    Ok(AppState {
         sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::new())),
         llm,
         renderer,
         events: EventBus::new(),
         trajectory: TrajectoryStore::new(),
-    }
+    })
 }
 
 /// Run the server with a pre-bound [`tokio::net::TcpListener`] until the

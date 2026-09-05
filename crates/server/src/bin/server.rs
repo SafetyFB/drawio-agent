@@ -11,7 +11,7 @@ fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => {
             eprintln!("config error: {e}");
-            return ExitCode::from(1);
+            return ExitCode::FAILURE;
         }
     };
 
@@ -19,37 +19,46 @@ fn main() -> ExitCode {
         Ok(l) => l,
         Err(e) => {
             eprintln!("bind error on {}: {e}", config.bind_addr);
-            return ExitCode::from(1);
+            return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = std_listener.set_nonblocking(true) {
-        eprintln!("set_nonblocking failed: {e}");
-        return ExitCode::from(1);
-    }
-    let listener = match tokio::net::TcpListener::from_std(std_listener) {
-        Ok(l) => l,
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
         Err(e) => {
-            eprintln!("tokio listener conversion failed: {e}");
-            return ExitCode::from(1);
+            eprintln!("failed to build tokio runtime: {e}");
+            return ExitCode::FAILURE;
         }
     };
 
     info!(addr = %config.bind_addr, "drawio-agent-server starting");
-    let state = build_app_state(&config);
-    let static_dir = config.static_dir.clone();
+    // Everything that needs the tokio runtime (listener conversion,
+    // chromium launch via build_app_state, the serve loop) runs inside
+    // block_on — from_std on a std listener outside a runtime panics.
+    let result = runtime.block_on(async move {
+        std_listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("set_nonblocking: {e}"))?;
+        let listener = tokio::net::TcpListener::from_std(std_listener)
+            .map_err(|e| format!("from_std: {e}"))?;
+        let state = build_app_state(&config)
+            .await
+            .map_err(|e| format!("build_app_state: {e}"))?;
+        run_server(
+            listener,
+            state,
+            config.static_dir.clone().unwrap_or_default(),
+            shutdown_signal(),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    });
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-        Ok(r) => r,
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("tokio runtime init failed: {e}");
-            return ExitCode::from(1);
+            eprintln!("server error: {e}");
+            ExitCode::FAILURE
         }
-    };
-    if let Err(e) = runtime.block_on(async move {
-        run_server(listener, state, static_dir, shutdown_signal()).await
-    }) {
-        eprintln!("server error: {e}");
-        return ExitCode::from(1);
     }
-    ExitCode::SUCCESS
 }

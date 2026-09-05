@@ -25,7 +25,7 @@ pub use agent_deps::ServerAgentDeps;
 pub use routes::router;
 pub use run::{
     build_app_state, run_server, shutdown_signal, ConfigError, LlmProviderKind,
-    ReqwestHttpTransport, ServerConfig, StubLlm,
+    RendererKind, ReqwestHttpTransport, ServerConfig, StubLlm,
 };
 pub use state::{
     EventBus, SessionData, SessionId, SessionMeta, SessionStore, VersionEntry, VersionMeta,

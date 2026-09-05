@@ -8,7 +8,12 @@ description = "Draw.io diagram renderer: RenderDriver trait + MockDriver (headle
 
 [dependencies]
 async-trait = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process", "io-util", "net"] }
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+url = "2"
+base64 = "0.22"
+uuid = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

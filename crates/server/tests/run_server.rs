@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use drawio_agent_server::{
-    build_app_state, run_server, LlmProviderKind, ServerConfig,
+    build_app_state, run_server, LlmProviderKind, RendererKind, ServerConfig,
 };
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -26,8 +26,11 @@ async fn spawn_server(
     let state = build_app_state(&ServerConfig {
         bind_addr: addr,
         llm_provider: LlmProviderKind::Mock,
-        static_dir: static_dir.clone(),
-    });
+        renderer: RendererKind::Mock,
+        static_dir: Some(static_dir.clone()),
+    })
+    .await
+    .unwrap();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let handle = tokio::spawn(async move {

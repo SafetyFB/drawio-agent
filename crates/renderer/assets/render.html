@@ -5,63 +5,64 @@
   <title>drawio-agent render</title>
   <style>
     html, body { margin: 0; padding: 0; background: #ffffff; }
-    #host { display: inline-block; }
+    #host { display: block; position: relative; overflow: hidden; }
   </style>
   <script src="./viewer-static.min.js"></script>
 </head>
 <body>
   <div id="host"></div>
   <script>
-    // Single entry point called from Rust: render XML -> PNG data URL.
-    // Uses mxGraph (bundled inside viewer-static.min.js).
-    window.__renderXml = function (xmlString, scale, bg, border) {
-      return new Promise(function (resolve, reject) {
-        try {
-          var host = document.getElementById('host');
-          host.innerHTML = '';
+    // Render a Draw.io XML document into the #host div. Synchronous:
+    // mxGraph.refresh() is a synchronous DOM mutation, so no Promise is
+    // needed. The CDP driver sets deviceScaleFactor for pixel density.
+    window.renderXml = function (xmlString, scale, bg, border) {
+      try {
+        var host = document.getElementById('host');
+        host.innerHTML = '';
 
-          // Parse the XML.
-          var xmlDoc = mxUtils.parseXml(xmlString);
-          if (!xmlDoc) {
-            reject('parseXml returned null');
-            return;
-          }
-
-          // Build a fresh model + graph (no shared state between calls).
-          var model = new mxGraphModel();
-          var codec = new mxCodec(xmlDoc);
-          codec.decode(xmlDoc.documentElement, model);
-
-          var graph = new mxGraph(host, model);
-          graph.setEnabled(false);
-          graph.setPanning(false);
-
-          // After layout/render, export to PNG.
-          graph.addListener('postrender', function () {
-            try {
-              var bounds = graph.getGraphBounds();
-              var w = Math.ceil((bounds.width || 1) + 2 * border);
-              var h = Math.ceil((bounds.height || 1) + 2 * border);
-              var xmlCanvas = new mxXmlCanvas2D(w * scale, h * scale);
-              xmlCanvas.scale = scale;
-              xmlCanvas.translate(-bounds.x + border, -bounds.y + border);
-              if (bg) {
-                xmlCanvas.setBackground = bg;
-              }
-              var exp = new mxImageExport();
-              exp.drawState(graph.view.state, xmlCanvas);
-              var dataUrl = xmlCanvas.close();
-              resolve(dataUrl);
-            } catch (e) {
-              reject(String(e));
-            }
-          });
-
-          graph.refresh();
-        } catch (e) {
-          reject(String(e));
+        var xmlDoc = mxUtils.parseXml(xmlString);
+        if (!xmlDoc) {
+          return { ok: false, error: 'parseXml returned null' };
         }
-      });
+
+        // Locate the <mxGraphModel> element by tag — the document root is
+        // <mxfile>/<diagram>, not the model.
+        var models = xmlDoc.getElementsByTagName('mxGraphModel');
+        if (models.length === 0) {
+          return { ok: false, error: 'no <mxGraphModel> element found' };
+        }
+
+        var model = new mxGraphModel();
+        var codec = new mxCodec(xmlDoc);
+        codec.decode(models[0], model);
+
+        var graph = new mxGraph(host, model);
+        graph.setEnabled(false);
+        graph.setPanning(false);
+        graph.refresh();
+
+        var bounds = graph.getGraphBounds();
+        var w = Math.max(1, Math.ceil(bounds.width + 2 * border));
+        var h = Math.max(1, Math.ceil(bounds.height + 2 * border));
+
+        // Shift content so the diagram starts at (border, border) inside
+        // the host, then re-render with the new translation.
+        graph.view.translate.x = border - bounds.x;
+        graph.view.translate.y = border - bounds.y;
+        graph.refresh();
+
+        host.style.width = w + 'px';
+        host.style.height = h + 'px';
+        host.style.background = bg || '#ffffff';
+
+        return {
+          ok: true,
+          width: Math.ceil(bounds.width),
+          height: Math.ceil(bounds.height),
+        };
+      } catch (e) {
+        return { ok: false, error: String(e) };
+      }
     };
   </script>
 </body>
