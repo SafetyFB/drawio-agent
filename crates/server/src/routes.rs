@@ -256,13 +256,28 @@ async fn render(
     Path(id): Path<String>,
 ) -> Result<Response, ServerError> {
     let session_id = crate::state::SessionId(id);
+
+    // 1. Verify session exists (404 if not).
+    {
+        let store = state.sessions.read().await;
+        if !store.contains(&session_id).await {
+            return Err(ServerError::SessionNotFound(session_id.clone()));
+        }
+    }
+
+    // 2. Get current XML (400 if session exists but has no XML yet).
     let xml = state
         .sessions
         .read()
         .await
         .current_xml(&session_id)
         .await
-        .ok_or_else(|| ServerError::SessionNotFound(session_id.clone()))?;
+        .ok_or_else(|| {
+            ServerError::BadRequest(
+                "session has no current XML — call /generate first".into(),
+            )
+        })?;
+
     let opts = drawio_agent_renderer::RenderOptions::default();
     let png = state
         .renderer
