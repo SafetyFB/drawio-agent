@@ -27,7 +27,7 @@ pub struct ProviderConfig {
 }
 
 /// Input for a single XML generation call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GenerateRequest {
     pub user_prompt: String,
     pub current_xml: Option<String>,
@@ -35,6 +35,9 @@ pub struct GenerateRequest {
     pub scope: Option<String>,
     /// Visual review issues to incorporate into the regenerated XML.
     pub feedback: Option<Vec<String>>,
+    /// When true, request `response_format: {type: "json_object"}` and
+    /// parse the assistant content as `{"xml": "...", "reasoning": "..."}`.
+    pub json_mode: bool,
 }
 
 /// A single issue found during visual review.
@@ -152,17 +155,27 @@ impl LlmProvider for OpenAiCompatProvider {
         req: GenerateRequest,
     ) -> Result<LlmResponse<String>, ProviderError> {
         let start = Instant::now();
-        let body = json!({
+        let mut body = json!({
             "model": self.config.model,
             "messages": [
                 {"role": "system", "content": codegen_system_prompt()},
                 {"role": "user", "content": req.user_prompt},
             ],
         });
+        if req.json_mode {
+            body["response_format"] = json!({"type": "json_object"});
+        }
         let raw = self.post(&body).await?;
-        let content = parse_content(&raw)?;
         let usage = parse_usage(&raw);
         let duration_ms = start.elapsed().as_millis() as u64;
+
+        let content = if req.json_mode {
+            let content_str = parse_content(&raw)?;
+            parse_json_codegen_content(&content_str)?
+        } else {
+            parse_content(&raw)?
+        };
+
         Ok(LlmResponse {
             content,
             usage,
@@ -223,6 +236,25 @@ fn parse_content(body: &Value) -> Result<String, TransportError> {
             "no assistant message content in choices".to_string(),
         )),
     }
+}
+
+/// Parse the assistant content as the codegen JSON envelope
+/// `{"xml": "...", "reasoning": "..."}`. Returns the `xml` field. The
+/// `reasoning` field (if present) is preserved in the response's `raw`
+/// payload by the caller.
+fn parse_json_codegen_content(content_str: &str) -> Result<String, TransportError> {
+    let parsed: Value = serde_json::from_str(content_str).map_err(|e| {
+        TransportError::Invalid(format!("json_mode: response is not valid JSON: {e}"))
+    })?;
+    parsed
+        .get("xml")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            TransportError::Invalid(
+                "json_mode: response missing string 'xml' field".to_string(),
+            )
+        })
 }
 
 /// Extract `usage.prompt_tokens` / `usage.completion_tokens`; missing values

@@ -118,6 +118,7 @@ async fn generate_posts_to_chat_completions_endpoint() {
             current_xml: None,
             scope: None,
             feedback: None,
+            ..Default::default()
         })
         .await
         .expect("generate should succeed");
@@ -144,6 +145,7 @@ async fn generate_includes_bearer_authorization_header() {
         current_xml: None,
         scope: None,
         feedback: None,
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -169,6 +171,7 @@ async fn generate_request_body_has_model_and_messages() {
         current_xml: None,
         scope: None,
         feedback: None,
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -194,6 +197,7 @@ async fn generate_response_usage_maps_to_usage_type() {
             current_xml: None,
             scope: None,
             feedback: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -217,6 +221,7 @@ async fn generate_error_on_non_2xx_response() {
             current_xml: None,
             scope: None,
             feedback: None,
+            ..Default::default()
         })
         .await
         .expect_err("must error on 401");
@@ -242,6 +247,7 @@ async fn generate_error_when_no_assistant_message_in_response() {
             current_xml: None,
             scope: None,
             feedback: None,
+            ..Default::default()
         })
         .await
         .expect_err("missing choices must error");
@@ -268,6 +274,7 @@ async fn response_raw_payload_is_preserved() {
             current_xml: None,
             scope: None,
             feedback: None,
+            ..Default::default()
         })
         .await
         .unwrap();
