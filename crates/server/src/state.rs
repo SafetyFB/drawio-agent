@@ -76,8 +76,14 @@ pub struct VersionEntry {
 }
 
 /// Events broadcast over the WebSocket.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+///
+/// Serialization is hand-rolled: `VersionCreated` / `Error` keep the
+/// original flat shape (`{"type":"version_created",...}`), while the
+/// `Trajectory` payload rides under a stable `event` key carrying the
+/// internally-tagged `TrajectoryEvent`:
+/// `{"type":"trajectory","event":{"kind":"llm_call_started",...}}`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", content = "event", rename_all = "snake_case")]
 pub enum WsEvent {
     /// A new version was added.
     VersionCreated {
@@ -90,6 +96,45 @@ pub enum WsEvent {
         session_id: SessionId,
         message: String,
     },
+    /// A trajectory event recorded by an action handler. Boxed so the
+    /// enum stays small despite the heap-allocated payload.
+    Trajectory(Box<drawio_agent_trajectory::Event>),
+}
+
+impl Serialize for WsEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        match self {
+            WsEvent::VersionCreated {
+                session_id,
+                version_id,
+                kind,
+            } => {
+                let mut s = serializer.serialize_struct("WsEvent", 4)?;
+                s.serialize_field("type", "version_created")?;
+                s.serialize_field("session_id", session_id)?;
+                s.serialize_field("version_id", version_id)?;
+                s.serialize_field("kind", kind)?;
+                s.end()
+            }
+            WsEvent::Error { session_id, message } => {
+                let mut s = serializer.serialize_struct("WsEvent", 3)?;
+                s.serialize_field("type", "error")?;
+                s.serialize_field("session_id", session_id)?;
+                s.serialize_field("message", message)?;
+                s.end()
+            }
+            WsEvent::Trajectory(event) => {
+                let mut s = serializer.serialize_struct("WsEvent", 2)?;
+                s.serialize_field("type", "trajectory")?;
+                s.serialize_field("event", &event.kind)?;
+                s.end()
+            }
+        }
+    }
 }
 
 /// In-memory session storage. Cheap to clone (Arc-shared).

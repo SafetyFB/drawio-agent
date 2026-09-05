@@ -322,10 +322,18 @@ async fn generate_emits_version_created_after_success() {
         .await
         .unwrap();
 
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-        .await
-        .expect("event timed out")
-        .expect("recv error");
+    // Trajectory events (Started/Completed) stream ahead of the
+    // VersionCreated; skip them and assert on the version event.
+    let event = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("event timed out")
+            .expect("recv error");
+        match event {
+            WsEvent::Trajectory(_) => continue,
+            other => break other,
+        }
+    };
     match event {
         WsEvent::VersionCreated { kind, .. } => assert_eq!(kind, "generate"),
         other => panic!("expected VersionCreated, got {other:?}"),
@@ -361,10 +369,18 @@ async fn generate_emits_error_on_llm_failure() {
         .await
         .unwrap();
 
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-        .await
-        .expect("error event timed out")
-        .expect("recv error");
+    // LlmCallStarted streams first; skip trajectory events and assert on
+    // the Error notification.
+    let event = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("error event timed out")
+            .expect("recv error");
+        match event {
+            WsEvent::Trajectory(_) => continue,
+            other => break other,
+        }
+    };
     match event {
         WsEvent::Error { message, .. } => assert!(
             message.contains("vlm is down"),
@@ -403,10 +419,18 @@ async fn patch_emits_version_created_after_success() {
         .await
         .unwrap();
 
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-        .await
-        .expect("event timed out")
-        .expect("recv error");
+    // Trajectory events (Started/Completed) stream ahead of the
+    // VersionCreated; skip them and assert on the version event.
+    let event = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("event timed out")
+            .expect("recv error");
+        match event {
+            WsEvent::Trajectory(_) => continue,
+            other => break other,
+        }
+    };
     match event {
         WsEvent::VersionCreated { kind, .. } => assert_eq!(kind, "patch"),
         other => panic!("expected VersionCreated, got {other:?}"),
@@ -487,10 +511,18 @@ async fn review_emits_error_on_llm_failure() {
         .await
         .unwrap();
 
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-        .await
-        .expect("event timed out")
-        .expect("recv error");
+    // RenderCompleted + LlmCallStarted stream first; skip trajectory
+    // events and assert on the Error notification.
+    let event = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("event timed out")
+            .expect("recv error");
+        match event {
+            WsEvent::Trajectory(_) => continue,
+            other => break other,
+        }
+    };
     match event {
         WsEvent::Error { message, .. } => {
             assert!(message.contains("vlm down"), "got: {message}");
@@ -502,3 +534,226 @@ async fn review_emits_error_on_llm_failure() {
 // Suppress unused-warning on `Uuid` import (kept for clarity).
 #[allow(dead_code)]
 fn _phantom(_u: Uuid) {}
+
+// ---------------------------------------------------------------------------
+// Trajectory events on the WebSocket
+//
+// Action handlers record TrajectoryEvents to the store AND emit them on
+// the EventBus as WsEvent::Trajectory so the frontend can render them in
+// real time. The frontend subscribes to the existing WS endpoint at
+// /api/sessions/:id/events — no new route needed.
+// ---------------------------------------------------------------------------
+
+use drawio_agent_trajectory::TrajectoryEventKind;
+
+#[tokio::test]
+async fn trajectory_events_streamed_on_ws_after_generate() {
+    let llm = Arc::new(TestLlm::new());
+    let state = state_with(llm, Arc::new(MockDriver::new()));
+    let app = router(state.clone());
+
+    let sid = create_session_with_xml(app.clone(), FULL_XML).await;
+    let session_id = SessionId(sid.clone());
+    let mut rx = state.events.subscribe(&session_id).await.unwrap();
+
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid}/generate"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&GenReq {
+                        prompt: "x".into(),
+                        json_mode: false,
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Collect a few events: VersionCreated + Trajectory(x2)
+    let mut kinds = Vec::new();
+    for _ in 0..3 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("event timed out")
+            .expect("recv error");
+        match event {
+            WsEvent::Trajectory(e) => {
+                kinds.push(e.kind.kind());
+            }
+            WsEvent::VersionCreated { .. } => {} // ignore
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    // generate → Started + Completed
+    assert_eq!(
+        kinds,
+        vec![
+            TrajectoryEventKind::LlmCallStarted,
+            TrajectoryEventKind::LlmCallCompleted,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn trajectory_events_streamed_on_ws_after_patch() {
+    let llm = Arc::new(TestLlm::new());
+    let state = state_with(llm, Arc::new(MockDriver::new()));
+    let app = router(state.clone());
+
+    let sid = create_session_with_xml(app.clone(), FULL_XML).await;
+    let session_id = SessionId(sid.clone());
+    let mut rx = state.events.subscribe(&session_id).await.unwrap();
+
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid}/patch"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&PatchReq {
+                        cell_ids: vec!["2".into()],
+                        instruction: "x".into(),
+                        json_mode: false,
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let mut kinds = Vec::new();
+    for _ in 0..2 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("event timed out")
+            .expect("recv error");
+        if let WsEvent::Trajectory(e) = event {
+            kinds.push(e.kind.kind());
+        }
+    }
+    assert_eq!(
+        kinds,
+        vec![
+            TrajectoryEventKind::LlmCallStarted,
+            TrajectoryEventKind::LlmCallCompleted,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn trajectory_events_streamed_on_ws_after_render() {
+    let llm = Arc::new(TestLlm::new());
+    let state = state_with(llm, Arc::new(MockDriver::new()));
+    let app = router(state.clone());
+
+    let sid = create_session_with_xml(app.clone(), FULL_XML).await;
+    let session_id = SessionId(sid.clone());
+    let mut rx = state.events.subscribe(&session_id).await.unwrap();
+
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid}/render"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let mut kinds = Vec::new();
+    for _ in 0..2 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("event timed out")
+            .expect("recv error");
+        if let WsEvent::Trajectory(e) = event {
+            kinds.push(e.kind.kind());
+        }
+    }
+    assert_eq!(
+        kinds,
+        vec![
+            TrajectoryEventKind::RenderStarted,
+            TrajectoryEventKind::RenderCompleted,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn trajectory_events_streamed_on_ws_after_review() {
+    let llm = Arc::new(TestLlm::new());
+    let state = state_with(llm, Arc::new(MockDriver::new()));
+    let app = router(state.clone());
+
+    let sid = create_session_with_xml(app.clone(), FULL_XML).await;
+    let session_id = SessionId(sid.clone());
+    let mut rx = state.events.subscribe(&session_id).await.unwrap();
+
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid}/review"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&RevReq {
+                        xml: None,
+                        checks: vec!["overlap".into()],
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let mut kinds = Vec::new();
+    for _ in 0..3 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("event timed out")
+            .expect("recv error");
+        if let WsEvent::Trajectory(e) = event {
+            kinds.push(e.kind.kind());
+        }
+    }
+    // review → RenderCompleted + LlmCallStarted + LlmCallCompleted
+    assert_eq!(
+        kinds,
+        vec![
+            TrajectoryEventKind::RenderCompleted,
+            TrajectoryEventKind::LlmCallStarted,
+            TrajectoryEventKind::LlmCallCompleted,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn trajectory_event_serializes_as_json_with_kind_tag() {
+    // Sanity check: the WsEvent::Trajectory variant must round-trip
+    // through serde_json with a `"type":"trajectory"` tag so the frontend
+    // can dispatch on it.
+    let event = WsEvent::Trajectory(Box::new(drawio_agent_trajectory::Event {
+        id: uuid::Uuid::nil(),
+        seq: 0,
+        at: std::time::SystemTime::UNIX_EPOCH,
+        session_id: "abc".into(),
+        kind: drawio_agent_trajectory::TrajectoryEvent::LlmCallStarted {
+            prompt_chars: 42,
+            json_mode: false,
+        },
+    }));
+
+    let json = serde_json::to_value(&event).expect("serialize");
+    assert_eq!(json["type"], "trajectory", "got {json}");
+    assert!(json["event"].is_object(), "got {json}");
+    assert_eq!(json["event"]["kind"], "llm_call_started");
+}
