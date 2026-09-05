@@ -19,5 +19,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
+[build-dependencies]
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

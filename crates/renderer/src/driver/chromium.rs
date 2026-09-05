@@ -27,21 +27,34 @@ use tracing::{debug, info, warn};
 
 use crate::{RenderDriver, RenderError, RenderOptions};
 
+// Build-time bundled chrome-headless-shell (path + pinned version).
+include!(concat!(env!("OUT_DIR"), "/bundled_chromium.rs"));
+
 // ---------------------------------------------------------------------------
 // Binary discovery
 // ---------------------------------------------------------------------------
 
 /// Resolve the Chromium binary path. Looks at (in order):
-/// 1. `DRAWIO_AGENT_CHROMIUM_PATH` env var
-/// 2. Common macOS/Linux app locations
-/// 3. `$PATH` via `which()`
+/// 1. `DRAWIO_AGENT_CHROMIUM_PATH` env var (always wins)
+/// 2. Build-time bundled chrome-headless-shell
+/// 3. Common macOS/Linux app locations
+/// 4. `$PATH` via `which()`
 pub fn find_chromium() -> Option<PathBuf> {
+    // 1. Explicit override always wins.
     if let Ok(p) = std::env::var("DRAWIO_AGENT_CHROMIUM_PATH") {
         let pb = PathBuf::from(p);
         if pb.exists() {
             return Some(pb);
         }
     }
+    // 2. Build-time bundled chrome-headless-shell.
+    if let Some(p) = BUNDLED_CHROMIUM_PATH {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    // 3. System candidates.
     let candidates = [
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -57,7 +70,15 @@ pub fn find_chromium() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    which("chromium").or_else(|| which("google-chrome"))
+    // 4. PATH lookup.
+    which("chrome-headless-shell")
+        .or_else(|| which("chromium"))
+        .or_else(|| which("google-chrome"))
+}
+
+/// Returns the build-time resolved path to chrome-headless-shell, if any.
+pub fn bundled_chromium_path() -> Option<PathBuf> {
+    BUNDLED_CHROMIUM_PATH.map(PathBuf::from)
 }
 
 fn which(name: &str) -> Option<PathBuf> {

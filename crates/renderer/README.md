@@ -77,3 +77,33 @@ The whole visual-review loop depends on this: after an LLM produces
 or patches Draw.io XML, we need to render it to PNG and feed the PNG
 to a VLM for the "is there overlap / text overflow / crossed edges?"
 check. Without a working renderer, the Agent Loop has no eyes.
+
+## Bundled chrome-headless-shell
+
+The renderer crate's build.rs downloads a pinned `chrome-headless-shell`
+binary from `storage.googleapis.com/chrome-for-testing-public` on first
+build and caches it under `XDG_CACHE_HOME/drawio-agent/chrome-headless-shell/`
+(or the platform equivalent). Subsequent builds use the cached copy.
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `DRAWIO_AGENT_CHROMIUM_PATH` | Override with an explicit binary path. Wins over bundled. |
+| `DRAWIO_AGENT_OFFLINE=1` | Skip the download entirely; `find_chromium()` falls through to system chrome or env override. |
+| `DRAWIO_AGENT_CACHE_DIR` | Override the cache root (default: `XDG_CACHE_HOME/drawio-agent/`). |
+
+### Version bump procedure
+
+1. Update `PINNED_VERSION` in `crates/renderer/build.rs`.
+2. Run `cargo build -p drawio-agent-renderer` — the build will print the
+   new SHA-256 hashes for each platform. Commit those into the
+   `CHECKSUMS` table (TODO — currently hashes are logged but not enforced).
+3. Update the `CHANGELOG` (TODO) entry.
+
+### Cache reset
+
+```sh
+rm -rf ~/.cache/drawio-agent/chrome-headless-shell  # Linux
+rm -rf ~/Library/Caches/drawio-agent/chrome-headless-shell  # macOS
+```
