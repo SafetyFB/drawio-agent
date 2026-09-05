@@ -295,15 +295,56 @@ async fn render(
 async fn review(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(_req): Json<ReviewRequest>,
+    Json(req): Json<ReviewRequest>,
 ) -> Result<Response, ServerError> {
     let session_id = crate::state::SessionId(id);
-    let store = state.sessions.read().await;
-    if !store.contains(&session_id).await {
-        return Err(ServerError::SessionNotFound(session_id.clone()));
+
+    // 1. Verify session exists.
+    {
+        let store = state.sessions.read().await;
+        if !store.contains(&session_id).await {
+            return Err(ServerError::SessionNotFound(session_id.clone()));
+        }
     }
-    drop(store);
-    Err(ServerError::Internal(
-        "review endpoint not yet implemented".into(),
-    ))
+
+    // 2. Determine XML: explicit override wins; else fall back to session's
+    //    current XML (400 if neither is available).
+    let xml = match req.xml {
+        Some(x) => x,
+        None => state
+            .sessions
+            .read()
+            .await
+            .current_xml(&session_id)
+            .await
+            .ok_or_else(|| {
+                ServerError::BadRequest(
+                    "no XML available — pass it in the request body or call /generate first"
+                        .into(),
+                )
+            })?,
+    };
+
+    // 3. Render XML to PNG (503 on failure).
+    let opts = drawio_agent_renderer::RenderOptions::default();
+    let png = state
+        .renderer
+        .render(&xml, &opts)
+        .await
+        .map_err(|e| ServerError::Render(e.to_string()))?;
+
+    // 4. Call LLM for visual review (502 on failure).
+    let llm_req = drawio_agent_llm_client::ReviewRequest {
+        image_png: png,
+        xml: xml.clone(),
+        checks: req.checks,
+    };
+    let resp = state
+        .llm
+        .review_visual(llm_req)
+        .await
+        .map_err(|e| ServerError::Llm(e.to_string()))?;
+
+    // 5. Return the parsed ReviewResponse directly.
+    Ok(Json(resp.content).into_response())
 }
