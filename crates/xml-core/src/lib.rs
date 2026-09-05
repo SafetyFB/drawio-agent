@@ -6,11 +6,12 @@
 #![warn(rust_2018_idioms)]
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::name::QName;
 use quick_xml::reader::Reader;
+use quick_xml::writer::Writer;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -349,6 +350,161 @@ fn count_ids(cell: &Cell, counts: &mut std::collections::HashMap<String, usize>)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Serializer
+// ---------------------------------------------------------------------------
+
+fn xml_ser_err(e: quick_xml::Error) -> SerializeError {
+    SerializeError::Xml(format!("{e:?}"))
+}
+
+fn write_diagram_uncompressed<W: Write>(
+    writer: &mut Writer<W>,
+    diagram: &Diagram,
+) -> Result<(), SerializeError> {
+    let mut elem = BytesStart::new("diagram");
+    elem.push_attribute(("id", diagram.id.as_str()));
+    elem.push_attribute(("name", diagram.name.as_str()));
+    writer.write_event(Event::Start(elem)).map_err(xml_ser_err)?;
+
+    if let Some(model) = &diagram.model {
+        write_model(writer, model)?;
+    }
+
+    writer
+        .write_event(Event::End(BytesEnd::new("diagram")))
+        .map_err(xml_ser_err)?;
+    Ok(())
+}
+
+fn write_diagram_compressed<W: Write>(
+    writer: &mut Writer<W>,
+    diagram: &Diagram,
+) -> Result<(), SerializeError> {
+    let mut elem = BytesStart::new("diagram");
+    elem.push_attribute(("id", diagram.id.as_str()));
+    elem.push_attribute(("name", diagram.name.as_str()));
+    writer.write_event(Event::Start(elem)).map_err(xml_ser_err)?;
+
+    if let Some(model) = &diagram.model {
+        // Serialize the mxGraphModel to a string, then compress with raw
+        // deflate + base64 to match Draw.io's on-disk format.
+        let inner = serialize_model_to_string(model)?;
+        let compressed = miniz_oxide::deflate::compress_to_vec(inner.as_bytes(), 6);
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&compressed);
+        writer
+            .write_event(Event::Text(BytesText::new(&encoded)))
+            .map_err(xml_ser_err)?;
+    }
+
+    writer
+        .write_event(Event::End(BytesEnd::new("diagram")))
+        .map_err(xml_ser_err)?;
+    Ok(())
+}
+
+fn serialize_model_to_string(model: &MxGraphModel) -> Result<String, SerializeError> {
+    let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
+    write_model(&mut writer, model)?;
+    String::from_utf8(writer.into_inner()).map_err(SerializeError::Utf8)
+}
+
+fn write_model<W: Write>(
+    writer: &mut Writer<W>,
+    model: &MxGraphModel,
+) -> Result<(), SerializeError> {
+    writer
+        .write_event(Event::Start(BytesStart::new("mxGraphModel")))
+        .map_err(xml_ser_err)?;
+    writer
+        .write_event(Event::Start(BytesStart::new("root")))
+        .map_err(xml_ser_err)?;
+    write_cell_recursive(writer, &model.root)?;
+    writer
+        .write_event(Event::End(BytesEnd::new("root")))
+        .map_err(xml_ser_err)?;
+    writer
+        .write_event(Event::End(BytesEnd::new("mxGraphModel")))
+        .map_err(xml_ser_err)?;
+    Ok(())
+}
+
+fn write_cell_recursive<W: Write>(
+    writer: &mut Writer<W>,
+    cell: &Cell,
+) -> Result<(), SerializeError> {
+    write_cell(writer, cell)?;
+    for child in &cell.children {
+        write_cell_recursive(writer, child)?;
+    }
+    Ok(())
+}
+
+fn write_cell<W: Write>(
+    writer: &mut Writer<W>,
+    cell: &Cell,
+) -> Result<(), SerializeError> {
+    let mut elem = BytesStart::new("mxCell");
+    elem.push_attribute(("id", cell.id.as_str()));
+    if let Some(v) = &cell.value {
+        elem.push_attribute(("value", v.as_str()));
+    }
+    if let Some(s) = &cell.style {
+        elem.push_attribute(("style", s.as_str()));
+    }
+    if cell.vertex {
+        elem.push_attribute(("vertex", "1"));
+    }
+    if cell.edge {
+        elem.push_attribute(("edge", "1"));
+    }
+    if let Some(p) = &cell.parent {
+        elem.push_attribute(("parent", p.as_str()));
+    }
+    if let Some(s) = &cell.source {
+        elem.push_attribute(("source", s.as_str()));
+    }
+    if let Some(t) = &cell.target {
+        elem.push_attribute(("target", t.as_str()));
+    }
+
+    if let Some(geom) = &cell.geometry {
+        writer.write_event(Event::Start(elem)).map_err(xml_ser_err)?;
+        write_geometry(writer, geom)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("mxCell")))
+            .map_err(xml_ser_err)?;
+    } else {
+        writer.write_event(Event::Empty(elem)).map_err(xml_ser_err)?;
+    }
+    Ok(())
+}
+
+fn write_geometry<W: Write>(
+    writer: &mut Writer<W>,
+    geom: &Geometry,
+) -> Result<(), SerializeError> {
+    let mut g = BytesStart::new("mxGeometry");
+    g.push_attribute(("x", format_f64(geom.x).as_str()));
+    g.push_attribute(("y", format_f64(geom.y).as_str()));
+    g.push_attribute(("width", format_f64(geom.width).as_str()));
+    g.push_attribute(("height", format_f64(geom.height).as_str()));
+    g.push_attribute(("as", "geometry"));
+    writer.write_event(Event::Empty(g)).map_err(xml_ser_err)?;
+    Ok(())
+}
+
+/// Format f64 without trailing `.0` for whole numbers (Draw.io style),
+/// preserving precision for fractional values.
+fn format_f64(v: f64) -> String {
+    if v.is_finite() && v == v.trunc() && v.abs() < 1e16 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cell {
     pub id: String,
@@ -400,6 +556,14 @@ pub enum ParseError {
     Schema(String),
 }
 
+#[derive(Debug, Error)]
+pub enum SerializeError {
+    #[error("xml: {0}")]
+    Xml(String),
+    #[error("utf8: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
+}
+
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
@@ -448,6 +612,48 @@ impl MxFile {
         }
 
         Ok(MxFile { diagrams })
+    }
+
+    /// Serialize to uncompressed mxfile XML. Each diagram body is
+    /// emitted as inline `<mxGraphModel>`.
+    pub fn to_xml(&self) -> Result<String, SerializeError> {
+        let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
+        writer
+            .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
+            .map_err(xml_ser_err)?;
+        writer
+            .write_event(Event::Start(BytesStart::new("mxfile")))
+            .map_err(xml_ser_err)?;
+
+        for diagram in &self.diagrams {
+            write_diagram_uncompressed(&mut writer, diagram)?;
+        }
+
+        writer
+            .write_event(Event::End(BytesEnd::new("mxfile")))
+            .map_err(xml_ser_err)?;
+        String::from_utf8(writer.into_inner()).map_err(SerializeError::Utf8)
+    }
+
+    /// Serialize to mxfile XML with base64 + raw deflate compression on
+    /// each diagram body (Draw.io's on-disk format).
+    pub fn to_compressed_xml(&self) -> Result<String, SerializeError> {
+        let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
+        writer
+            .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
+            .map_err(xml_ser_err)?;
+        writer
+            .write_event(Event::Start(BytesStart::new("mxfile")))
+            .map_err(xml_ser_err)?;
+
+        for diagram in &self.diagrams {
+            write_diagram_compressed(&mut writer, diagram)?;
+        }
+
+        writer
+            .write_event(Event::End(BytesEnd::new("mxfile")))
+            .map_err(xml_ser_err)?;
+        String::from_utf8(writer.into_inner()).map_err(SerializeError::Utf8)
     }
 }
 
