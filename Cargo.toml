@@ -5,6 +5,7 @@ members = [
     "crates/llm-client",
     "crates/renderer",
     "crates/server",
+    "crates/trajectory",
 ]
 
 [workspace.package]
