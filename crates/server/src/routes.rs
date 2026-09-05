@@ -104,18 +104,49 @@ async fn list_versions(
 async fn generate(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(_req): Json<GenerateRequest>,
+    Json(req): Json<GenerateRequest>,
 ) -> Result<Json<GenerateResponse>, ServerError> {
     let session_id = crate::state::SessionId(id);
-    let store = state.sessions.read().await;
-    if !store.contains(&session_id).await {
-        return Err(ServerError::SessionNotFound(session_id.clone()));
+    {
+        let store = state.sessions.read().await;
+        if !store.contains(&session_id).await {
+            return Err(ServerError::SessionNotFound(session_id.clone()));
+        }
     }
-    drop(store);
-    // TDD #2 will fill this in.
-    Err(ServerError::Internal(
-        "generate endpoint not yet implemented".into(),
-    ))
+    let llm_req = drawio_agent_llm_client::GenerateRequest {
+        user_prompt: req.prompt.clone(),
+        current_xml: None,
+        scope: None,
+        feedback: None,
+        json_mode: req.json_mode,
+    };
+    let resp = state
+        .llm
+        .generate_xml(llm_req)
+        .await
+        .map_err(|e| ServerError::Llm(e.to_string()))?;
+    let summary = truncate_summary(&req.prompt, 80);
+    let version_id = state
+        .sessions
+        .write()
+        .await
+        .append_version(&session_id, "generate", Some(summary), &resp.content)
+        .await
+        .ok_or_else(|| ServerError::Internal("session vanished mid-flight".into()))?;
+    Ok(Json(GenerateResponse {
+        xml: resp.content,
+        version_id,
+    }))
+}
+
+/// Truncate a user prompt to `max_chars` for use as a version summary.
+fn truncate_summary(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{truncated}…")
+    }
 }
 
 async fn patch(
