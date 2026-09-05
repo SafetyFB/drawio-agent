@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 mod price;
 mod provider;
+mod retry;
 mod session_usage;
 mod transport;
 
@@ -17,6 +18,7 @@ pub mod prompt;
 pub use price::{PriceBook, PriceEntry};
 pub use prompt::*;
 pub use provider::*;
+pub use retry::{RetryPolicy, RetryingTransport, Sleeper, TokioSleeper};
 pub use session_usage::SessionUsage;
 pub use transport::*;
 
