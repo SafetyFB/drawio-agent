@@ -14,9 +14,9 @@ use serde_json::json;
 use tokio::sync::broadcast;
 
 use crate::{
-    state::WsEvent, AppState, CreateSessionRequest, CreateSessionResponse, GenerateRequest,
-    GenerateResponse, PatchRequest, PatchResponse, RenderResponse, ReviewRequest,
-    SessionInfoResponse, ServerError, VersionsResponse,
+    state::WsEvent, AgentLoopRequest, AppState, CreateSessionRequest, CreateSessionResponse,
+    GenerateRequest, GenerateResponse, PatchRequest, PatchResponse, RenderResponse,
+    ReviewRequest, ServerAgentDeps, SessionInfoResponse, ServerError, VersionsResponse,
 };
 
 /// Record a TrajectoryEvent to the store AND emit it on the EventBus as
@@ -79,6 +79,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/patch", post(patch))
         .route("/api/sessions/:id/render", post(render))
         .route("/api/sessions/:id/review", post(review))
+        .route("/api/sessions/:id/agent-loop", post(run_agent_loop))
         .route("/api/sessions/:id/events", get(events))
         .route("/api/sessions/:id/trajectory", get(get_trajectory))
         .with_state(Arc::new(state))
@@ -595,6 +596,105 @@ async fn review(
 
     // 5. Return the parsed ReviewResponse directly.
     Ok(Json(resp.content).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/sessions/:id/agent-loop
+// ---------------------------------------------------------------------------
+
+/// Run the Agent Loop (Generate → Render → Review → Patch) against the
+/// session's current XML. Streams trajectory events to WS subscribers,
+/// then stores the final XML as a new `agent-loop` version.
+async fn run_agent_loop(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<AgentLoopRequest>,
+) -> Result<Json<drawio_agent_agent::AgentOutcome>, ServerError> {
+    let session_id = crate::state::SessionId(id);
+
+    // 404 if the session doesn't exist.
+    {
+        let store = state.sessions.read().await;
+        if !store.contains(&session_id).await {
+            return Err(ServerError::SessionNotFound(session_id));
+        }
+    }
+
+    // 400 if there's no XML to start from.
+    let initial_xml = state
+        .sessions
+        .read()
+        .await
+        .current_xml(&session_id)
+        .await
+        .ok_or_else(|| {
+            ServerError::BadRequest(
+                "session has no current XML — run /generate first".into(),
+            )
+        })?;
+
+    // Bridge the server's shared providers into the Agent Loop.
+    let deps = ServerAgentDeps {
+        llm: state.llm.clone(),
+        renderer: state.renderer.clone(),
+    };
+
+    let config = drawio_agent_agent::AgentLoop {
+        prompt: req.prompt.clone(),
+        initial_xml: Some(initial_xml),
+        max_iterations: req.max_iterations,
+        patch_cell_ids: req.patch_cell_ids,
+        review_checks: req.review_checks,
+    };
+
+    let outcome = drawio_agent_agent::run(config, &deps).await.map_err(|e| {
+        use drawio_agent_agent::LoopError as Le;
+        match e {
+            Le::Llm { .. } => ServerError::Llm(e.to_string()),
+            Le::Render { .. } => ServerError::Render(e.to_string()),
+            Le::MaxIterations(_) | Le::EmptyResponse { .. } => {
+                ServerError::Internal(e.to_string())
+            }
+        }
+    })?;
+
+    // Stream each trajectory event to WS subscribers.
+    for traj_event in &outcome.trajectory {
+        state
+            .events
+            .emit(
+                &session_id,
+                WsEvent::Trajectory(Box::new(traj_event.clone())),
+            )
+            .await;
+    }
+
+    // Store the final XML as a new version.
+    let version_id = state
+        .sessions
+        .write()
+        .await
+        .append_version(
+            &session_id,
+            "agent-loop",
+            Some(truncate_summary(&req.prompt, 80)),
+            &outcome.final_xml,
+        )
+        .await
+        .ok_or_else(|| ServerError::Internal("session vanished mid-flight".into()))?;
+    state
+        .events
+        .emit(
+            &session_id,
+            WsEvent::VersionCreated {
+                session_id: session_id.clone(),
+                version_id,
+                kind: "agent-loop".into(),
+            },
+        )
+        .await;
+
+    Ok(Json(outcome))
 }
 
 // ---------------------------------------------------------------------------

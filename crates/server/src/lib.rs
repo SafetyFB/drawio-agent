@@ -16,10 +16,12 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+pub mod agent_deps;
 pub mod routes;
 pub mod run;
 pub mod state;
 
+pub use agent_deps::ServerAgentDeps;
 pub use routes::router;
 pub use run::{
     build_app_state, run_server, shutdown_signal, ConfigError, LlmProviderKind,
@@ -154,4 +156,24 @@ pub struct ReviewRequest {
     pub xml: Option<String>,
     #[serde(default)]
     pub checks: Vec<String>,
+}
+
+/// Request body for `POST /api/sessions/:id/agent-loop`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentLoopRequest {
+    /// Prompt for the Agent Loop (used for patch instructions).
+    pub prompt: String,
+    /// Maximum render-review-patch iterations. Defaults to 5.
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: u32,
+    /// Cells to focus on during Patch (e.g. specific node IDs).
+    #[serde(default)]
+    pub patch_cell_ids: Vec<String>,
+    /// Optional reviewer checks.
+    #[serde(default)]
+    pub review_checks: Vec<String>,
+}
+
+fn default_max_iterations() -> u32 {
+    5
 }
