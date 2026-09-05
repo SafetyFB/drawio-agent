@@ -1,0 +1,24 @@
+[package]
+name = "drawio-agent-renderer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Draw.io diagram renderer scaffold: RenderDriver trait + MockDriver, HeadlessChromiumDriver as future work"
+
+[dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+
+# Future: chromiumoxide will be added behind a "chromium" feature flag.
+# For the Phase 3 spike, we ship the trait + MockDriver only. Live
+# Chromium integration requires chromiumoxide in the dep tree plus a
+# Chromium binary on PATH; see crates/renderer/README.md.
+
