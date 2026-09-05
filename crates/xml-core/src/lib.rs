@@ -139,6 +139,57 @@ impl MxGraphModel {
             context_ignored: sub.context.len(),
         }
     }
+
+    /// Validate structural integrity of the model. Collects **all** errors
+    /// it can detect in a single pass rather than failing on the first.
+    ///
+    /// Checks:
+    /// - The synthetic root cell exists with id `0`.
+    /// - All cell ids are unique across the tree.
+    /// - Every edge's `source` and `target` reference an existing cell.
+    pub fn validate(&self) -> ValidationReport {
+        use std::collections::HashMap;
+
+        let mut errors: Vec<ValidationError> = Vec::new();
+
+        // Pass 1: count occurrences of every id (also detects MissingRoot).
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        count_ids(&self.root, &mut counts);
+
+        let root_count = counts.get("0").copied().unwrap_or(0);
+        if root_count == 0 {
+            errors.push(ValidationError::MissingRoot);
+        }
+        for (id, n) in &counts {
+            if *n > 1 {
+                errors.push(ValidationError::DuplicateId(id.clone()));
+            }
+        }
+
+        // Pass 2: every edge's endpoints must resolve.
+        let mut edges: Vec<&Cell> = Vec::new();
+        collect_edges(&self.root, &mut edges);
+        for edge in &edges {
+            if let Some(src) = &edge.source {
+                if !counts.contains_key(src) {
+                    errors.push(ValidationError::EdgeMissingSource {
+                        edge_id: edge.id.clone(),
+                        source: src.clone(),
+                    });
+                }
+            }
+            if let Some(tgt) = &edge.target {
+                if !counts.contains_key(tgt) {
+                    errors.push(ValidationError::EdgeMissingTarget {
+                        edge_id: edge.id.clone(),
+                        target: tgt.clone(),
+                    });
+                }
+            }
+        }
+
+        ValidationReport { errors }
+    }
 }
 
 /// Outcome of [`MxGraphModel::apply_subgraph`].
@@ -150,6 +201,58 @@ pub struct ApplyResult {
     pub added: Vec<String>,
     /// Number of context cells that were deliberately skipped.
     pub context_ignored: usize,
+}
+
+/// One structural issue found by [`MxGraphModel::validate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationError {
+    /// The model tree contains no cell with id `0` (synthetic root).
+    MissingRoot,
+    /// Two or more cells share the same id.
+    DuplicateId(String),
+    /// An edge references a `source` cell that does not exist.
+    EdgeMissingSource { edge_id: String, source: String },
+    /// An edge references a `target` cell that does not exist.
+    EdgeMissingTarget { edge_id: String, target: String },
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingRoot => write!(f, "missing root cell id=0"),
+            Self::DuplicateId(id) => write!(f, "duplicate cell id: {id}"),
+            Self::EdgeMissingSource { edge_id, source } => {
+                write!(f, "edge {edge_id} references missing source: {source}")
+            }
+            Self::EdgeMissingTarget { edge_id, target } => {
+                write!(f, "edge {edge_id} references missing target: {target}")
+            }
+        }
+    }
+}
+
+/// Aggregated validation outcome for a model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ValidationReport {
+    pub errors: Vec<ValidationError>,
+}
+
+impl ValidationReport {
+    pub fn is_ok(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
+impl std::fmt::Display for ValidationReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_ok() {
+            return write!(f, "validation passed");
+        }
+        for e in &self.errors {
+            writeln!(f, "- {e}")?;
+        }
+        Ok(())
+    }
 }
 
 fn replace_cell_in_place(root: &mut Cell, id: &str, replacement: &Cell) {
@@ -236,6 +339,13 @@ fn collect_edges<'a>(cell: &'a Cell, out: &mut Vec<&'a Cell>) {
     }
     for child in &cell.children {
         collect_edges(child, out);
+    }
+}
+
+fn count_ids(cell: &Cell, counts: &mut std::collections::HashMap<String, usize>) {
+    *counts.entry(cell.id.clone()).or_insert(0) += 1;
+    for child in &cell.children {
+        count_ids(child, counts);
     }
 }
 
