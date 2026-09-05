@@ -12,17 +12,9 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::prompt::{codegen_system_prompt, review_system_prompt};
 use crate::transport::{HttpTransport, TransportError};
 use crate::Usage;
-
-/// System prompt for XML generation calls. Final prompt content is refined in
-/// a later iteration; a stable stub keeps the provider behavior deterministic.
-const GENERATE_SYSTEM_PROMPT: &str =
-    "You are a Draw.io XML generator. Respond with raw drawio XML only.";
-
-/// System prompt for visual review calls.
-const REVIEW_SYSTEM_PROMPT: &str = "You are a Draw.io diagram reviewer. Review the rendered \
-     diagram against the requested checks and answer in JSON only.";
 
 /// Configuration for an OpenAI-compatible provider.
 #[derive(Debug, Clone)]
@@ -163,7 +155,7 @@ impl LlmProvider for OpenAiCompatProvider {
         let body = json!({
             "model": self.config.model,
             "messages": [
-                {"role": "system", "content": GENERATE_SYSTEM_PROMPT},
+                {"role": "system", "content": codegen_system_prompt()},
                 {"role": "user", "content": req.user_prompt},
             ],
         });
@@ -194,7 +186,7 @@ impl LlmProvider for OpenAiCompatProvider {
         let body = json!({
             "model": self.config.model,
             "messages": [
-                {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
+                {"role": "system", "content": review_system_prompt()},
                 {"role": "user", "content": [
                     {"type": "text", "text": user_text},
                     {"type": "image_url", "image_url": {"url": image_url}},

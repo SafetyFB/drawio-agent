@@ -12,7 +12,10 @@ mod provider;
 mod session_usage;
 mod transport;
 
+pub mod prompt;
+
 pub use price::{PriceBook, PriceEntry};
+pub use prompt::*;
 pub use provider::*;
 pub use session_usage::SessionUsage;
 pub use transport::*;
