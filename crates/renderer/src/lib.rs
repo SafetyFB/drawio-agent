@@ -14,7 +14,7 @@ use thiserror::Error;
 
 pub mod driver;
 
-pub use driver::MockDriver;
+pub use driver::{find_chromium, HeadlessChromiumDriver, MockDriver};
 
 /// Render options for a single diagram export.
 #[derive(Debug, Clone)]

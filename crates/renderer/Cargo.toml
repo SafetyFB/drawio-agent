@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Draw.io diagram renderer scaffold: RenderDriver trait + MockDriver, HeadlessChromiumDriver as future work"
+description = "Draw.io diagram renderer: drives headless Chromium with viewer-static.min.js to produce PNG"
 
 [dependencies]
 async-trait = { workspace = true }
@@ -13,12 +13,12 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+base64 = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 
-# Future: chromiumoxide will be added behind a "chromium" feature flag.
-# For the Phase 3 spike, we ship the trait + MockDriver only. Live
-# Chromium integration requires chromiumoxide in the dep tree plus a
-# Chromium binary on PATH; see crates/renderer/README.md.
 

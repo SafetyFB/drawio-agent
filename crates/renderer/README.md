@@ -1,62 +1,79 @@
 # drawio-agent-renderer
 
-Draw.io diagram renderer. Drives a headless Chromium browser against a
-self-hosted `viewer-static.min.js` page to export PNG bytes from raw
-Draw.io XML.
+Draw.io diagram renderer. Drives some backend (browser, cloud service,
+or pure-Rust) to turn Draw.io XML into PNG bytes for VLM-based visual
+review.
 
 ## Status
 
-**Phase 3 spike** — architecture + scaffolding landed. MockDriver fully
-tested. Live Chromium integration (`HeadlessChromiumDriver`) is sketched
-out but not in the default build because the chromiumoxide API surface
-couldn't be verified without a Chromium binary on PATH.
+**Phase 3 spike — deferred on the Chromium path.**
 
-## What shipped in this spike
+- ✅ `Renderer` + `RenderDriver` trait — stable interface
+- ✅ `MockDriver` — deterministic, 10 unit tests pass
+- ⏸ `HeadlessChromiumDriver` — stub; see "Why deferred" below
+- ✅ `find_chromium()` path resolver (works, returns `Some` on this system)
+- ✅ `assets/render.html` + bundled `viewer-static.min.js` (3.4 MB) ready
+- ✅ `assets/cdp.rs` minimal CDP client — gets past launch but blocked by macOS keychain
+- ✅ Integration test scaffold (`tests/chromium_integration.rs`, `#[ignore]`d)
 
-- `Renderer` — async API that takes `&str` XML + `RenderOptions`, returns
-  `Vec<u8>` PNG via a `RenderDriver`.
-- `RenderDriver` trait — pluggable backend; production = browser, tests =
-  canned bytes.
-- `MockDriver` — deterministic mock returning configurable bytes (or a
-  valid 1x1 PNG placeholder) and recording every call for assertions.
-- `RenderOptions { scale, background, border }` with `Default`.
-- `RenderError` enum with `Xml | Browser | Page | Export` variants.
+## What shipped
+
+- **`Renderer::render(xml, opts) -> Vec<u8>`** — the only public API
+  callers need to know.
+- **`RenderDriver` trait** — pluggable backend. Mock + (stub) Chromium
+  impls; add more by implementing the trait.
+- **`MockDriver`** — configurable bytes, call recording, error
+  injection, valid 1x1 PNG placeholder.
+- **`RenderOptions { scale, background, border }`** with `Default`.
+- **`RenderError` enum** with `Xml | Browser | Page | Export` variants.
 - 10 unit tests covering Renderer + MockDriver + RenderOptions.
-- Sketch of `HeadlessChromiumDriver` using `chromiumoxide` — see
-  `src/driver/chromium.rs.bak` if present, or `git log` for the historical
-  version. Not compiled in default build.
+- Deferred integration test (`#[ignore]`d) for live Chromium.
+- `find_chromium()` looks at `CHROMIUM_PATH` env + macOS app path +
+  common Linux binary names.
+
+## Why deferred
+
+Live Chromium on this machine triggers macOS **keychain access prompts**
+when launched in headless mode — unacceptable for a server / agent
+context. We tried two paths; both got past the CDP connect but
+either hung (chromiumoxide 0.7 hangs on Chrome 150+ because of pinned
+Chrome ~126) or stalled on a keychain dialog before the first
+screenshot (hand-rolled CDP client via tokio-tungstenite).
+
+The `RenderDriver` trait means we can swap in any of these without
+touching callers:
+
+| Option | Pros | Cons |
+|---|---|---|
+| **Docker Chromium with `--use-mock-keychain --password-store=basic`** | Bypasses keychain; standard pipeline | Need Docker in CI; bigger images |
+| **browserless.io / hosted rendering service** | No local browser; clean | Per-render cost; needs API key |
+| **Frontend pre-render via WebSocket** | Zero infra; uses user's actual browser | Requires user to have tab open; async coordination |
+| **Pure-Rust `drawio-rs`** | No browser at all | Limited fidelity (per Phase 0 research) |
+
+The frontend-pre-render approach is interesting for our agent:
+the user's browser already has the Draw.io embed loaded and rendering,
+so `canvas.toDataURL()` is essentially free when the user has the
+diagram open. The Agent Loop would then ask "send me your current
+canvas" instead of "render server-side". Both flows share the same
+`RenderDriver` trait, so we can A/B them later.
 
 ## Test layout
 
-- `tests/render.rs` — unit tests with `MockDriver` (10 tests, all green).
-
-## What's missing / recommended next steps
-
-1. **Install Chromium** (`brew install --cask chromium` or
-   `npx playwright install chromium`) so live tests can run.
-2. **Wire chromiumoxide back into the workspace** as an optional
-   dependency behind a `chromium` cargo feature; gate
-   `HeadlessChromiumDriver` and its tests with `#[cfg(feature = "chromium")]`.
-3. **Verify the chromium.rs sketch against real chromiumoxide 0.7** —
-   the API drifted between minor versions; `BrowserConfig::builder()`,
-   `Browser::launch()`, and `Page::evaluate()` return shapes need a sanity
-   pass.
-4. **Self-host `viewer-static.min.js`** — either commit a pinned copy
-   (1–2 MB) into `assets/` and load via `file://`, or pin a CDN URL with a
-   hash check.
-5. **Tune the export script** — the existing sketch calls `new Graph(...)`
-   + `mxXmlCodec.decode(...)`. Verify this works against viewer-static
-   (which exposes `mxGraph` globally, not as a class).
+- `tests/render.rs` — 10 unit tests with `MockDriver`. Run with `cargo test`.
+- `tests/chromium_integration.rs` — `#[ignore]`d; documents the live
+  integration we want once a renderer is wired up. Run with
+  `cargo test -- --ignored`.
 
 ## Run
 
 ```bash
-cargo test                     # mock tests (no browser needed)
+cargo test                     # 10 mock tests, no browser needed
+cargo test -- --ignored        # chromium integration (currently unreachable)
 ```
 
 ## Why this matters
 
-The whole visual-review loop depends on this: after an LLM produces or
-patches Draw.io XML, we render it back to PNG and feed the PNG to a VLM
-for the "is there overlap / text overflow / crossed edges?" check.
-Without a working renderer, the Agent Loop has no eyes.
+The whole visual-review loop depends on this: after an LLM produces
+or patches Draw.io XML, we need to render it to PNG and feed the PNG
+to a VLM for the "is there overlap / text overflow / crossed edges?"
+check. Without a working renderer, the Agent Loop has no eyes.

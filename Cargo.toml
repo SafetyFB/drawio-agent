@@ -23,12 +23,13 @@ base64 = "0.22"
 thiserror = "1"
 anyhow = "1"
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["sync", "time", "rt-multi-thread", "macros", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["sync", "time", "rt-multi-thread", "macros", "fs", "process", "io-util", "net"] }
 tracing = "0.1"
 rand = "0.8"
 futures = "0.3"
 async-stream = "0.3"
+tokio-tungstenite = "0.24"
 
 [profile.dev]
 debug = 1
