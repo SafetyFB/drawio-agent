@@ -7,6 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
+mod price;
+
+pub use price::{PriceBook, PriceEntry};
+
 /// Token usage returned by every LLM call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
