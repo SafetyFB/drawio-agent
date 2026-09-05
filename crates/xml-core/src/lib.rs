@@ -106,6 +106,92 @@ impl MxGraphModel {
             missing,
         }
     }
+
+    /// Apply a [`Subgraph`] back to the model.
+    ///
+    /// - `primary` and `edges` cells: replaced in-place if id exists;
+    ///   inserted under their declared `parent` if id is new. Children
+    ///   of an existing cell are preserved (the subgraph does not own them).
+    /// - `context` cells: **ignored** — read-only reference for the LLM.
+    /// - Cells not in the subgraph: untouched, attributes byte-for-byte
+    ///   preserved.
+    pub fn apply_subgraph(&mut self, sub: &Subgraph) -> ApplyResult {
+        let mut updated: Vec<String> = Vec::new();
+        let mut added: Vec<String> = Vec::new();
+
+        for cell in sub.primary.iter().chain(sub.edges.iter()) {
+            let id = cell.id.clone();
+            if id.is_empty() {
+                continue;
+            }
+            if self.get_mut(&id).is_some() {
+                replace_cell_in_place(&mut self.root, &id, cell);
+                updated.push(id);
+            } else {
+                insert_cell(&mut self.root, cell.clone());
+                added.push(id);
+            }
+        }
+
+        ApplyResult {
+            updated,
+            added,
+            context_ignored: sub.context.len(),
+        }
+    }
+}
+
+/// Outcome of [`MxGraphModel::apply_subgraph`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApplyResult {
+    /// Ids of existing cells that were replaced.
+    pub updated: Vec<String>,
+    /// Ids of cells newly inserted into the model.
+    pub added: Vec<String>,
+    /// Number of context cells that were deliberately skipped.
+    pub context_ignored: usize,
+}
+
+fn replace_cell_in_place(root: &mut Cell, id: &str, replacement: &Cell) {
+    fn walk(node: &mut Cell, id: &str, replacement: &Cell) -> bool {
+        if node.id == id {
+            // Preserve children — they are not part of the subgraph scope.
+            let children = std::mem::take(&mut node.children);
+            *node = replacement.clone();
+            node.children = children;
+            return true;
+        }
+        for child in node.children.iter_mut() {
+            if walk(child, id, replacement) {
+                return true;
+            }
+        }
+        false
+    }
+    walk(root, id, replacement);
+}
+
+fn insert_cell(root: &mut Cell, cell: Cell) {
+    let parent_id = cell.parent.clone().unwrap_or_else(|| "1".to_string());
+    if try_insert_under(root, &parent_id, cell.clone()) {
+        return;
+    }
+    // Parent missing → fall back to root layer (id="1") so we don't lose
+    // the cell entirely. Validation can flag this in a later pass.
+    let _ = try_insert_under(root, "1", cell);
+}
+
+fn try_insert_under(root: &mut Cell, parent_id: &str, cell: Cell) -> bool {
+    if root.id == parent_id {
+        root.children.push(cell);
+        return true;
+    }
+    for child in root.children.iter_mut() {
+        if try_insert_under(child, parent_id, cell.clone()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// A scope extracted from a model for selection-based editing.
