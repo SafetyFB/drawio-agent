@@ -93,13 +93,31 @@ build and caches it under `XDG_CACHE_HOME/drawio-agent/chrome-headless-shell/`
 | `DRAWIO_AGENT_OFFLINE=1` | Skip the download entirely; `find_chromium()` falls through to system chrome or env override. |
 | `DRAWIO_AGENT_CACHE_DIR` | Override the cache root (default: `XDG_CACHE_HOME/drawio-agent/`). |
 
+### Checksum verification
+
+The four SHA-256 hashes of the chrome-headless-shell binary are baked into
+`crates/renderer/src/checksum.rs::CHECKSUMS`. On every build, the downloaded
+binary is verified against the pinned hash; mismatch fails the build with an
+actionable error message.
+
 ### Version bump procedure
 
-1. Update `PINNED_VERSION` in `crates/renderer/build.rs`.
-2. Run `cargo build -p drawio-agent-renderer` — the build will print the
-   new SHA-256 hashes for each platform. Commit those into the
-   `CHECKSUMS` table (TODO — currently hashes are logged but not enforced).
-3. Update the `CHANGELOG` (TODO) entry.
+1. Update `PINNED_VERSION` in `crates/renderer/build.rs` to the new Chrome
+   for Testing version (e.g. `132.0.6834.83`).
+2. Run `cargo build -p drawio-agent-renderer` on **each supported platform**
+   (mac-x64, mac-arm64, linux64, win64 — use `cargo build --target` or CI).
+   The build will fail with a "no pinned SHA-256" error and print the new
+   observed hash for that platform.
+3. Paste each observed hash into the `CHECKSUMS` table in
+   `crates/renderer/src/checksum.rs`.
+4. Re-run `cargo build` to confirm verification passes.
+5. Commit both files together (`build.rs` and `checksum.rs`) in one PR.
+
+### Escape hatch (USE WITH CAUTION)
+
+`DRAWIO_AGENT_ACCEPT_NEW_CHECKSUM=1` allows the build to proceed when a
+platform has no pinned hash yet. Use this only during a version bump when
+capturing hashes for a new platform. Never set this in production CI.
 
 ### Cache reset
 

@@ -19,6 +19,9 @@ use std::time::Duration;
 
 use sha2::Digest;
 
+#[path = "src/checksum.rs"]
+mod checksum;
+
 /// Pinned chrome-for-testing `chrome-headless-shell` version. Verified to
 /// exist at the storage.googleapis.com CDN URL on 2026-09-05.
 const PINNED_VERSION: &str = "131.0.6778.85";
@@ -185,11 +188,13 @@ fn ensure_bundled() -> Result<Option<PathBuf>, String> {
         ));
     }
 
-    // 6. Compute SHA-256 and log it (NOT verified against a pinned value yet —
-    //    this is for first-iteration observability; a follow-up will add the
-    //    expected hashes as an enforced check).
-    if let Some(hash) = compute_sha256(&extracted_bin) {
-        eprintln!("cargo:warning=chrome-headless-shell {platform} SHA-256: {hash}");
+    // 6. Verify checksum (fails build on mismatch).
+    let hash = compute_sha256(&extracted_bin)
+        .ok_or_else(|| format!("compute SHA-256 of {}", extracted_bin.display()))?;
+    if let Err(e) = checksum::verify_checksum(platform, &hash) {
+        // Clean up the half-extracted tmp_dir before failing.
+        let _ = fs::remove_dir_all(&tmp_dir);
+        return Err(e);
     }
 
     // 7. macOS Gatekeeper: strip the quarantine xattr.
@@ -245,6 +250,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DRAWIO_AGENT_CHROMIUM_PATH");
     println!("cargo:rerun-if-env-changed=XDG_CACHE_HOME");
     println!("cargo:rerun-if-env-changed=HOME");
+    println!("cargo:rerun-if-changed=src/checksum.rs");
 
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR");
     let emitted = PathBuf::from(out_dir).join("bundled_chromium.rs");

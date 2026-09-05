@@ -12,6 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
+pub mod checksum;
 pub mod driver;
 
 pub use driver::{
