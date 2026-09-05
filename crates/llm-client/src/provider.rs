@@ -4,11 +4,13 @@
 //! `/chat/completions` endpoint shape used by OpenAI and compatible services.
 
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use base64::Engine;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -75,6 +77,20 @@ pub struct LlmResponse<T> {
     pub duration_ms: u64,
 }
 
+/// A single chunk in a streaming response.
+#[derive(Debug, Clone, Default)]
+pub struct StreamChunk {
+    /// Incremental text delta from the assistant.
+    pub delta: String,
+    /// Set on the final chunk (e.g. `"stop"` or `"length"`).
+    pub finish_reason: Option<String>,
+    /// Total token usage, present on the final chunk when the API reports it.
+    pub usage: Option<Usage>,
+}
+
+/// A stream of [`StreamChunk`]s from a streaming generation call.
+pub type LlmStream = Pin<Box<dyn Stream<Item = Result<StreamChunk, ProviderError>> + Send>>;
+
 /// Errors surfaced by a provider call.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -94,6 +110,11 @@ pub trait LlmProvider: Send + Sync {
         &self,
         req: GenerateRequest,
     ) -> Result<LlmResponse<String>, ProviderError>;
+    /// Stream incremental chunks of the generated content.
+    async fn generate_streaming(
+        &self,
+        req: GenerateRequest,
+    ) -> Result<LlmStream, ProviderError>;
     /// Visually review a rendered diagram.
     async fn review_visual(
         &self,
@@ -184,6 +205,35 @@ impl LlmProvider for OpenAiCompatProvider {
         })
     }
 
+    async fn generate_streaming(
+        &self,
+        req: GenerateRequest,
+    ) -> Result<LlmStream, ProviderError> {
+        let mut body = json!({
+            "model": self.config.model,
+            "stream": true,
+            "messages": [
+                {"role": "system", "content": codegen_system_prompt()},
+                {"role": "user", "content": req.user_prompt},
+            ],
+        });
+        if req.json_mode {
+            body["response_format"] = json!({"type": "json_object"});
+        }
+
+        let raw = self.post(&body).await?;
+        let sse_text: String = raw
+            .as_str()
+            .ok_or_else(|| {
+                ProviderError::Provider(
+                    "streaming: expected response body as string".to_string(),
+                )
+            })?
+            .to_string();
+
+        Ok(Box::pin(parse_sse_stream(sse_text)))
+    }
+
     async fn review_visual(
         &self,
         req: ReviewRequest,
@@ -255,6 +305,63 @@ fn parse_json_codegen_content(content_str: &str) -> Result<String, TransportErro
                 "json_mode: response missing string 'xml' field".to_string(),
             )
         })
+}
+
+/// Parse an SSE-formatted response body into a stream of [`StreamChunk`]s.
+///
+/// Lines starting with `data: ` are JSON payloads. `data: [DONE]`
+/// terminates the stream. Empty lines, SSE comments (`: ...`), and any
+/// other lines are ignored.
+///
+/// Takes ownership of the SSE text so the returned stream is `'static`
+/// and self-contained.
+fn parse_sse_stream(
+    sse_text: String,
+) -> impl Stream<Item = Result<StreamChunk, ProviderError>> + Send {
+    async_stream::try_stream! {
+        for raw_line in sse_text.split('\n') {
+            let line = raw_line.trim_end_matches('\r').trim();
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+            let Some(payload) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if payload == "[DONE]" {
+                break;
+            }
+            let value: Value = serde_json::from_str(payload).map_err(|e| {
+                ProviderError::Provider(format!("invalid SSE JSON payload: {e}"))
+            })?;
+            let delta = value
+                .pointer("/choices/0/delta/content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let finish_reason = value
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let usage = value.get("usage").and_then(|u| {
+                let input = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+                let output = u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
+                if u.is_object() && (input > 0 || output > 0) {
+                    Some(Usage {
+                        input_tokens: input,
+                        output_tokens: output,
+                    })
+                } else {
+                    None
+                }
+            });
+
+            yield StreamChunk {
+                delta,
+                finish_reason,
+                usage,
+            };
+        }
+    }
 }
 
 /// Extract `usage.prompt_tokens` / `usage.completion_tokens`; missing values
