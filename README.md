@@ -20,8 +20,10 @@ Generate/Review/Patch 循环、sessions/trajectory —— 全部由
   （XML 可解析 / id 唯一 / 引用完整），其余行字节级不动，diff 报告
   added/removed/changed 精确到 cell。
 - **模型驱动**：每轮一个 JSON 信封 `{"tool": ..., "args": ...}` 或
-  `{"reply": ..., "done": true}`；工具结果回填下一轮。任意的
-  OpenAI-compatible 端点即可接入。
+  `{"reply": ..., "done": true}`；工具结果回填下一轮。`view` 会把渲染截图
+  作为图像消息直接发给模型（视觉闭环在一条对话里完成，不再有独立的
+  VLM review 阶段）。任意的 OpenAI-compatible 端点即可接入（需支持视觉
+  时用多模态模型）。
 
 ## 构建与测试
 

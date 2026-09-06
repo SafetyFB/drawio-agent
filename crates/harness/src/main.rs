@@ -89,7 +89,7 @@ fn main() {
     }
 
     let harness = Harness::default();
-    let mut tools = Tools::new(true, true);
+    let mut tools = Tools::new(true);
     let mut pending_ctx: String = String::new();
     let mut chat = chat.map(|c| Box::new(c) as Box<dyn Chat>);
 
@@ -126,8 +126,8 @@ fn main() {
             match cmd {
                 "help" => println!("{HELP}"),
                 "quit" | "q" | "exit" => break,
-                "view" => match rt.block_on(tools.view(&doc)) {
-                    Ok(msg) => println!("{msg}"),
+                "view" => match rt.block_on(tools.view(&doc, true)) {
+                    Ok(out) => println!("{}", out.text),
                     Err(e) => eprintln!("{e}"),
                 },
                 "check" => match check_doc(doc.canonical()) {

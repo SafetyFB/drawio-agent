@@ -3,24 +3,74 @@
 
 use std::time::Duration;
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Serialize)]
+/// One content part of a chat message. Text is the default; images are sent
+/// as OpenAI-style `image_url` parts with a base64 data URI (the format GLM
+/// and most OpenAI-compatible vision endpoints accept).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Part {
+    Text(String),
+    /// Raw PNG bytes; serialized to `data:image/png;base64,…`.
+    ImagePng(Vec<u8>),
+}
+
+impl Part {
+    pub fn text(s: impl Into<String>) -> Self {
+        Part::Text(s.into())
+    }
+    pub fn image_png(bytes: Vec<u8>) -> Self {
+        Part::ImagePng(bytes)
+    }
+
+    fn to_json(&self) -> Value {
+        match self {
+            Part::Text(t) => json!({ "type": "text", "text": t }),
+            Part::ImagePng(png) => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+                json!({
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:image/png;base64,{b64}")}
+                })
+            }
+        }
+    }
+}
+
+/// A chat message: role + ordered parts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
-    pub content: String,
+    pub parts: Vec<Part>,
 }
 
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into() }
+        Self { role: "user".into(), parts: vec![Part::Text(content.into())] }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into() }
+        Self { role: "assistant".into(), parts: vec![Part::Text(content.into())] }
     }
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: content.into() }
+        Self { role: "system".into(), parts: vec![Part::Text(content.into())] }
+    }
+    pub fn with_parts(role: impl Into<String>, parts: Vec<Part>) -> Self {
+        Self { role: role.into(), parts }
+    }
+
+    /// Serialize `content` the way the wire protocol wants it: a bare string
+    /// for pure-text messages (max compatibility), an array of typed parts
+    /// otherwise.
+    pub fn content_json(&self) -> Value {
+        if self.parts.len() == 1 {
+            if let Part::Text(t) = &self.parts[0] {
+                return json!(t);
+            }
+        }
+        Value::Array(self.parts.iter().map(|p| p.to_json()).collect())
     }
 }
 
@@ -97,7 +147,7 @@ impl Chat for OpenAiChat {
         body.insert("model".into(), serde_json::json!(self.model));
         let msgs: Vec<serde_json::Value> = messages
             .iter()
-            .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+            .map(|m| serde_json::json!({ "role": m.role, "content": m.content_json() }))
             .collect();
         body.insert("messages".into(), serde_json::Value::Array(msgs));
         body.insert(
@@ -143,5 +193,34 @@ fn truncate(s: &str, n: usize) -> String {
         format!("{t}…")
     } else {
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_only_content_is_bare_string() {
+        let m = Message::user("hi");
+        assert_eq!(m.content_json(), json!("hi"));
+    }
+
+    #[test]
+    fn image_part_serializes_as_data_uri_array() {
+        let m = Message::with_parts(
+            "user",
+            vec![
+                Part::text("看这张图"),
+                Part::image_png(vec![0x89, b'P', b'N', b'G', 1, 2, 3]),
+            ],
+        );
+        let v = m.content_json();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[1]["type"], "image_url");
+        let url = arr[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+        assert!(url.contains("ECAw"), "raw bytes present in base64: {url}");
     }
 }

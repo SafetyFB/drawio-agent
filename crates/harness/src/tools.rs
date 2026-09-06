@@ -9,14 +9,35 @@ use serde_json::Value;
 
 use crate::xmlfile::{check_doc, lines_in, total_lines, CheckReport, EditReport, XmlDoc};
 
-/// Result of executing one tool: free-form text fed back to the model.
-pub type ToolResult = String;
+/// Result of executing one tool: free-form text fed back to the model,
+/// optionally carrying an image (the `view` tool returns the screenshot so
+/// the engine can send it to a vision-capable model as an image part).
+#[derive(Debug, Clone, Default)]
+pub struct ToolOutput {
+    pub text: String,
+    pub image_png: Option<Vec<u8>>,
+}
+
+impl ToolOutput {
+    pub fn text(s: impl Into<String>) -> Self {
+        Self { text: s.into(), image_png: None }
+    }
+    pub fn with_image(text: impl Into<String>, png: Vec<u8>) -> Self {
+        Self { text: text.into(), image_png: Some(png) }
+    }
+    pub fn plain(&self) -> String {
+        if self.image_png.is_some() {
+            format!("{}（附渲染截图）", self.text)
+        } else {
+            self.text.clone()
+        }
+    }
+}
 
 /// Renderer backend shared across `view` calls (constructed lazily per call
 /// for now — chromium launch is ~1s, fine for interactive use).
 pub struct Tools {
     pub render: bool,
-    pub open_png: bool,
     pub renderer: Option<Arc<drawio_agent_renderer::Renderer>>,
 }
 
@@ -24,7 +45,6 @@ impl std::fmt::Debug for Tools {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tools")
             .field("render", &self.render)
-            .field("open_png", &self.open_png)
             .field("renderer", &self.renderer.is_some())
             .finish()
     }
@@ -47,12 +67,14 @@ fn numbered(text: &str, start: usize) -> String {
 }
 
 impl Tools {
-    pub fn new(render: bool, open_png: bool) -> Self {
-        Self {
-            render,
-            open_png,
-            renderer: None,
-        }
+    pub fn new(render: bool) -> Self {
+        Self { render, renderer: None }
+    }
+
+    /// Test seam: inject a canned renderer (e.g. built on
+    /// `drawio_agent_renderer::MockDriver`) so `view` works without chromium.
+    pub fn with_renderer(renderer: drawio_agent_renderer::Renderer) -> Self {
+        Self { render: true, renderer: Some(Arc::new(renderer)) }
     }
 
     /// Tool docs embedded in the system prompt.
@@ -78,8 +100,10 @@ impl Tools {
    确定性校验：XML 结构、id 唯一、parent/source/target 引用完整。
 
 6. view   {}
-   渲染当前文件为 PNG（文件旁 diagram.png）并打开。看完图再决定改哪里。
-   注意：画布位置与 xml 行区间没有 1:1 对应，需用 locate 或几何值换算。
+   渲染当前文件为截图，并作为图像消息发给你 —— 你会真正看到这张图。
+   仔细检查：节点重叠、文字溢出框体、连线错位/穿框、箭头方向、布局失衡。
+   看完再决定改哪里；改完几何/样式后应再次 view 核对，确认没有引入新问题。
+   注意：画布坐标与 xml 行区间没有 1:1 对应，定位用 locate，看几何值用 read。
 
 7. done —— {"reply": "给用户的总结", "done": true}
    认为任务完成时使用；回复会直接展示给用户。"#
@@ -93,28 +117,39 @@ impl Tools {
         doc: &mut XmlDoc,
         name: &str,
         args: &Value,
-    ) -> Result<ToolResult, String> {
+    ) -> Result<ToolOutput, String> {
         match name {
             "read" => self.read(doc, args),
             "locate" => self.locate(doc, args),
             "edit" => self.edit(doc, args, false),
             "draw" => self.edit(doc, args, true),
             "check" => self.check(doc),
-            "view" => self.view(doc).await,
+            "view" => {
+                let open = args
+                    .get("open")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.view(doc, open).await
+            }
             other => Err(format!("未知工具 `{other}`。可用: read locate edit draw check view")),
         }
     }
 
-    fn read(&self, doc: &XmlDoc, args: &Value) -> Result<ToolResult, String> {
+    fn read(&self, doc: &XmlDoc, args: &Value) -> Result<ToolOutput, String> {
         let spec = args
             .get("range")
             .and_then(Value::as_str)
             .ok_or_else(|| "read 需要参数 range".to_string())?;
         let (a, b) = resolve_arg(doc, spec)?;
-        Ok(format!("@{}:{} 内容如下:\n{}", file_stem(doc), range_str(a, b), numbered(&lines_in(doc.canonical(), a, b), a)))
+        Ok(ToolOutput::text(format!(
+            "@{}:{} 内容如下:\n{}",
+            file_stem(doc),
+            range_str(a, b),
+            numbered(&lines_in(doc.canonical(), a, b), a)
+        )))
     }
 
-    fn locate(&self, doc: &XmlDoc, args: &Value) -> Result<ToolResult, String> {
+    fn locate(&self, doc: &XmlDoc, args: &Value) -> Result<ToolOutput, String> {
         let query = args
             .get("query")
             .and_then(Value::as_str)
@@ -149,13 +184,16 @@ impl Tools {
             }
         }
         if hits.is_empty() {
-            Ok(format!("没有找到包含 `{query}` 的 cell（共 {} 个 cell）", doc.cells.len()))
+            Ok(ToolOutput::text(format!(
+                "没有找到包含 `{query}` 的 cell（共 {} 个 cell）",
+                doc.cells.len()
+            )))
         } else {
-            Ok(format!("命中 {} 个 cell:\n{}", hits.len(), hits.join("\n")))
+            Ok(ToolOutput::text(format!("命中 {} 个 cell:\n{}", hits.len(), hits.join("\n"))))
         }
     }
 
-    fn edit(&mut self, doc: &mut XmlDoc, args: &Value, whole: bool) -> Result<ToolResult, String> {
+    fn edit(&mut self, doc: &mut XmlDoc, args: &Value, whole: bool) -> Result<ToolOutput, String> {
         let (range_spec, text) = if whole {
             let xml = args
                 .get("xml")
@@ -180,30 +218,34 @@ impl Tools {
             resolve_arg(doc, &range_spec)?
         };
         match doc.apply_edit(start, end, &text) {
-            Ok(report) if report.noop => Ok("no-op：内容与当前文件相同，未修改。".into()),
+            Ok(report) if report.noop => Ok(ToolOutput::text("no-op：内容与当前文件相同，未修改。")),
             Ok(report) => {
                 doc.save()
                     .map_err(|e| format!("保存失败: {e}"))?;
-                Ok(format!(
+                Ok(ToolOutput::text(format!(
                     "编辑已应用并保存。{}",
                     report_summary(&report)
-                ))
+                )))
             }
             Err(e) => Err(format!("编辑被拒绝（文件未改动）: {e}")),
         }
     }
 
-    fn check(&self, doc: &XmlDoc) -> Result<ToolResult, String> {
+    fn check(&self, doc: &XmlDoc) -> Result<ToolOutput, String> {
         match check_doc(doc.canonical()) {
-            Ok(r) => Ok(r.summarize()),
+            Ok(r) => Ok(ToolOutput::text(r.summarize())),
             Err(e) => Err(format!("校验失败: {e}")),
         }
     }
 
-    /// Render current doc to PNG (file dir) and open it.
-    pub async fn view(&mut self, doc: &XmlDoc) -> Result<ToolResult, String> {
+    /// Render current doc to PNG. `open=true` also opens it in the system
+    /// viewer (human `/view`); model-driven calls pass `false` and instead
+    /// get the PNG back as an image part.
+    pub async fn view(&mut self, doc: &XmlDoc, open: bool) -> Result<ToolOutput, String> {
         if !self.render {
-            return Ok("渲染未启用（无 chromium）。请用 /view 在本地渲染查看。".into());
+            return Ok(ToolOutput::text(
+                "渲染未启用（无 chromium）。请用 /view 在本地渲染查看。",
+            ));
         }
         let renderer = match &self.renderer {
             Some(r) => r.clone(),
@@ -225,24 +267,20 @@ impl Tools {
         let opts = drawio_agent_renderer::RenderOptions::default();
         match renderer.render(doc.canonical(), &opts).await {
             Ok(png) => {
-                let stem = file_stem(doc).replace(".xml", "").replace(".drawio", "");
-                let png_path = doc
-                    .path
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join(format!("{stem}.png"));
-                if std::fs::write(&png_path, &png).is_err() {
-                    return Ok(format!("已渲染 {} bytes，但写入 {} 失败", png.len(), png_path.display()));
+                let mut text = format!("渲染成功 ({} bytes, cells={})", png.len(), doc.cells.len());
+                if open {
+                    let stem = file_stem(doc).replace(".xml", "").replace(".drawio", "");
+                    let png_path = doc
+                        .path
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .join(format!("{stem}.png"));
+                    if std::fs::write(&png_path, &png).is_ok() {
+                        open_with_system_viewer(&png_path);
+                        text = format!("已渲染并打开 {} ({}, cells={})", png_path.display(), png.len(), doc.cells.len());
+                    }
                 }
-                if self.open_png {
-                    open_with_system_viewer(&png_path);
-                }
-                Ok(format!(
-                    "已渲染并保存 {} ({} bytes, cells={})",
-                    png_path.display(),
-                    png.len(),
-                    doc.cells.len()
-                ))
+                Ok(ToolOutput::with_image(text, png))
             }
             Err(e) => Err(format!("渲染失败: {e}")),
         }
@@ -335,13 +373,13 @@ mod tests {
     #[tokio::test]
     async fn edit_by_cell_id_applies_and_reports() {
         let mut d = doc();
-        let mut t = Tools::new(false, false);
+        let mut t = Tools::new(false);
         let args = serde_json::json!({
             "range": "cell:svc-a",
             "text": r#"<mxCell id="svc-a" value="Payments" vertex="1" parent="1"><mxGeometry x="40" y="60" width="200" height="60" as="geometry"/></mxCell>"#
         });
         let out = t.run(&mut d, "edit", &args).await.unwrap();
-        assert!(out.contains("changed=[svc-a]"), "{out}");
+        assert!(out.text.contains("changed=[svc-a]"), "{}", out.text);
         assert!(d.canonical().contains("Payments"));
         assert!(!d.canonical().contains("Order Service"));
     }
@@ -349,10 +387,10 @@ mod tests {
     #[tokio::test]
     async fn draw_replaces_whole_file() {
         let mut d = doc();
-        let mut t = Tools::new(false, false);
+        let mut t = Tools::new(false);
         let xml = r#"<mxfile host="x"><diagram id="d2"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="n1" value="New" vertex="1" parent="1"><mxGeometry x="0" y="0" width="100" height="50" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
         let out = t.run(&mut d, "draw", &serde_json::json!({ "xml": xml })).await.unwrap();
-        assert!(out.contains("added=[n1]"), "{out}");
+        assert!(out.text.contains("added=[n1]"), "{}", out.text);
         assert!(d.id_to_cell("svc-a").is_none());
     }
 
@@ -360,7 +398,7 @@ mod tests {
     async fn bad_edit_is_rejected_and_file_unchanged() {
         let mut d = doc();
         let before = d.canonical().to_string();
-        let mut t = Tools::new(false, false);
+        let mut t = Tools::new(false);
         let out = t.run(&mut d, "edit", &serde_json::json!({"range": "cell:svc-a", "text": "<mxCell>"})).await;
         assert!(out.is_err());
         assert_eq!(d.canonical(), before);
@@ -369,16 +407,16 @@ mod tests {
     #[tokio::test]
     async fn locate_finds_by_value() {
         let mut d = doc();
-        let mut t = Tools::new(false, false);
+        let mut t = Tools::new(false);
         let out = t.run(&mut d, "locate", &serde_json::json!({"query": "order"})).await.unwrap();
-        assert!(out.contains("svc-a"), "{out}");
-        assert!(out.contains("@"), "{out}");
+        assert!(out.text.contains("svc-a"), "{}", out.text);
+        assert!(out.text.contains("@"), "{}", out.text);
     }
 
     #[tokio::test]
     async fn read_returns_numbered_lines() {
         let mut d = doc();
-        let mut t = Tools::new(false, false);
+        let mut t = Tools::new(false);
         let start_line = {
             let a = d.id_to_cell("svc-a").unwrap();
             a.start_line
@@ -392,7 +430,7 @@ mod tests {
             .run(&mut d, "read", &serde_json::json!({"range": range}))
             .await
             .unwrap();
-        assert!(out.contains("Order Service"), "{out}");
-        assert!(out.contains(&format!("{start_line}|")));
+        assert!(out.text.contains("Order Service"), "{}", out.text);
+        assert!(out.text.contains(&format!("{start_line}|")));
     }
 }

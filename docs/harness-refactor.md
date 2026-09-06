@@ -73,7 +73,12 @@ Drawio 原始文件通常压缩且单行 —— 行号无意义、diff 不可读
 - [x] M4 chat + loop：接入任意 OpenAI-compatible 端点（`DRAWIO_LLM_*` env），
       模型驱动工具闭环（已用 GLM 真实端点 E2E 验证：模型自主 3-4 次工具调用，
       只有目标 cell 变化，其余 cell 字节级不变）
-- [ ] M5 view 带图像 part 注入模型（视觉自审闭环回到一条 chat 里）
+- [x] M5 view 带图像 part 注入模型（视觉自审闭环回到一条 chat 里）：
+      `Message` 支持 text+image parts（OpenAI 风格 data-URI，GLM-4.6v 实测）；
+      view 工具把截图作为图像消息回填，模型真正“看见”再编辑；旧截图在
+      新截图到达后自动折叠，上下文至多保留最近一张。E2E：两个重叠节点，
+      模型自主 7 次工具调用（view→定位→edit→view 核对→done）修复对齐，
+      svc-a 位置零改动
 - [ ] M6 （可选）web 画布瘦壳：mxGraph 渲染 + 框选 → cell ids，其余全部走
       本 harness 语义
 

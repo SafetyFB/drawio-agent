@@ -4,8 +4,8 @@
 
 use serde_json::{Value, json};
 
-use crate::chat::{Chat, Message};
-use crate::tools::Tools;
+use crate::chat::{Chat, Message, Part};
+use crate::tools::{ToolOutput, Tools};
 use crate::xmlfile::XmlDoc;
 
 #[derive(Debug)]
@@ -173,19 +173,51 @@ impl Harness {
             let args = env.get("args").cloned().unwrap_or(json!({}));
             history.push(Message::assistant(raw));
             let result = match tools.run(doc, name, &args).await {
-                Ok(text) => text,
-                Err(text) => format!("工具执行失败: {text}"),
+                Ok(out) => out,
+                Err(text) => ToolOutput::text(format!("工具执行失败: {text}")),
             };
             tool_calls += 1;
-            history.push(Message::user(format!("[工具结果 {name}]\n{result}")));
+            let mut parts = vec![Part::Text(format!("[工具结果 {name}]\n{}", result.text))];
+            if let Some(png) = result.image_png {
+                parts.push(Part::ImagePng(png));
+            }
+            history.push(Message::with_parts("user", parts));
+            // Keep vision tokens bounded: once a newer screenshot arrives,
+            // older ones in the transcript become "folded" text (the model
+            // already acted on them; re-view if needed).
+            fold_old_images(&mut history);
         }
         Err(format!("达到最大轮数 {} 仍未完成", self.max_turns))
+    }
+}
+
+/// Replace image parts in every message except the last one with a note,
+/// keeping only the most recent screenshot in the transcript.
+fn fold_old_images(history: &mut [Message]) {
+    let last = history.len().saturating_sub(1);
+    for (i, m) in history.iter_mut().enumerate() {
+        if i == last {
+            continue;
+        }
+        let mut has_image = false;
+        for p in &m.parts {
+            if matches!(p, Part::ImagePng(_)) {
+                has_image = true;
+                break;
+            }
+        }
+        if has_image {
+            m.parts.retain(|p| !matches!(p, Part::ImagePng(_)));
+            m.parts.push(Part::Text("（该轮截图已折叠；如需再看请重新调用 view）".into()));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xmlfile::XmlDoc;
+    use std::collections::VecDeque;
 
     #[test]
     fn envelope_parses_plain_and_fenced() {
@@ -205,5 +237,121 @@ mod tests {
     fn envelope_rejects_garbage() {
         assert!(parse_envelope("抱歉我不知道").is_err());
         assert!(parse_envelope("{\"tool\": \"edit\"").is_err());
+    }
+
+    /// Scripted fake: returns envelopes in order, records every transcript
+    /// snapshot it was sent.
+    struct FakeChat {
+        script: VecDeque<String>,
+        snapshots: Vec<Vec<Message>>,
+    }
+
+    impl FakeChat {
+        fn new(script: Vec<&str>) -> Self {
+            Self {
+                script: script.into_iter().map(String::from).collect(),
+                snapshots: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Chat for FakeChat {
+        async fn complete(&mut self, messages: &[Message]) -> Result<String, crate::chat::ChatError> {
+            self.snapshots.push(messages.to_vec());
+            self.script
+                .pop_front()
+                .ok_or(crate::chat::ChatError::Empty)
+        }
+    }
+
+    fn contains_image_parts(msgs: &[Message]) -> bool {
+        msgs.iter().any(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, Part::ImagePng(_)))
+        })
+    }
+
+    const SAMPLE: &str = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" vertex="1" parent="1"><mxGeometry x="0" y="0" width="100" height="50" as="geometry"/></mxCell><mxCell id="b" value="B" vertex="1" parent="1"><mxGeometry x="200" y="0" width="100" height="50" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+
+    #[tokio::test]
+    async fn view_image_roundtrip_drives_edits() {
+        // Scripted model: 1) view -> receives a screenshot back as an image
+        // part, 2) edit cell `b`, 3) done.
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let replacement = r#"<mxCell id="b" value="B v2" vertex="1" parent="1"><mxGeometry x="220" y="0" width="120" height="50" as="geometry"/></mxCell>"#;
+        let edit_env = json!({
+            "tool": "edit",
+            "args": { "range": "cell:b", "text": replacement }
+        })
+        .to_string();
+        let mut fake = FakeChat::new(vec![
+            r#"{"tool":"view","args":{}}"#,
+            &edit_env,
+            r#"{"reply":"改好了","done":true}"#,
+        ]);
+        let png = vec![0x89, b'P', b'N', b'G'];
+        let mock = drawio_agent_renderer::MockDriver::new().with_bytes(png.clone());
+        let renderer = drawio_agent_renderer::Renderer::new(std::sync::Arc::new(mock));
+        let mut tools = Tools::with_renderer(renderer);
+        let harness = Harness::default();
+
+        let outcome = harness
+            .run(&mut fake, &mut tools, &mut doc, "两个节点重叠了，看看并修复 b", "")
+            .await
+            .unwrap();
+        assert_eq!(outcome.tool_calls, 2);
+        assert_eq!(outcome.reply, "改好了");
+        // the transcript handed to the *second* model call must contain the
+        // screenshot as an image part (tool result of view)
+        assert_eq!(fake.snapshots.len(), 3);
+        let after_view = &fake.snapshots[1];
+        assert!(contains_image_parts(after_view), "view 的结果必须带图像 part");
+        // image part is the second part of the tool-result user message
+        let user_img = after_view
+            .iter()
+            .find(|m| m.role == "user" && m.parts.len() == 2)
+            .expect("view 工具结果消息应有 text+image 两个 part");
+        match &user_img.parts[1] {
+            Part::ImagePng(b) => assert_eq!(b, &png),
+            _ => panic!("第二个 part 应为 PNG"),
+        }
+        // and the edit really landed
+        assert!(doc.canonical().contains("B v2"));
+        assert!(doc.id_to_cell("b").is_some());
+    }
+
+    #[tokio::test]
+    async fn old_screenshots_are_folded_after_a_newer_view() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        // view -> edit b -> view -> done: the first screenshot must be folded
+        // once the second arrives, so at most one image is ever in context.
+        let mut fake = FakeChat::new(vec![
+            r#"{"tool":"view","args":{}}"#,
+            r#"{"tool":"edit","args":{"range":"cell:b","text":"<mxCell id=\"b\" value=\"B2\" parent=\"1\"/>"}}"#,
+            r#"{"tool":"view","args":{}}"#,
+            r#"{"reply":"done","done":true}"#,
+        ]);
+        let mock = drawio_agent_renderer::MockDriver::new()
+            .with_bytes(vec![0x89, b'P', b'N', b'G', 0x0d]);
+        let renderer = drawio_agent_renderer::Renderer::new(std::sync::Arc::new(mock));
+        let mut tools = Tools::with_renderer(renderer);
+        let outcome = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "检查布局", "")
+            .await
+            .unwrap();
+        assert_eq!(outcome.tool_calls, 3);
+        let final_snapshot = fake.snapshots.last().unwrap();
+        let images = final_snapshot
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter(|p| matches!(p, Part::ImagePng(_)))
+            .count();
+        assert_eq!(images, 1, "上下文中最多保留最近一张截图");
+        // the folded one became an explicit note
+        assert!(final_snapshot.iter().any(|m| {
+            m.parts.iter().any(|p| matches!(p, Part::Text(t) if t.contains("已折叠")))
+        }));
     }
 }
