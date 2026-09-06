@@ -619,6 +619,48 @@ function setupDebugHud() {
   hud.id = 'debug-hud';
   hud.style.cssText = 'position:fixed;top:70px;right:360px;z-index:99;background:rgba(0,0,0,.85);color:#8f8;font:11px/1.5 monospace;padding:8px 10px;border-radius:8px;white-space:pre;';
   document.body.appendChild(hud);
+  // 状态矩形叠加层：把每个 cell 的 state 画成彩色框叠在画布上。
+  // 彩色框 = 系统认为 cell 所在的位置（命中检测也用它）。
+  // 如果框与花瓣错位 → 渲染/状态分叉；如果框套着花瓣但点选还是错 → 坐标问题。
+  const overlay = document.createElement('div');
+  overlay.id = 'state-overlay';
+  overlay.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:30;';
+  currentGraph ? currentGraph.container.appendChild(overlay) : null;
+  const paintStateOverlay = () => {
+    if (!currentGraph) return;
+    if (!overlay.parentNode) currentGraph.container.appendChild(overlay);
+    overlay.innerHTML = '';
+    const model = currentGraph.getModel();
+    const walk = (c) => {
+      if (c.id && c.id !== '0' && c.id !== '1') {
+        const st = currentGraph.view.getState(c);
+        if (st && st.width > 0) {
+          const d = document.createElement('div');
+          d.style.cssText = 'position:absolute;left:' + st.x + 'px;top:' + st.y + 'px;width:' + st.width + 'px;height:' + st.height + 'px;border:1px dashed #0f0;color:#0f0;font:10px monospace;';
+          d.textContent = c.id;
+          overlay.appendChild(d);
+        }
+      }
+      for (let i = 0; i < model.getChildCount(c); i++) walk(model.getChildAt(c, i));
+    };
+    walk(model.getRoot());
+  };
+  paintStateOverlay();
+  // 平移/重绘后刷新叠加层
+  const origScaleAndTranslate = currentGraph ? currentGraph.view.scaleAndTranslate.bind(currentGraph.view) : null;
+  if (origScaleAndTranslate) {
+    currentGraph.view.scaleAndTranslate = function (a, b, c) {
+      origScaleAndTranslate(a, b, c);
+      paintStateOverlay();
+    };
+  }
+  const origLoad = window.loadXmlIntoCanvas;
+  window.loadXmlIntoCanvas = function (xml) {
+    origLoad(xml);
+    setTimeout(paintStateOverlay, 50);
+  };
+  document.addEventListener('pointerup', () => setTimeout(paintStateOverlay, 0));
+
   // cell 状态矩形 vs SVG 实际屏幕矩形（视觉/状态是否分叉的诊断核心）
   const cellRects = () => {
     if (!currentGraph) return '';
