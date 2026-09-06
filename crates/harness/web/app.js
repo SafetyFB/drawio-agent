@@ -1272,6 +1272,7 @@ const cfgThinking = $('cfg-thinking');
 const cfgPriceIn = $('cfg-price-in');
 const cfgPriceOut = $('cfg-price-out');
 const cfgBudget = $('cfg-budget');
+const cfgMaxTurns = $('cfg-max-turns');
 
 function fmtCost(v) { return '¥' + (v == null ? '?' : v.toFixed(4)); }
 
@@ -1319,6 +1320,7 @@ function renderCurrentCfg(cfg) {
   cfgPriceIn.value = (llm.price_input_per_m || 0);
   cfgPriceOut.value = (llm.price_output_per_m || 0);
   cfgBudget.value = llm.budget_yuan != null ? llm.budget_yuan : '';
+  cfgMaxTurns.value = llm.max_turns || 24;
 }
 
 async function openSettings() {
@@ -1371,6 +1373,7 @@ function configPayload() {
     price_input_per_m: num(cfgPriceIn.value),
     price_output_per_m: num(cfgPriceOut.value),
     budget_yuan: opt(cfgBudget.value),
+    max_turns: parseInt(cfgMaxTurns.value, 10) || 24,
   };
 }
 

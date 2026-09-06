@@ -385,10 +385,12 @@ fn llm_view() -> serde_json::Value {
             "price_input_per_m": s.price_input_per_m,
             "price_output_per_m": s.price_output_per_m,
             "budget_yuan": s.budget_yuan,
+            "max_turns": s.max_turns.max(1),
         }),
         None => json!({ "kind": "unconfigured", "base_url": "", "model": "", "api_key_masked": "",
             "context_length": null, "thinking": "default",
-            "price_input_per_m": 0.0, "price_output_per_m": 0.0, "budget_yuan": null }),
+            "price_input_per_m": 0.0, "price_output_per_m": 0.0, "budget_yuan": null,
+            "max_turns": crate::config::default_max_turns() }),
     }
 }
 
@@ -422,6 +424,8 @@ struct ConfigPutReq {
     price_output_per_m: Option<f64>,
     #[serde(default)]
     budget_yuan: Option<f64>,
+    #[serde(default)]
+    max_turns: Option<usize>,
 }
 
 async fn api_config_put(
@@ -452,6 +456,7 @@ async fn api_config_put(
         price_input_per_m: req.price_input_per_m.unwrap_or(0.0),
         price_output_per_m: req.price_output_per_m.unwrap_or(0.0),
         budget_yuan: req.budget_yuan,
+        max_turns: req.max_turns.unwrap_or(config::default_max_turns()).max(1),
     };
     let Some(path) = config::config_file_path() else {
         return Json(json!({ "ok": false, "error": "找不到 config 文件路径（HOME 未设置？）" }));
@@ -613,7 +618,8 @@ async fn api_chat_stream(
         };
         // Canvas selection -> @cell refs (same as REPL /sel)。
         let ctx = selection_ctx(&req.cell_ids, &doc);
-        let harness = Harness::default();
+        let mut harness = Harness::default();
+        harness.max_turns = opts.max_turns.max(1);
         let tx2 = tx.clone();
         let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
         let events2 = events.clone();

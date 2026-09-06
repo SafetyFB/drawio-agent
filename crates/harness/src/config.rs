@@ -58,6 +58,14 @@ pub struct LlmSettings {
     /// Optional session spend cap in ¥; the agent stops when reached.
     #[serde(default)]
     pub budget_yuan: Option<f64>,
+    /// Max model rounds per single ask (1 round = 1 LLM call + its tool
+    /// execution); exceeding it aborts with an actionable hint.
+    #[serde(default = "default_max_turns")]
+    pub max_turns: usize,
+}
+
+pub fn default_max_turns() -> usize {
+    24
 }
 
 /// ¥ cost of a usage at the given settings (0 price = 0 cost, token 照常统计).

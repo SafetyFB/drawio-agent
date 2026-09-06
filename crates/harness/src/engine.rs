@@ -97,6 +97,8 @@ pub struct RunOpts {
     /// ¥ left of the session budget for this run. When the run's spend
     /// reaches this, the engine stops with a clear budget message.
     pub budget_remaining: f64,
+    /// Max model rounds for this run (configurable in the settings panel).
+    pub max_turns: usize,
 }
 
 impl Default for RunOpts {
@@ -107,6 +109,7 @@ impl Default for RunOpts {
             price_input_per_m: 0.0,
             price_output_per_m: 0.0,
             budget_remaining: f64::INFINITY,
+            max_turns: crate::config::default_max_turns(),
         }
     }
 }
@@ -119,6 +122,7 @@ impl RunOpts {
             price_input_per_m: s.price_input_per_m,
             price_output_per_m: s.price_output_per_m,
             budget_remaining: f64::INFINITY,
+            max_turns: s.max_turns.max(1),
         }
     }
 }
@@ -134,7 +138,7 @@ pub struct Harness {
 impl Default for Harness {
     fn default() -> Self {
         Self {
-            max_turns: 12,
+            max_turns: crate::config::default_max_turns(),
             max_llm_retries: 2,
         }
     }
@@ -589,7 +593,10 @@ impl Harness {
         }
         stats.add(&usage, spent);
         remember!();
-        Err(format!("达到最大轮数 {} 仍未完成", self.max_turns))
+        Err(format!(
+            "达到最大轮数 {} 仍未完成（可在设置面板调大「最大轮数」，或把任务拆小分步完成）",
+            self.max_turns
+        ))
     }
 }
 

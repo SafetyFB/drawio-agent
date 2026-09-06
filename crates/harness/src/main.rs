@@ -161,7 +161,13 @@ fn main() {
     // can run as a background task while the main thread keeps reading
     // stdin (its only job while busy is to accept /stop).
     let repl = Arc::new(tokio::sync::Mutex::new(ReplSession {
-        harness: Harness::default(),
+        harness: {
+            let mut h = Harness::default();
+            if let Some(cfg) = drawio_harness::config::effective_settings() {
+                h.max_turns = cfg.max_turns.max(1);
+            }
+            h
+        },
         tools: Tools::new(true),
         doc,
         usage: drawio_harness::SessionStats::default(),

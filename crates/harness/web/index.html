@@ -62,6 +62,12 @@
           <input id="cfg-context-length" type="number" min="1024" step="1024" placeholder="128000" autocomplete="off">
         </label>
         <label class="field">
+          <span>单次最大轮数（模型每轮一次工具执行，超限自动中断）</span>
+          <input id="cfg-max-turns" type="number" min="1" step="1" placeholder="24" autocomplete="off">
+        </label>
+      </div>
+      <div class="grid2">
+        <label class="field">
           <span>思考模式</span>
           <select id="cfg-thinking">
             <option value="default">跟随模型默认</option>
