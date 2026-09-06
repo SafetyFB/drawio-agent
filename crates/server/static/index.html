@@ -44,37 +44,31 @@
     </section>
 
     <aside class="ai-panel" aria-label="AI assistant">
-      <div id="selection-patch" class="selection-patch" hidden>
-        <div class="selection-header">
-          <span class="selection-chip" id="selection-chip">0 selected</span>
-          <button type="button" class="link-btn" id="selection-clear">clear</button>
-        </div>
-        <textarea id="selection-instruction" rows="2" placeholder="e.g. 把这两个 box 之间的距离拉远"></textarea>
-        <div class="selection-actions">
-          <button type="button" id="selection-modify-btn" class="primary-btn" disabled>Modify selected</button>
-        </div>
-      </div>
+      <div id="chat-thread" class="chat-thread" aria-live="polite" aria-label="Conversation"></div>
 
-      <label for="prompt" class="panel-label">AI 助手</label>
-      <textarea id="prompt" rows="6" placeholder="Describe the diagram you want…"></textarea>
-      <div id="refine-hint" class="refine-hint" hidden aria-live="polite">
-        <span class="refine-hint-icon" aria-hidden="true">💡</span>
-        <span class="refine-hint-text">Refine will re-render and replace your current canvas.</span>
-        <button type="button" id="refine-hint-cta" class="refine-hint-cta">Run as Fast</button>
-      </div>
-      <div class="send-row">
-        <div class="thinking-toggle" role="radiogroup" aria-label="Thinking depth">
-          <button type="button" class="thinking-option" data-depth="fast" role="radio" aria-checked="true">
-            <span class="thinking-icon" aria-hidden="true">⚡</span> Fast
-          </button>
-          <button type="button" class="thinking-option" data-depth="refine" role="radio" aria-checked="false">
-            <span class="thinking-icon" aria-hidden="true">🔄</span> Refine
+      <div class="composer">
+        <div id="prompt-attachments" class="prompt-attachments" hidden></div>
+        <label for="prompt" class="panel-label sr-only">Message</label>
+        <textarea id="prompt" rows="3" placeholder="Describe the diagram you want…  (框选节点后会作为引用附加到本条消息)"></textarea>
+        <div id="refine-hint" class="refine-hint" hidden aria-live="polite">
+          <span class="refine-hint-icon" aria-hidden="true">💡</span>
+          <span class="refine-hint-text">Refine will re-render and replace your current canvas.</span>
+          <button type="button" id="refine-hint-cta" class="refine-hint-cta">Run as Fast</button>
+        </div>
+        <div class="send-row">
+          <div class="thinking-toggle" role="radiogroup" aria-label="Thinking depth">
+            <button type="button" class="thinking-option" data-depth="fast" role="radio" aria-checked="true">
+              <span class="thinking-icon" aria-hidden="true">⚡</span> Fast
+            </button>
+            <button type="button" class="thinking-option" data-depth="refine" role="radio" aria-checked="false">
+              <span class="thinking-icon" aria-hidden="true">🔄</span> Refine
+            </button>
+          </div>
+          <button type="button" id="send-btn" class="primary-btn send-btn" disabled>
+            <span>Send</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
           </button>
         </div>
-        <button type="button" id="send-btn" class="primary-btn send-btn" disabled>
-          <span>Send</span>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-        </button>
       </div>
       <div id="run-status" class="run-status" style="display:none">
         <span class="spinner" aria-hidden="true"></span>

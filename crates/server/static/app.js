@@ -27,14 +27,11 @@
   const runStatusText = $('run-status-text');
   const errorBox = $('error-box');
   const activityLog = $('activity-log');
+  const chatThread = $('chat-thread');
+  const promptAttachments = $('prompt-attachments');
   const btnExportPng = $('export-png-btn');
   const downloadSvgBtn = $('download-svg-btn');
   const copyXmlUrlBtn = $('copy-xml-url-btn');
-  const selectionPatch = $('selection-patch');
-  const selectionChip = $('selection-chip');
-  const selectionClear = $('selection-clear');
-  const selectionInstruction = $('selection-instruction');
-  const selectionModifyBtn = $('selection-modify-btn');
   const canvasToolPan = $('canvas-tool-pan');
   const canvasToolSelect = $('canvas-tool-select');
 
@@ -45,6 +42,9 @@
   let currentXml = null;
   let isRunning = false;
   let activityEntries = [];
+  // Canvas cells attached to the NEXT message as a selection reference
+  // (the drawing canvas analogue of @File in a coding agent). When present,
+  // Send routes to /patch (scope mode) instead of /generate or /agent-loop.
   let currentSelection = [];
   let currentGraph = null;
   let currentDepth = 'fast';
@@ -158,7 +158,8 @@
     const hasSession = !!currentSessionId;
     const hasPrompt = !!promptEl.value.trim();
     const hasXml = !!(currentXml && currentXml.trim());
-    const shouldShow = hasSession && hasPrompt && currentDepth === 'refine' && hasXml && !isRunning;
+    const hasRef = currentSelection.length > 0;
+    const shouldShow = hasSession && hasPrompt && currentDepth === 'refine' && hasXml && !isRunning && !hasRef;
     if (shouldShow) {
       refineHint.hidden = false;
       requestAnimationFrame(() => refineHint.classList.add('visible'));
@@ -170,55 +171,36 @@
 
   function updateSelectionState(cellIds) {
     currentSelection = cellIds || [];
-    const count = currentSelection.length;
-    selectionChip.textContent = `${count} selected`;
-    selectionModifyBtn.disabled = count === 0 || !selectionInstruction.value.trim();
-    if (count > 0) {
-      selectionPatch.hidden = false;
-    } else {
-      selectionPatch.hidden = true;
-      selectionInstruction.value = '';
-    }
+    renderAttachments();
+    updateSendButton();
   }
 
-  async function patchSelected() {
-    if (!currentSessionId) return;
-    const cellIds = currentSelection;
-    const instruction = selectionInstruction.value.trim();
-    if (cellIds.length === 0 || !instruction) return;
-
-    setLoading(true, 'patching selected cells…');
-    selectionModifyBtn.disabled = true;
-    selectionInstruction.disabled = true;
-    const previousLabel = selectionModifyBtn.textContent;
-    selectionModifyBtn.textContent = 'Modifying…';
-    try {
-      const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}/patch`, {
-        cell_ids: cellIds,
-        instruction,
-        json_mode: false,
-      });
-      if (result && result.xml) {
-        // If the LLM returned the same XML (e.g. the no-op mock LLM echoing
-        // the current diagram), say so instead of silently doing nothing.
-        const noVisualChange = result.xml === currentXml;
-        loadXmlIntoCanvas(result.xml);
-        if (noVisualChange) {
-          addActivity('StateTransition', { from: 'patch', to: 'no visual change (LLM returned the same XML)' });
-        }
-      }
-      currentSelection = [];
-      updateSelectionState([]);
-      selectionInstruction.value = '';
-      addActivity('StateTransition', { from: 'selected cells', to: `patched · v:${(result.version_id || '').slice(0, 8)}` });
-    } catch (err) {
-      showError(`Patch failed: ${err.message}`);
-    } finally {
-      setLoading(false);
-      selectionModifyBtn.disabled = false;
-      selectionInstruction.disabled = false;
-      selectionModifyBtn.textContent = previousLabel;
+  function renderAttachments() {
+    promptAttachments.innerHTML = '';
+    if (!currentSelection.length) {
+      promptAttachments.hidden = true;
+      return;
     }
+    const chip = document.createElement('span');
+    chip.className = 'attach-chip';
+    chip.innerHTML = `<span>◎ ${currentSelection.length} selected cell${currentSelection.length > 1 ? 's' : ''} — message will patch ONLY these</span>`;
+    const x = document.createElement('button');
+    x.className = 'attach-x';
+    x.type = 'button';
+    x.textContent = '✕';
+    x.title = 'Remove selection reference';
+    x.setAttribute('aria-label', 'Remove selection reference');
+    x.addEventListener('click', () => {
+      currentSelection = [];
+      if (currentGraph) currentGraph.clearSelection();
+      renderAttachments();
+      updateSendButton();
+      promptEl.focus();
+    });
+    chip.appendChild(x);
+    promptAttachments.appendChild(chip);
+    promptAttachments.hidden = false;
+    updateRefineHint();
   }
 
   function escapeHtml(str) {
@@ -529,6 +511,7 @@
     sessionSelect.value = id;
     setHash(id);
     clearError();
+    clearChat();
     setLoading(true, 'loading session…');
     closeWs();
 
@@ -590,6 +573,100 @@
   function clearActivity() {
     activityLog.innerHTML = '';
     activityEntries = [];
+  }
+
+  // -------------------------------------------------------------------------
+  // Conversation bubbles (chat skeleton)
+  // -------------------------------------------------------------------------
+
+  const KIND_LABEL = {
+    generate: '⚡ generate',
+    patch: '✂ patch',
+    'agent-loop': '🔄 refine',
+    error: '⚠ error',
+    system: 'ℹ',
+  };
+
+  function clearChat() {
+    chatThread.innerHTML = '';
+  }
+
+  function scrollChat() {
+    chatThread.scrollTop = chatThread.scrollHeight;
+  }
+
+  /** Append a user bubble. `chipLabel` is shown as an inline reference
+   *  chip when the message carried a canvas selection. */
+  function addUserBubble(text, chipLabel) {
+    const el = document.createElement('div');
+    el.className = 'bubble user';
+    const kind = document.createElement('div');
+    kind.className = 'bubble-kind';
+    kind.textContent = 'you';
+    el.appendChild(kind);
+    const body = document.createElement('div');
+    body.className = 'bubble-text';
+    body.textContent = text;
+    el.appendChild(body);
+    if (chipLabel) {
+      const chip = document.createElement('span');
+      chip.className = 'inline-chip';
+      chip.textContent = chipLabel;
+      el.appendChild(chip);
+    }
+    chatThread.appendChild(el);
+    scrollChat();
+  }
+
+  /** Append (or resolve) an agent bubble. Pass an existing element as
+   *  `pendingEl` to turn a running placeholder into the final message. */
+  function addAgentBubble(kind, text, opts = {}) {
+    const el = opts.pendingEl || document.createElement('div');
+    el.className = `bubble agent${opts.isError ? ' error' : ''}${opts.pending ? ' pending' : ''}`;
+    el.innerHTML = '';
+    const kindEl = document.createElement('div');
+    kindEl.className = 'bubble-kind';
+    kindEl.textContent = KIND_LABEL[kind] || kind;
+    el.appendChild(kindEl);
+    if (opts.pending) {
+      const spinner = document.createElement('span');
+      spinner.className = 'spinner';
+      el.appendChild(spinner);
+      const txt = document.createElement('span');
+      txt.className = 'bubble-text';
+      txt.textContent = text;
+      el.appendChild(txt);
+      chatThread.appendChild(el);
+      scrollChat();
+      return el;
+    }
+    const body = document.createElement('div');
+    body.className = 'bubble-text';
+    body.textContent = text;
+    el.appendChild(body);
+    if (opts.reasoning) {
+      const r = document.createElement('blockquote');
+      r.className = 'bubble-reason';
+      r.textContent = opts.reasoning;
+      el.appendChild(r);
+    }
+    if (opts.meta) {
+      const m = document.createElement('div');
+      m.className = 'bubble-meta';
+      m.textContent = opts.meta;
+      el.appendChild(m);
+    }
+    if (opts.pendingEl) {
+      el.classList.remove('pending');
+    } else {
+      chatThread.appendChild(el);
+    }
+    scrollChat();
+    return el;
+  }
+
+  function runningBubble(text) {
+    return addAgentBubble('system', text, { pending: true });
   }
 
   function handleWsMessage(data) {
@@ -682,39 +759,91 @@
   async function runSend() {
     if (!canSend()) return;
     const prompt = promptEl.value.trim();
+    const cellIds = currentSelection.slice();
     clearError();
     if (currentDepth === 'refine') clearActivity();
 
-    const isRefine = currentDepth === 'refine';
-    const statusText = isRefine ? '🔄 Refining…' : '⚡ Generating…';
-    const loadingText = isRefine ? 'refining…' : 'generating…';
+    // One composer, three backends (until they converge on a chat turn API):
+    //   with a selection reference  -> /patch      (scope: ONLY these cells)
+    //   no reference + refine depth -> /agent-loop (visual self-review loop)
+    //   no reference + fast depth   -> /generate   (single shot from scratch)
+    const isPatch = cellIds.length > 0;
+    const endpoint = isPatch ? '/patch' : (currentDepth === 'refine' ? '/agent-loop' : '/generate');
+    const statusText = isPatch ? '✂ Patching selected…' : (currentDepth === 'refine' ? '🔄 Refining…' : '⚡ Generating…');
+    const loadingText = isPatch ? 'patching selected cells…' : (currentDepth === 'refine' ? 'refining…' : 'generating…');
+
     setRunLoading(true, statusText);
     setLoading(true, loadingText);
+    const chipLabel = cellIds.length ? `◎ ${cellIds.length} selected` : null;
+    addUserBubble(prompt, chipLabel);
+    const pendingBubble = runningBubble(loadingText);
+    promptEl.value = '';
+    if (cellIds.length && currentGraph) currentGraph.clearSelection(); // clears currentSelection via listener
+    currentSelection = [];
+    renderAttachments();
+    updateSendButton();
+    updateRefineHint();
 
     try {
       const body = { prompt };
-      if (isRefine && currentXml) body.initial_xml = currentXml;
-      const endpoint = isRefine ? '/agent-loop' : '/generate';
+      if (isPatch) {
+        body.cell_ids = cellIds;
+        body.instruction = prompt;
+        delete body.prompt;
+      } else if (currentDepth === 'refine' && currentXml) {
+        body.initial_xml = currentXml;
+      }
       const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}${endpoint}`, body);
-      loadXmlIntoCanvas(result.xml || '');
-      promptEl.value = '';
-      updateRefineHint();
-      await loadSessionList();
-      if (isRefine) {
-        if (result.converged) {
-          addActivity('StateTransition', { from: 'loop', to: `converged · ${result.iterations} iterations` });
-        } else {
-          addActivity('StateTransition', { from: 'loop', to: `finished · ${result.iterations} iterations · not converged` });
+
+      if (result && result.xml) {
+        const noVisualChange = result.xml === currentXml;
+        loadXmlIntoCanvas(result.xml);
+        if (noVisualChange) {
+          addActivity('StateTransition', { from: endpoint, to: 'no visual change (LLM returned the same XML)' });
         }
       }
+
+      // Agent bubble summary.
+      if (isPatch) {
+        addAgentBubble('patch', `已修改选中的 ${cellIds.length} 个 cell（未选中的内容保持原样）`, {
+          pendingEl: pendingBubble,
+          meta: `v:${(result.version_id || '').slice(0, 8)}`,
+        });
+      } else if (currentDepth === 'refine') {
+        const converged = !!result.converged;
+        const note = result.last_reasoning ? truncateForBubble(result.last_reasoning, 320) : '';
+        addAgentBubble('agent-loop', converged
+          ? `✓ 完成 · ${result.iterations} 轮收敛`
+          : `⚠ ${result.iterations} 轮后未收敛（已保留当前最优结果）`, {
+          pendingEl: pendingBubble,
+          reasoning: note || undefined,
+          meta: result.last_verdict ? `verdict: ${result.last_verdict}` : undefined,
+        });
+      } else {
+        addAgentBubble('generate', '已生成新图并载入画布', {
+          pendingEl: pendingBubble,
+          meta: `v:${(result.version_id || '').slice(0, 8)}`,
+        });
+      }
+      await loadSessionList();
     } catch (err) {
-      const label = isRefine ? 'Refine' : 'Generate';
+      const label = isPatch ? 'Patch' : (currentDepth === 'refine' ? 'Refine' : 'Generate');
       showError(`${label} failed: ${err.message}`);
       addActivity('Error', { stage: currentDepth, message: err.message });
+      addAgentBubble('error', `${label} 失败：${err.message}`, {
+        pendingEl: pendingBubble,
+        isError: true,
+      });
     } finally {
       setRunLoading(false);
       setLoading(false);
     }
+  }
+
+  function truncateForBubble(text, maxChars) {
+    if (!text) return '';
+    const t = String(text);
+    return t.length > maxChars ? `${t.slice(0, maxChars)}…` : t;
   }
 
   async function downloadSvg() {
@@ -852,20 +981,6 @@
     btnExportPng.addEventListener('click', exportPng);
     downloadSvgBtn.addEventListener('click', downloadSvg);
     copyXmlUrlBtn.addEventListener('click', copyXmlUrl);
-
-    selectionClear.addEventListener('click', () => {
-      if (currentGraph) currentGraph.clearSelection();
-    });
-    selectionModifyBtn.addEventListener('click', patchSelected);
-    selectionInstruction.addEventListener('input', () => {
-      selectionModifyBtn.disabled = currentSelection.length === 0 || !selectionInstruction.value.trim();
-    });
-    selectionInstruction.addEventListener('keydown', (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-        e.preventDefault();
-        patchSelected();
-      }
-    });
 
     promptEl.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
