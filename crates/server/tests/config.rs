@@ -13,6 +13,14 @@ use drawio_agent_server::{
 use serde_json::Value;
 use tower::ServiceExt;
 
+/// Every test writes into a throwaway temp dir so the real
+/// ~/.drawio-agent/config.json is never touched.
+fn temp_config_path() -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join(format!("drawio-agent-cfg-{}", uuid::Uuid::new_v4()))
+        .join("config.json")
+}
+
 async fn mock_state_with_config_path(config_path: Option<std::path::PathBuf>) -> Arc<AppState> {
     let config = ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -50,6 +58,7 @@ async fn get_config(app: axum::Router) -> Value {
 
 #[tokio::test]
 async fn get_config_reports_defaults_and_fixed_renderer() {
+    // GET-only test: no PUT happens, so None is safe (nothing is written).
     let state = mock_state_with_config_path(None).await;
     let app = router(state);
     let cfg = get_config(app).await;
@@ -60,7 +69,7 @@ async fn get_config_reports_defaults_and_fixed_renderer() {
 
 #[tokio::test]
 async fn put_config_hot_swaps_the_provider() {
-    let state = mock_state_with_config_path(None).await;
+    let state = mock_state_with_config_path(Some(temp_config_path())).await;
     let app = router(state.clone());
 
     let resp = app
@@ -101,7 +110,7 @@ async fn put_config_hot_swaps_the_provider() {
 
 #[tokio::test]
 async fn put_config_validates_openai_compat_fields() {
-    let state = mock_state_with_config_path(None).await;
+    let state = mock_state_with_config_path(Some(temp_config_path())).await;
     let app = router(state);
 
     let resp = app
@@ -127,7 +136,7 @@ async fn put_config_validates_openai_compat_fields() {
 
 #[tokio::test]
 async fn put_config_with_empty_key_keeps_existing_secret() {
-    let state = mock_state_with_config_path(None).await;
+    let state = mock_state_with_config_path(Some(temp_config_path())).await;
     let app = router(state.clone());
 
     let put = |body: Value| {
@@ -210,7 +219,7 @@ async fn put_config_persists_to_the_config_file() {
 
 #[tokio::test]
 async fn connection_test_handles_validation_without_network() {
-    let state = mock_state_with_config_path(None).await;
+    let state = mock_state_with_config_path(Some(temp_config_path())).await;
     let app = router(state);
 
     // Mock kind: no network involved.
