@@ -60,6 +60,7 @@ fn apply_updates_existing_primary_cell_geometry() {
         y: 888.0,
         width: 77.0,
         height: 66.0,
+        ..Default::default()
     });
 
     model.apply_subgraph(&sub);
@@ -84,6 +85,7 @@ fn apply_inserts_new_primary_cell() {
         y: 100.0,
         width: 80.0,
         height: 40.0,
+        ..Default::default()
     });
 
     let sub = Subgraph {
@@ -115,6 +117,7 @@ fn apply_ignores_context_cell_changes() {
         y: -1.0,
         width: 1.0,
         height: 1.0,
+        ..Default::default()
     });
 
     let result = model.apply_subgraph(&sub);

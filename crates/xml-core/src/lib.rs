@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
+use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::name::QName;
 use quick_xml::reader::Reader;
@@ -18,6 +19,10 @@ use thiserror::Error;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MxFile {
     pub diagrams: Vec<Diagram>,
+    /// `<mxfile>`-level attributes (e.g. `host`, `type`) preserved verbatim
+    /// so roundtrips don't lose document metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_attrs: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,11 +30,19 @@ pub struct Diagram {
     pub id: String,
     pub name: String,
     pub model: Option<MxGraphModel>,
+    /// `<diagram>`-level attributes xml-core doesn't model (e.g. `description`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_attrs: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MxGraphModel {
     pub root: Cell,
+    /// `<mxGraphModel>`-level attributes (dx/dy, grid, page, …) preserved
+    /// verbatim — they configure the editor canvas and must survive
+    /// patch/agent-loop roundtrips.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_attrs: Vec<(String, String)>,
 }
 
 impl MxGraphModel {
@@ -407,8 +420,13 @@ pub fn serialize_subgraph(subgraph: &Subgraph) -> Result<String, SerializeError>
         diagrams: vec![Diagram {
             id: "patch".to_string(),
             name: "Page-1".to_string(),
-            model: Some(MxGraphModel { root }),
+            model: Some(MxGraphModel {
+                root,
+                extra_attrs: Vec::new(),
+            }),
+            extra_attrs: Vec::new(),
         }],
+        extra_attrs: Vec::new(),
     };
     file.to_xml()
 }
@@ -454,6 +472,132 @@ fn count_ids(cell: &Cell, counts: &mut std::collections::HashMap<String, usize>)
 }
 
 // ---------------------------------------------------------------------------
+// Entity codec
+//
+// quick-xml hands attribute values over RAW (source bytes, undecoded) and
+// its (&str,&str) attribute channel escapes only `& < > " '` — a literal
+// newline in an attribute would be normalized away by XML parsers. Draw.io
+// labels rely on `&#10;` (and other entities) surviving byte-exact, so
+// xml-core decodes entities on read and re-encodes (including control
+// chars) on write via the raw-bytes attribute channel.
+// ---------------------------------------------------------------------------
+
+/// Decode XML entity / character references in an attribute value into the
+/// semantic text. Unknown entities (`&foo;`) are preserved verbatim.
+fn decode_entities(bytes: &[u8]) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    if !s.contains('&') {
+        return s.into_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest: &str = &s;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        rest = &rest[pos..];
+        let Some(semi) = rest.find(';') else {
+            // No terminator: keep the remainder verbatim.
+            out.push_str(rest);
+            return out;
+        };
+        let entity = &rest[1..semi];
+        let replacement: Option<char> = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => entity.strip_prefix('#').and_then(|num| {
+                let (radix, digits) =
+                    match num.strip_prefix(['x', 'X']) {
+                        Some(hex) => (16, hex),
+                        None => (10, num),
+                    };
+                u32::from_str_radix(digits, radix)
+                    .ok()
+                    .and_then(char::from_u32)
+            }),
+        };
+        match replacement {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Escape attribute-value text for XML output: the five predefined
+/// entities plus control characters. Raw newlines/tabs/CRs inside
+/// attribute values are normalized away by XML parsers, so multi-line
+/// labels MUST be emitted as `&#10;` to survive a roundtrip.
+fn encode_attr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            '\t' => out.push_str("&#9;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Push an attribute with full entity/control-char escaping onto a start
+/// tag. Uses the raw-bytes channel: the (&str,&str) channel would escape
+/// the `&` of our `&#10;` into `&amp;#10;` (the original double-escape bug).
+fn push_attr(elem: &mut BytesStart<'_>, name: &str, value: &str) {
+    let encoded = encode_attr(value);
+    elem.push_attribute(Attribute::from((name.as_bytes(), encoded.as_bytes())));
+}
+
+fn push_attr_pairs(elem: &mut BytesStart<'_>, attrs: &[(String, String)]) {
+    for (k, v) in attrs {
+        push_attr(elem, k, v);
+    }
+}
+
+/// Serialize a captured raw node (geometry children: mxPoint / Array…)
+/// back verbatim.
+fn write_raw_node<W: Write>(
+    writer: &mut Writer<W>,
+    node: &RawNode,
+) -> Result<(), SerializeError> {
+    let mut elem = BytesStart::new(node.name.as_str());
+    push_attr_pairs(&mut elem, &node.attrs);
+    if node.children.is_empty() && node.text.is_none() {
+        writer.write_event(Event::Empty(elem)).map_err(xml_ser_err)?;
+        return Ok(());
+    }
+    writer
+        .write_event(Event::Start(elem))
+        .map_err(xml_ser_err)?;
+    if let Some(t) = &node.text {
+        writer
+            .write_event(Event::Text(BytesText::new(t.as_str())))
+            .map_err(xml_ser_err)?;
+    }
+    for child in &node.children {
+        write_raw_node(writer, child)?;
+    }
+    writer
+        .write_event(Event::End(BytesEnd::new(node.name.as_str())))
+        .map_err(xml_ser_err)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Serializer
 // ---------------------------------------------------------------------------
 
@@ -466,8 +610,9 @@ fn write_diagram_uncompressed<W: Write>(
     diagram: &Diagram,
 ) -> Result<(), SerializeError> {
     let mut elem = BytesStart::new("diagram");
-    elem.push_attribute(("id", diagram.id.as_str()));
-    elem.push_attribute(("name", diagram.name.as_str()));
+    push_attr(&mut elem, "id", &diagram.id);
+    push_attr(&mut elem, "name", &diagram.name);
+    push_attr_pairs(&mut elem, &diagram.extra_attrs);
     writer.write_event(Event::Start(elem)).map_err(xml_ser_err)?;
 
     if let Some(model) = &diagram.model {
@@ -485,8 +630,9 @@ fn write_diagram_compressed<W: Write>(
     diagram: &Diagram,
 ) -> Result<(), SerializeError> {
     let mut elem = BytesStart::new("diagram");
-    elem.push_attribute(("id", diagram.id.as_str()));
-    elem.push_attribute(("name", diagram.name.as_str()));
+    push_attr(&mut elem, "id", &diagram.id);
+    push_attr(&mut elem, "name", &diagram.name);
+    push_attr_pairs(&mut elem, &diagram.extra_attrs);
     writer.write_event(Event::Start(elem)).map_err(xml_ser_err)?;
 
     if let Some(model) = &diagram.model {
@@ -517,8 +663,10 @@ fn write_model<W: Write>(
     writer: &mut Writer<W>,
     model: &MxGraphModel,
 ) -> Result<(), SerializeError> {
+    let mut model_elem = BytesStart::new("mxGraphModel");
+    push_attr_pairs(&mut model_elem, &model.extra_attrs);
     writer
-        .write_event(Event::Start(BytesStart::new("mxGraphModel")))
+        .write_event(Event::Start(model_elem))
         .map_err(xml_ser_err)?;
     writer
         .write_event(Event::Start(BytesStart::new("root")))
@@ -549,32 +697,40 @@ fn write_cell<W: Write>(
     cell: &Cell,
 ) -> Result<(), SerializeError> {
     let mut elem = BytesStart::new("mxCell");
-    elem.push_attribute(("id", cell.id.as_str()));
+    push_attr(&mut elem, "id", &cell.id);
     if let Some(v) = &cell.value {
-        elem.push_attribute(("value", v.as_str()));
+        push_attr(&mut elem, "value", v);
     }
     if let Some(s) = &cell.style {
-        elem.push_attribute(("style", s.as_str()));
+        push_attr(&mut elem, "style", s);
     }
     if cell.vertex {
-        elem.push_attribute(("vertex", "1"));
+        push_attr(&mut elem, "vertex", "1");
     }
     if cell.edge {
-        elem.push_attribute(("edge", "1"));
+        push_attr(&mut elem, "edge", "1");
     }
     if let Some(p) = &cell.parent {
-        elem.push_attribute(("parent", p.as_str()));
+        push_attr(&mut elem, "parent", p);
     }
     if let Some(s) = &cell.source {
-        elem.push_attribute(("source", s.as_str()));
+        push_attr(&mut elem, "source", s);
     }
     if let Some(t) = &cell.target {
-        elem.push_attribute(("target", t.as_str()));
+        push_attr(&mut elem, "target", t);
     }
+    push_attr_pairs(&mut elem, &cell.extra_attrs);
 
     if let Some(geom) = &cell.geometry {
+        // Geometry always nests inside its mxCell element.
         writer.write_event(Event::Start(elem)).map_err(xml_ser_err)?;
-        write_geometry(writer, geom)?;
+        if geom.nodes.is_empty() {
+            let mut g = BytesStart::new("mxGeometry");
+            push_geometry_attrs(&mut g, geom);
+            writer.write_event(Event::Empty(g)).map_err(xml_ser_err)?;
+        } else {
+            write_geometry(writer, geom)?;
+        }
         writer
             .write_event(Event::End(BytesEnd::new("mxCell")))
             .map_err(xml_ser_err)?;
@@ -584,17 +740,31 @@ fn write_cell<W: Write>(
     Ok(())
 }
 
+fn push_geometry_attrs(g: &mut BytesStart<'_>, geom: &Geometry) {
+    push_attr(g, "x", &format_f64(geom.x));
+    push_attr(g, "y", &format_f64(geom.y));
+    push_attr(g, "width", &format_f64(geom.width));
+    push_attr(g, "height", &format_f64(geom.height));
+    if let Some(rel) = geom.relative {
+        push_attr(g, "relative", if rel { "1" } else { "0" });
+    }
+    push_attr_pairs(g, &geom.extra_attrs);
+    push_attr(g, "as", "geometry");
+}
+
 fn write_geometry<W: Write>(
     writer: &mut Writer<W>,
     geom: &Geometry,
 ) -> Result<(), SerializeError> {
     let mut g = BytesStart::new("mxGeometry");
-    g.push_attribute(("x", format_f64(geom.x).as_str()));
-    g.push_attribute(("y", format_f64(geom.y).as_str()));
-    g.push_attribute(("width", format_f64(geom.width).as_str()));
-    g.push_attribute(("height", format_f64(geom.height).as_str()));
-    g.push_attribute(("as", "geometry"));
-    writer.write_event(Event::Empty(g)).map_err(xml_ser_err)?;
+    push_geometry_attrs(&mut g, geom);
+    writer.write_event(Event::Start(g)).map_err(xml_ser_err)?;
+    for node in &geom.nodes {
+        write_raw_node(writer, node)?;
+    }
+    writer
+        .write_event(Event::End(BytesEnd::new("mxGeometry")))
+        .map_err(xml_ser_err)?;
     Ok(())
 }
 
@@ -606,6 +776,20 @@ fn format_f64(v: f64) -> String {
     } else {
         format!("{v}")
     }
+}
+
+/// A generic XML element captured verbatim (name, attributes, children,
+/// optional text). Used to preserve constructs xml-core does not model
+/// explicitly — e.g. `<mxPoint>` anchors and `<Array>` waypoints inside
+/// `mxGeometry` — so edge paths survive patch roundtrips.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct RawNode {
+    pub name: String,
+    /// Attributes in source order, values entity-decoded.
+    pub attrs: Vec<(String, String)>,
+    pub children: Vec<RawNode>,
+    /// Non-whitespace text content, if any.
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -620,6 +804,10 @@ pub struct Cell {
     pub target: Option<String>,
     pub geometry: Option<Geometry>,
     pub children: Vec<Cell>,
+    /// mxCell attributes xml-core doesn't model (link, tooltip,
+    /// connectable, placeholders, …) — preserved so nothing is dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_attrs: Vec<(String, String)>,
 }
 
 impl Cell {
@@ -635,16 +823,28 @@ impl Cell {
             target: None,
             geometry: None,
             children: Vec::new(),
+            extra_attrs: Vec::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Geometry {
     pub x: f64,
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    /// `relative` attribute of mxGeometry (present on edge geometry).
+    /// `None` = absent in the source; preserved so edges don't silently
+    /// switch geometry mode on roundtrip.
+    pub relative: Option<bool>,
+    /// mxGeometry attributes xml-core doesn't model (exitX/exitY/entryX/…).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_attrs: Vec<(String, String)>,
+    /// Raw child elements: `<mxPoint as="sourcePoint">`, `<Array
+    /// as="points">…` waypoints. Written back verbatim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<RawNode>,
 }
 
 #[derive(Debug, Error)]
@@ -690,10 +890,17 @@ impl MxFile {
         r.config_mut().trim_text(true);
 
         let mut diagrams: Vec<Diagram> = Vec::new();
+        let mut file_attrs: Vec<(String, String)> = Vec::new();
         let mut buf = Vec::new();
 
         loop {
             match r.read_event_into(&mut buf) {
+                Ok(Event::Start(e)) if e.name().as_ref() == b"mxfile" => {
+                    file_attrs = collect_attrs(&e);
+                }
+                Ok(Event::Empty(e)) if e.name().as_ref() == b"mxfile" => {
+                    file_attrs = collect_attrs(&e);
+                }
                 Ok(Event::Start(e)) if e.name().as_ref() == b"diagram" => {
                     let mut partial = PartialDiagram::from_attrs(&e)?;
                     let body = r
@@ -714,7 +921,10 @@ impl MxFile {
             buf.clear();
         }
 
-        Ok(MxFile { diagrams })
+        Ok(MxFile {
+            diagrams,
+            extra_attrs: file_attrs,
+        })
     }
 
     /// Serialize to uncompressed mxfile XML. Each diagram body is
@@ -724,9 +934,9 @@ impl MxFile {
         writer
             .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
             .map_err(xml_ser_err)?;
-        writer
-            .write_event(Event::Start(BytesStart::new("mxfile")))
-            .map_err(xml_ser_err)?;
+        let mut mxfile = BytesStart::new("mxfile");
+        push_attr_pairs(&mut mxfile, &self.extra_attrs);
+        writer.write_event(Event::Start(mxfile)).map_err(xml_ser_err)?;
 
         for diagram in &self.diagrams {
             write_diagram_uncompressed(&mut writer, diagram)?;
@@ -745,9 +955,9 @@ impl MxFile {
         writer
             .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
             .map_err(xml_ser_err)?;
-        writer
-            .write_event(Event::Start(BytesStart::new("mxfile")))
-            .map_err(xml_ser_err)?;
+        let mut mxfile = BytesStart::new("mxfile");
+        push_attr_pairs(&mut mxfile, &self.extra_attrs);
+        writer.write_event(Event::Start(mxfile)).map_err(xml_ser_err)?;
 
         for diagram in &self.diagrams {
             write_diagram_compressed(&mut writer, diagram)?;
@@ -764,6 +974,7 @@ impl MxFile {
 struct PartialDiagram {
     id: String,
     name: String,
+    extra_attrs: Vec<(String, String)>,
     body: String,
 }
 
@@ -774,7 +985,7 @@ impl PartialDiagram {
             match attr.key.as_ref() {
                 b"id" => p.id = attr_value(&attr.value),
                 b"name" => p.name = attr_value(&attr.value),
-                _ => {}
+                _ => p.extra_attrs.push((attr_key(attr.key.as_ref()), attr_value(&attr.value))),
             }
         }
         Ok(p)
@@ -796,6 +1007,7 @@ impl PartialDiagram {
             id: self.id,
             name: self.name,
             model: Some(model),
+            extra_attrs: self.extra_attrs,
         })
     }
 }
@@ -817,17 +1029,27 @@ fn parse_mxgraphmodel(xml: &[u8]) -> Result<MxGraphModel, ParseError> {
 
     let mut cells: Vec<Cell> = Vec::new();
     let mut current_cell: Option<Cell> = None;
+    let mut model_attrs: Vec<(String, String)> = Vec::new();
     let mut buf = Vec::new();
 
     loop {
         match r.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match e.name().as_ref() {
+                b"mxGraphModel" => {
+                    model_attrs = collect_attrs(&e);
+                }
                 b"mxCell" => {
                     current_cell = Some(parse_mxcell_attrs(&e)?);
                 }
                 b"mxGeometry" => {
                     if let Some(cell) = current_cell.as_mut() {
-                        cell.geometry = Some(parse_geometry_attrs(&e)?);
+                        // Start tag: the geometry may carry child elements
+                        // (mxPoint anchors, <Array> waypoints). Consume
+                        // events until its matching End and capture them
+                        // verbatim as raw nodes.
+                        let mut geom = parse_geometry_attrs(&e)?;
+                        geom.nodes = read_raw_children(&mut r, b"mxGeometry")?;
+                        cell.geometry = Some(geom);
                     }
                 }
                 _ => {}
@@ -897,7 +1119,81 @@ fn parse_mxgraphmodel(xml: &[u8]) -> Result<MxGraphModel, ParseError> {
     let mut root = cells[root_idx].clone();
     root.children = build_subtree(&cells, &by_parent, &root.id);
 
-    Ok(MxGraphModel { root })
+    Ok(MxGraphModel {
+        root,
+        extra_attrs: model_attrs,
+    })
+}
+
+/// Collect every attribute of a start/empty tag into source order,
+/// values entity-decoded.
+fn collect_attrs(e: &BytesStart<'_>) -> Vec<(String, String)> {
+    e.attributes()
+        .flatten()
+        .map(|a| (attr_key(a.key.as_ref()), attr_value(&a.value)))
+        .collect()
+}
+
+/// Consume reader events until the matching `</end_name>` at this level,
+/// capturing every element as a raw node tree (used for mxGeometry
+/// children such as `<mxPoint>` / `<Array>` waypoints).
+fn read_raw_children<R: std::io::BufRead>(
+    reader: &mut Reader<R>,
+    end_name: &[u8],
+) -> Result<Vec<RawNode>, ParseError> {
+    let mut roots: Vec<RawNode> = Vec::new();
+    loop {
+        let mut buf = Vec::new();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let attrs = collect_attrs(&e);
+                // Recurse until this element's own End tag.
+                let children = read_raw_children(reader, e.name().as_ref())?;
+                roots.push(RawNode {
+                    name,
+                    attrs,
+                    children,
+                    text: None,
+                });
+            }
+            Ok(Event::Empty(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let attrs = collect_attrs(&e);
+                roots.push(RawNode {
+                    name,
+                    attrs,
+                    children: Vec::new(),
+                    text: None,
+                });
+            }
+            Ok(Event::Text(t)) => {
+                let text = decode_entities(t.as_ref());
+                if text.trim().is_empty() {
+                    continue; // pretty-printing whitespace
+                }
+                if let Some(last) = roots.last_mut() {
+                    if last.text.is_none() {
+                        last.text = Some(text);
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                if e.name().as_ref() == end_name {
+                    return Ok(roots);
+                }
+                // Mismatched end tag: ignore (malformed input tolerance).
+            }
+            Ok(Event::Eof) => return Ok(roots),
+            Err(e) => {
+                return Err(ParseError::Xml(format!(
+                    "{e:?} at pos {}",
+                    reader.buffer_position()
+                )))
+            }
+            _ => {}
+        }
+    }
 }
 
 fn parse_mxcell_attrs(e: &BytesStart<'_>) -> Result<Cell, ParseError> {
@@ -912,33 +1208,43 @@ fn parse_mxcell_attrs(e: &BytesStart<'_>) -> Result<Cell, ParseError> {
             b"parent" => cell.parent = Some(attr_value(&attr.value)),
             b"source" => cell.source = Some(attr_value(&attr.value)),
             b"target" => cell.target = Some(attr_value(&attr.value)),
-            _ => {}
+            // Preserve anything unmodeled (link, tooltip, connectable, …).
+            _ => cell
+                .extra_attrs
+                .push((attr_key(attr.key.as_ref()), attr_value(&attr.value))),
         }
     }
     Ok(cell)
 }
 
 fn parse_geometry_attrs(e: &BytesStart<'_>) -> Result<Geometry, ParseError> {
-    let mut g = Geometry {
-        x: 0.0,
-        y: 0.0,
-        width: 0.0,
-        height: 0.0,
-    };
+    let mut g = Geometry::default();
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
             b"x" => g.x = parse_f64(&attr.value)?,
             b"y" => g.y = parse_f64(&attr.value)?,
             b"width" => g.width = parse_f64(&attr.value)?,
             b"height" => g.height = parse_f64(&attr.value)?,
-            _ => {}
+            b"relative" => g.relative = Some(is_truthy(&attr.value)),
+            b"as" => {} // schema constant (`as="geometry"`)
+            // Preserve anything unmodeled (exitX/exitY/entryX/…).
+            _ => g
+                .extra_attrs
+                .push((attr_key(attr.key.as_ref()), attr_value(&attr.value))),
         }
     }
     Ok(g)
 }
 
+fn attr_key(k: &[u8]) -> String {
+    String::from_utf8_lossy(k).into_owned()
+}
+
+/// Attribute value as semantic text (XML entities decoded: `&#10;` becomes
+/// a real newline, `&lt;` becomes `<`, …). Symmetric with [`encode_attr`]
+/// used on write.
 fn attr_value(v: &[u8]) -> String {
-    String::from_utf8_lossy(v).into_owned()
+    decode_entities(v)
 }
 
 fn is_truthy(v: &[u8]) -> bool {

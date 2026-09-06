@@ -69,7 +69,6 @@ fn normalize(xml: &str) -> String {
 }
 
 #[test]
-#[ignore = "M1: xml-core roundtrip fidelity not implemented — see PLAN.md milestone 1"]
 fn roundtrip_preserves_multiline_label_entities() {
     let file = MxFile::parse(FIDELITY_SAMPLE.as_bytes()).expect("sample must parse");
     let out = file.to_xml().expect("serialize must succeed");
@@ -87,7 +86,6 @@ fn roundtrip_preserves_multiline_label_entities() {
 }
 
 #[test]
-#[ignore = "M1: xml-core roundtrip fidelity not implemented — see PLAN.md milestone 1"]
 fn roundtrip_preserves_document_and_model_attributes() {
     let file = MxFile::parse(FIDELITY_SAMPLE.as_bytes()).expect("sample must parse");
     let out = normalize(&file.to_xml().expect("serialize must succeed"));
@@ -101,7 +99,6 @@ fn roundtrip_preserves_document_and_model_attributes() {
 }
 
 #[test]
-#[ignore = "M1: xml-core roundtrip fidelity not implemented — see PLAN.md milestone 1"]
 fn roundtrip_preserves_edge_geometry_and_waypoints() {
     let file = MxFile::parse(FIDELITY_SAMPLE.as_bytes()).expect("sample must parse");
     let out = file.to_xml().expect("serialize must succeed");
@@ -127,7 +124,6 @@ fn roundtrip_preserves_edge_geometry_and_waypoints() {
 /// The subgraph serialization path must keep the same fidelity promises:
 /// scope documents handed to the LLM must not mangle entities either.
 #[test]
-#[ignore = "M1: xml-core roundtrip fidelity not implemented — see PLAN.md milestone 1"]
 fn subgraph_serialize_preserves_multiline_labels() {
     let file = MxFile::parse(FIDELITY_SAMPLE.as_bytes()).expect("sample must parse");
     let model = file.diagrams[0].model.as_ref().expect("model");
@@ -141,5 +137,46 @@ fn subgraph_serialize_preserves_multiline_labels() {
     assert!(
         !scope.contains("&amp;#10;"),
         "scope document double-escaped the newline entity:\n{scope}"
+    );
+}
+
+/// Draw.io's on-disk format (base64 + raw deflate body) must round-trip to
+/// the same canonical document as the uncompressed path.
+#[test]
+fn compressed_roundtrip_matches_uncompressed_output() {
+    let file = MxFile::parse(FIDELITY_SAMPLE.as_bytes()).expect("sample must parse");
+    let compressed = file.to_compressed_xml().expect("compress");
+    assert!(
+        compressed.contains("host=\"app.diagrams.net\""),
+        "mxfile attributes must survive on the compressed path"
+    );
+    let reparsed = MxFile::parse(compressed.as_bytes()).expect("decompress");
+    assert_eq!(
+        reparsed.to_xml().expect("serialize"),
+        file.to_xml().expect("serialize"),
+        "compressed roundtrip must produce the identical document"
+    );
+}
+
+/// Entity semantics: decoded in-memory values carry the real newline, and
+/// re-serialization restores the `&#10;` reference exactly once.
+#[test]
+fn entity_codec_is_symmetric() {
+    let file = MxFile::parse(FIDELITY_SAMPLE.as_bytes()).expect("sample must parse");
+    let cell = file.diagrams[0]
+        .model
+        .as_ref()
+        .expect("model")
+        .get("2")
+        .expect("cell 2");
+    assert_eq!(
+        cell.value.as_deref(),
+        Some("line1\nline2\n& <tag>"),
+        "in-memory value must be decoded semantic text"
+    );
+    let out = file.to_xml().expect("serialize");
+    assert!(
+        out.contains("line1&#10;line2&#10;&amp; &lt;tag&gt;"),
+        "serialized value must re-encode entities exactly once:\n{out}"
     );
 }
