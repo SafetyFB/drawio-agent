@@ -156,6 +156,7 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
         .route("/api/history/:idx", get(api_history_detail))
         .route("/api/context/load", post(api_context_load))
         .route("/api/manual", post(api_manual))
+        .route("/api/export/png", get(api_export_png))
         .with_state(app_state);
 
     let addr = format!("127.0.0.1:{port}");
@@ -1040,6 +1041,59 @@ async fn api_sessions_delete(
 #[derive(Debug, Deserialize)]
 struct ManualReq {
     xml: String,
+}
+
+/// 导出当前会话为 PNG：读磁盘上的 canonical XML（与 /api/file 同一路径，
+/// 不受任务锁影响），chromium 2x 渲染返回。
+async fn api_export_png(State(st): State<Arc<Mutex<WebState>>>) -> Response {
+    let (path, stem) = {
+        let st = st.lock().await;
+        match &st.current {
+            Some(cur) => (
+                st.dir.join(cur),
+                cur.trim_end_matches(".drawio").to_string(),
+            ),
+            None => return (StatusCode::NOT_FOUND, "no session").into_response(),
+        }
+    };
+    let xml = match std::fs::read_to_string(&path) {
+        Ok(x) => x,
+        Err(_) => return (StatusCode::NOT_FOUND, "no session file").into_response(),
+    };
+    let driver = match drawio_agent_renderer::HeadlessChromiumDriver::launch().await {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("chromium 启动失败: {e}"),
+            )
+                .into_response()
+        }
+    };
+    let renderer = drawio_agent_renderer::Renderer::new(std::sync::Arc::new(driver));
+    let opts = drawio_agent_renderer::RenderOptions {
+        scale: 2.0,
+        ..Default::default()
+    };
+    match renderer.render(&xml, &opts).await {
+        Ok(png) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "image/png"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    &format!("attachment; filename=\"{stem}.png\""),
+                ),
+            ],
+            png,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("渲染失败: {e}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn api_manual(

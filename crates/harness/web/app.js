@@ -168,6 +168,85 @@ function applyMode() {
   cancelRubberBand();
   refreshHandles();
 }
+// ---- 导出（PNG 走服务端 chromium 渲染；SVG 用 fork 的 getSvg；XML 直读磁盘） ----
+function exportStem() {
+  const p = picker.value || 'diagram';
+  return p.replace(/\.drawio$/, '');
+}
+function downloadBlob(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+async function downloadUrl(url, name) {
+  const r = await fetch(url);
+  if (!r.ok) { log('error', '导出失败: ' + (await r.text())); return; }
+  downloadBlob(await r.blob(), name);
+}
+$('export-png').onclick = () => downloadUrl('/api/export/png', exportStem() + '.png');
+/// 导出 SVG：fork 把 translate/scale 全烤进 state 且 DOM 直接按 state
+/// 渲染（容器像素），所以克隆画布 SVG 就是最终坐标的矢量图。去掉网格
+/// 背景、按图元边界（含旋转外接盒）+ 边距裁剪、加白底。
+function buildExportSvg() {
+  const svg0 = currentGraph.container.querySelector('svg');
+  if (!svg0) throw new Error('画布 SVG 不存在');
+  const model = currentGraph.getModel();
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const walk = (c) => {
+    if (c && c.id && c.id !== '0' && c.id !== '1') {
+      const st = currentGraph.view.getState(c);
+      if (st && st.width > 0 && st.height > 0) {
+        const bb = model.isEdge(c)
+          ? { x: st.x, y: st.y, w: st.width, h: st.height }
+          : stateVisualBbox(st, styleRotation(model.getStyle(c)));
+        minX = Math.min(minX, bb.x); maxX = Math.max(maxX, bb.x + bb.w);
+        minY = Math.min(minY, bb.y); maxY = Math.max(maxY, bb.y + bb.h);
+      }
+    }
+    if (c) for (let i = 0; i < model.getChildCount(c); i++) walk(model.getChildAt(c, i));
+  };
+  walk(model.getRoot());
+  if (minX === Infinity) throw new Error('图中没有可导出的元素');
+  const border = 8;
+  const W = Math.ceil(maxX - minX + 2 * border);
+  const H = Math.ceil(maxY - minY + 2 * border);
+  const clone = svg0.cloneNode(true);
+  clone.removeAttribute('style'); // 去网格背景与尺寸样式
+  clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+  clone.setAttribute('width', W);
+  clone.setAttribute('height', H);
+  clone.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  const wrap = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  wrap.setAttribute('transform', 'translate(' + (border - minX) + ' ' + (border - minY) + ')');
+  while (clone.firstChild) wrap.appendChild(clone.firstChild);
+  clone.appendChild(wrap);
+  const bg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  bg.setAttribute('width', '100%');
+  bg.setAttribute('height', '100%');
+  bg.setAttribute('fill', '#ffffff');
+  clone.insertBefore(bg, wrap);
+  return new XMLSerializer().serializeToString(clone);
+}
+$('export-svg').onclick = () => {
+  if (!currentGraph) return;
+  let svg;
+  try {
+    svg = buildExportSvg();
+  } catch (err) {
+    log('error', 'SVG 导出失败: ' + (err && err.message ? err.message : err));
+    return;
+  }
+  downloadBlob(new Blob([svg], { type: 'image/svg+xml' }), exportStem() + '.svg');
+};
+$('export-xml').onclick = async () => {
+  const r = await fetch('/api/file');
+  if (!r.ok) { log('error', '导出失败: 无当前会话文件'); return; }
+  downloadBlob(new Blob([await r.text()], { type: 'application/xml' }), exportStem() + '.drawio');
+};
+
 $('mode-select').onclick = () => { canvasMode = 'select'; applyMode(); };
 $('mode-pan').onclick = () => { canvasMode = 'pan'; applyMode(); };
 $('mode-zoom-in').onclick = () => {
@@ -247,6 +326,22 @@ function revalidateView() {
 function styleRotation(style) {
   const m = String(style || '').match(/(?:^|;)rotation=(-?\d+(?:\.\d+)?)/);
   return m ? parseFloat(m[1]) : 0;
+}
+
+/// state 的视觉外接盒（含旋转；未旋转时即 state 矩形本身）
+function stateVisualBbox(st, deg) {
+  if (!deg) return { x: st.x, y: st.y, w: st.width, h: st.height };
+  const cx = st.x + st.width / 2, cy = st.y + st.height / 2;
+  const rad = deg * Math.PI / 180, cos = Math.cos(rad), sin = Math.sin(rad);
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const [px, py] of [[st.x, st.y], [st.x + st.width, st.y],
+                          [st.x, st.y + st.height], [st.x + st.width, st.y + st.height]]) {
+    const dx = px - cx, dy = py - cy;
+    const rx = cx + dx * cos - dy * sin, ry = cy + dx * sin + dy * cos;
+    minX = Math.min(minX, rx); maxX = Math.max(maxX, rx);
+    minY = Math.min(minY, ry); maxY = Math.max(maxY, ry);
+  }
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
 }
 
 /// fork 的渲染器不画旋转（canvas.rotate 存在但无调用方）——自己在 cell 的
@@ -516,21 +611,8 @@ function refreshHandles() {
   if (!st) return;
   handleCell = cell;
   // 旋转过的 cell：手柄跟随视觉 bbox（fork 的 state 不计算旋转外接盒）
-  let bx = st.x, by = st.y, bw = st.width, bh = st.height;
-  const deg = styleRotation(model.getStyle(cell));
-  if (deg) {
-    const cx = st.x + st.width / 2, cy = st.y + st.height / 2;
-    const rad = deg * Math.PI / 180, cos = Math.cos(rad), sin = Math.sin(rad);
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const [px, py] of [[st.x, st.y], [st.x + st.width, st.y],
-                            [st.x, st.y + st.height], [st.x + st.width, st.y + st.height]]) {
-      const dx = px - cx, dy = py - cy;
-      const rx = cx + dx * cos - dy * sin, ry = cy + dx * sin + dy * cos;
-      minX = Math.min(minX, rx); maxX = Math.max(maxX, rx);
-      minY = Math.min(minY, ry); maxY = Math.max(maxY, ry);
-    }
-    bx = minX; by = minY; bw = maxX - minX; bh = maxY - minY;
-  }
+  const bb = stateVisualBbox(st, styleRotation(model.getStyle(cell)));
+  const bx = bb.x, by = bb.y, bw = bb.w, bh = bb.h;
   const CURSORS = { nw:'nwse-resize', se:'nwse-resize', ne:'nesw-resize', sw:'nesw-resize',
                     n:'ns-resize', s:'ns-resize', e:'ew-resize', w:'ew-resize' };
   const mk = (cls, cx, cy, dir) => {

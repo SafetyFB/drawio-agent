@@ -43,12 +43,14 @@ cargo test -p drawio-agent-renderer   # 校验/渲染测试
 ## 用法（Web 主入口）
 
 ```bash
-cargo run -p drawio-harness -- web                  # http://127.0.0.1:8787
-cargo run -p drawio-harness -- web --dir ~/diagrams 4000   # 自定义会话目录与端口
+cargo run -p drawio-harness -- web       # http://127.0.0.1:8787
+cargo run -p drawio-harness -- web 4000  # 自定义端口
 ```
 
-打开浏览器地址即可。**会话 = 一个 `.drawio` 文件**：创建会话就是新建文件
-（默认 `~/.drawio-harness/files/`），下拉切换、＋ 新建、🗑 删除。
+打开浏览器地址即可。**会话 = 一个 `.drawio` 文件**：创建会话就是新建文件。
+所有数据统一放在一个目录下（`~/.drawio-agent/`）：`config.json`（配置）与
+`files/`（会话 `.drawio` + `<name>.history.jsonl` 轨迹 + `<name>.state.json`
+记忆/用量）。下拉切换、＋ 新建、🗑 删除。
 
 ### 首次配置（页内 ⚙ 面板）
 
@@ -72,6 +74,14 @@ cargo run -p drawio-harness -- web --dir ~/diagrams 4000   # 自定义会话目�
   底部实时显示，历史轨迹存 `<name>.history.jsonl`。
 - **历史 = 聊天流**：重新打开或切换会话时，上次对话、工具轨迹、用量按时间
   顺序以聊天样式重放，与实时消息同款，无感恢复。
+
+### 导出
+
+画布右下角 **PNG / SVG / XML** 三个按钮：
+
+- **PNG**：服务端 chromium 2x 渲染当前图（白底、带边距）
+- **SVG**：矢量导出（含旋转后的视觉形态），可直接用于报告/文档
+- **XML**：当前 `.drawio` 文件原文（canonical 格式，drawio 应用可直接打开）
 
 ### CLI（辅助）
 

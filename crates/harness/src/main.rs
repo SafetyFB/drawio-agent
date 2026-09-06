@@ -46,7 +46,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!(
-            "用法:\n  drawio-harness <file> [one-shot 消息…]      本地 REPL\n  drawio-harness new <file>                       创建空图\n  drawio-harness web [--dir 会话目录] [port]      浏览器入口：会话=文件 (默认 8787)\n  drawio-harness config show|set|clear|path      查看/保存 LLM 配置"
+            "用法:\n  drawio-harness <file> [one-shot 消息…]      本地 REPL\n  drawio-harness new <file>                       创建空图\n  drawio-harness web [port]                       浏览器入口：会话=文件 (默认 8787)\n  drawio-harness config show|set|clear|path      查看/保存 LLM 配置"
         );
         std::process::exit(2);
     }
@@ -56,37 +56,51 @@ fn main() {
     }
 
     if args[0] == "web" {
-        // drawio-harness web [--dir PATH] [port]
-        let mut dir: Option<PathBuf> = None;
+        // drawio-harness web [port]
+        // 会话目录不再对外暴露：统一在 ~/.drawio-agent/files（DRAWIO_DIR
+        // 仅作测试用内部开关，不写入文档）。
         let mut port = 8787u16;
-        let mut i = 1;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--dir" | "-d" => {
-                    i += 1;
-                    if let Some(v) = args.get(i) {
-                        dir = Some(PathBuf::from(v));
-                    }
-                }
-                other => {
-                    if let Ok(p) = other.parse::<u16>() {
-                        port = p;
-                    } else {
-                        eprintln!("未知参数: {other}");
-                        std::process::exit(2);
-                    }
+        for a in &args[1..] {
+            match a.parse::<u16>() {
+                Ok(p) => port = p,
+                Err(_) => {
+                    eprintln!("未知参数: {a}");
+                    std::process::exit(2);
                 }
             }
-            i += 1;
         }
-        let dir = dir
-            .or_else(|| std::env::var("DRAWIO_DIR").ok().map(PathBuf::from))
+        let dir = std::env::var("DRAWIO_DIR")
+            .ok()
+            .map(PathBuf::from)
             .unwrap_or_else(|| {
                 drawio_harness::config::home_dir()
                     .unwrap_or_default()
-                    .join(".drawio-harness")
+                    .join(".drawio-agent")
                     .join("files")
             });
+        // 老版本把会话放在 ~/.drawio-harness/files：一次性迁到统一目录
+        if !dir.exists() {
+            if let Some(home) = drawio_harness::config::home_dir() {
+                let legacy = home.join(".drawio-harness").join("files");
+                if legacy.is_dir() {
+                    if let Some(parent) = dir.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match std::fs::rename(&legacy, &dir) {
+                        Ok(()) => println!(
+                            "已迁移会话目录: {} -> {}",
+                            legacy.display(),
+                            dir.display()
+                        ),
+                        Err(e) => eprintln!(
+                            "会话目录迁移失败 {} -> {}: {e}",
+                            legacy.display(),
+                            dir.display()
+                        ),
+                    }
+                }
+            }
+        }
         if let Err(e) = rt.block_on(drawio_harness::web::serve(dir, port)) {
             eprintln!("{e}");
             std::process::exit(1);
