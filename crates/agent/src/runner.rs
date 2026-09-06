@@ -8,7 +8,18 @@ use tracing::{info, warn};
 
 use crate::deps::AgentDeps;
 use crate::phase::{LoopPhase, LoopState};
-use crate::{AgentLoop, AgentOutcome, LoopError};
+use crate::{AgentLoop, AgentOutcome, LoopError, ProgressCb};
+
+/// Record a trajectory event into the loop's local store AND forward it
+/// to the configured live-progress callback (if any). The callback runs
+/// synchronously in record order, so subscribers see events in exactly
+/// the order the loop recorded them — even while the run is still going.
+async fn record_progress(store: &TrajectoryStore, cb: &Option<ProgressCb>, event: TrajectoryEvent) {
+    store.record("agent", event.clone()).await;
+    if let Some(cb) = cb {
+        cb(event);
+    }
+}
 
 /// Run the Agent Loop against the given dependency implementations until
 /// the reviewer reports verdict "pass", `max_iterations` is hit, or a
@@ -39,12 +50,12 @@ pub async fn run<D: AgentDeps + ?Sized>(
     state.current_xml = match config.initial_xml.clone() {
         Some(xml) => Some(xml),
         None => {
-            store
-                .record(
-                    "agent",
-                    make_event(state.phase, config.prompt.chars().count(), false),
-                )
-                .await;
+            record_progress(
+                &store,
+                &config.progress_cb,
+                make_event(state.phase, config.prompt.chars().count(), false),
+            )
+            .await;
             match deps
                 .generate(GenerateRequest {
                     user_prompt: config.prompt.clone(),
@@ -56,25 +67,28 @@ pub async fn run<D: AgentDeps + ?Sized>(
                 .await
             {
                 Ok(r) => {
-                    store
-                        .record(
-                            "agent",
-                            complete_event(
-                                state.phase,
-                                r.usage.input_tokens,
-                                r.usage.output_tokens,
-                                r.duration_ms,
-                                r.finish_reason.clone(),
-                            ),
-                        )
-                        .await;
+                    record_progress(
+                        &store,
+                        &config.progress_cb,
+                        complete_event(
+                            state.phase,
+                            r.usage.input_tokens,
+                            r.usage.output_tokens,
+                            r.duration_ms,
+                            r.finish_reason.clone(),
+                        ),
+                    )
+                    .await;
                     Some(r.content)
                 }
                 Err(message) => {
                     let lp = state.phase;
-                    store
-                        .record("agent", error_event(state.phase, &message))
-                        .await;
+                    record_progress(
+                        &store,
+                        &config.progress_cb,
+                        error_event(state.phase, &message),
+                    )
+                    .await;
                     return Err(LoopError::Llm { phase: lp, message });
                 }
             }
@@ -100,21 +114,30 @@ pub async fn run<D: AgentDeps + ?Sized>(
                 return Err(LoopError::EmptyResponse { phase: LoopPhase::Generate });
             }
         };
-        store
-            .record("agent", make_event(state.phase, xml.len(), false))
-            .await;
+        record_progress(
+            &store,
+            &config.progress_cb,
+            make_event(state.phase, xml.len(), false),
+        )
+        .await;
         let _png = match deps.render(xml).await {
             Ok(p) => {
-                store
-                    .record("agent", complete_event_bytes(state.phase, p.len()))
-                    .await;
+                record_progress(
+                    &store,
+                    &config.progress_cb,
+                    complete_event_bytes(state.phase, p.len()),
+                )
+                .await;
                 p
             }
             Err(e) => {
                 let lp = state.phase;
-                store
-                    .record("agent", error_event(state.phase, &e.to_string()))
-                    .await;
+                record_progress(
+                    &store,
+                    &config.progress_cb,
+                    error_event(state.phase, &e.to_string()),
+                )
+                .await;
                 return Err(LoopError::Render {
                     phase: lp,
                     message: e.to_string(),
@@ -124,34 +147,37 @@ pub async fn run<D: AgentDeps + ?Sized>(
 
         // Review.
         state.phase = LoopPhase::Review;
-        store
-            .record(
-                "agent",
-                make_event(state.phase, config.review_checks.len(), false),
-            )
-            .await;
+        record_progress(
+            &store,
+            &config.progress_cb,
+            make_event(state.phase, config.review_checks.len(), false),
+        )
+        .await;
         let review = match deps.review(xml, &_png).await {
             Ok(r) => r,
             Err(message) => {
                 let lp = state.phase;
-                store
-                    .record("agent", error_event(state.phase, &message))
-                    .await;
+                record_progress(
+                    &store,
+                    &config.progress_cb,
+                    error_event(state.phase, &message),
+                )
+                .await;
                 return Err(LoopError::Llm { phase: lp, message });
             }
         };
-        store
-            .record(
-                "agent",
-                complete_event(
-                    state.phase,
-                    review_estimate_input(&review),
-                    review_estimate_output(&review),
-                    0,
-                    None,
-                ),
-            )
-            .await;
+        record_progress(
+            &store,
+            &config.progress_cb,
+            complete_event(
+                state.phase,
+                review_estimate_input(&review),
+                review_estimate_output(&review),
+                0,
+                None,
+            ),
+        )
+        .await;
         state.last_verdict = Some(review.verdict.clone());
         state.last_issue_count = review.issues.len() as u32;
 
@@ -177,30 +203,36 @@ pub async fn run<D: AgentDeps + ?Sized>(
             "Fix the {} issue(s) flagged by the visual reviewer.",
             review.issues.len()
         );
-        store
-            .record("agent", make_event(state.phase, cell_ids.len(), true))
-            .await;
+        record_progress(
+            &store,
+            &config.progress_cb,
+            make_event(state.phase, cell_ids.len(), true),
+        )
+        .await;
         match deps.patch(xml, &cell_ids, &instructions).await {
             Ok(r) => {
-                store
-                    .record(
-                        "agent",
-                        complete_event(
-                            state.phase,
-                            r.usage.input_tokens,
-                            r.usage.output_tokens,
-                            r.duration_ms,
-                            r.finish_reason.clone(),
-                        ),
-                    )
-                    .await;
+                record_progress(
+                    &store,
+                    &config.progress_cb,
+                    complete_event(
+                        state.phase,
+                        r.usage.input_tokens,
+                        r.usage.output_tokens,
+                        r.duration_ms,
+                        r.finish_reason.clone(),
+                    ),
+                )
+                .await;
                 state.current_xml = Some(r.content);
             }
             Err(message) => {
                 let lp = state.phase;
-                store
-                    .record("agent", error_event(state.phase, &message))
-                    .await;
+                record_progress(
+                    &store,
+                    &config.progress_cb,
+                    error_event(state.phase, &message),
+                )
+                .await;
                 return Err(LoopError::Llm { phase: lp, message });
             }
         }

@@ -95,7 +95,7 @@ impl LlmProvider for StubLlm {
     }
 }
 
-fn state_with(llm: Arc<StubLlm>, renderer: Arc<dyn RenderDriver>) -> Arc<AppState> {
+fn state_with(llm: Arc<dyn LlmProvider>, renderer: Arc<dyn RenderDriver>) -> Arc<AppState> {
     Arc::new(AppState {
         sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::new())),
         llm,
@@ -376,6 +376,368 @@ async fn agent_loop_rejects_request_without_prompt() {
     // Either 400 Bad Request (missing required field) or 422 — both are
     // acceptable "client error" responses. We just need non-2xx.
     assert!(resp.status().is_client_error(), "got {}", resp.status());
+}
+
+#[tokio::test]
+async fn agent_loop_400_message_is_actionable() {
+    let state = state_with(Arc::new(StubLlm::new()), Arc::new(MockDriver::new()));
+    let app = router(state);
+
+    // Empty session (no XML yet) — the exact "create then Run Loop" flow.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&CreateSessionRequest::default()).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 4096)
+        .await
+        .unwrap();
+    let parsed: drawio_agent_server::CreateSessionResponse = serde_json::from_slice(&body).unwrap();
+    let sid = parsed.session_id.as_str().to_string();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid}/agent-loop"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"prompt": "draw"}))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), 8192)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains("run /generate first"),
+        "message must tell the user what to do: {text}"
+    );
+    assert!(
+        text.contains(&sid),
+        "message must include the session id: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stub LLM for the Plan-B subgraph test: records the patch scope, returns
+// a modified subgraph document, and converges after one patch.
+// ---------------------------------------------------------------------------
+
+/// Full diagram with an unrelated cell (5) so a scope for `["2"]` must NOT
+/// include it.
+const SUBGRAPH_FULL_XML: &str = r#"<mxfile host="app.diagrams.net">
+  <diagram id="d" name="Page-1">
+    <mxGraphModel dx="800" dy="600" grid="1" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="2" value="Hello" style="rounded=0;" vertex="1" parent="1">
+          <mxGeometry x="100" y="100" width="120" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="3" value="World" style="rounded=0;" vertex="1" parent="1">
+          <mxGeometry x="300" y="100" width="120" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="4" style="edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="2" target="3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="5" value="Unrelated" style="rounded=0;" vertex="1" parent="1">
+          <mxGeometry x="600" y="300" width="120" height="60" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>"#;
+
+/// What the loop's internal patch LLM "returns": cell 2 modified, nothing else.
+const SUBGRAPH_PATCHED_XML: &str = r#"<mxfile>
+  <diagram id="d">
+    <mxGraphModel>
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="2" value="Modified" style="rounded=0;" vertex="1" parent="1">
+          <mxGeometry x="100" y="100" width="120" height="60" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>"#;
+
+#[derive(Clone)]
+struct SubgraphAwareLlm {
+    issues_served: Arc<std::sync::Mutex<u32>>,
+    patch_scopes: Arc<std::sync::Mutex<Vec<String>>>,
+    patch_current_xmls: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+}
+
+impl SubgraphAwareLlm {
+    fn new() -> Self {
+        Self {
+            issues_served: Arc::new(std::sync::Mutex::new(0)),
+            patch_scopes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            patch_current_xmls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for SubgraphAwareLlm {
+    fn name(&self) -> &str {
+        "subgraph-aware"
+    }
+    async fn generate_xml(
+        &self,
+        req: GenerateRequest,
+    ) -> Result<LlmResponse<String>, ProviderError> {
+        // The only generate_xml call in the loop is the internal patch step
+        // (initial XML is supplied), so every call records a patch request.
+        self.patch_scopes
+            .lock()
+            .unwrap()
+            .push(req.scope.clone().unwrap_or_default());
+        self.patch_current_xmls
+            .lock()
+            .unwrap()
+            .push(req.current_xml.clone());
+        Ok(LlmResponse {
+            content: SUBGRAPH_PATCHED_XML.to_string(),
+            usage: Usage::default(),
+            raw: Value::Null,
+            duration_ms: 0,
+            finish_reason: None,
+        })
+    }
+    async fn generate_streaming(
+        &self,
+        _req: GenerateRequest,
+    ) -> Result<LlmStream, ProviderError> {
+        unimplemented!()
+    }
+    async fn review_visual(
+        &self,
+        _req: ReviewRequest,
+    ) -> Result<LlmResponse<ReviewResponse>, ProviderError> {
+        let mut served = self.issues_served.lock().unwrap();
+        let first = *served == 0;
+        *served += 1;
+        let (verdict, issues) = if first {
+            (
+                "issues",
+                vec![drawio_agent_llm_client::ReviewIssue {
+                    kind: "overlap".into(),
+                    severity: "high".into(),
+                    cell_ids: vec!["2".into()],
+                    description: "overlap".into(),
+                }],
+            )
+        } else {
+            ("pass", vec![])
+        };
+        Ok(LlmResponse {
+            content: ReviewResponse {
+                verdict: verdict.into(),
+                issues,
+            },
+            usage: Usage::default(),
+            raw: Value::Null,
+            duration_ms: 0,
+            finish_reason: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn agent_loop_patch_sends_subgraph_scope_not_full_xml() {
+    let llm = Arc::new(SubgraphAwareLlm::new());
+    let state = state_with(llm.clone(), Arc::new(MockDriver::new()));
+    let app = router(state);
+    let sid = create_session_with_xml(app.clone(), SUBGRAPH_FULL_XML).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid}/agent-loop"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"prompt": "improve"}))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 65536)
+        .await
+        .unwrap();
+    let outcome: AgentOutcome = serde_json::from_slice(&body).unwrap();
+    assert!(outcome.converged(), "got {:?}", outcome.final_phase);
+
+    // The internal patch must have sent ONLY the subgraph as scope.
+    let scopes = llm.patch_scopes.lock().unwrap().clone();
+    assert_eq!(scopes.len(), 1, "loop should have patched exactly once");
+    let scope = &scopes[0];
+    assert!(
+        scope.len() < SUBGRAPH_FULL_XML.len(),
+        "scope ({}) must be shorter than the full diagram ({})",
+        scope.len(),
+        SUBGRAPH_FULL_XML.len()
+    );
+    assert!(
+        scope.contains("id=\"2\""),
+        "scope must include the targeted cell: {scope}"
+    );
+    assert!(
+        !scope.contains("Unrelated"),
+        "scope must NOT include unrelated cell 5: {scope}"
+    );
+
+    // And the full diagram must NOT be sent as current_xml (Plan B sends
+    // current_xml: None with only the subgraph as scope).
+    let current_xmls = llm.patch_current_xmls.lock().unwrap().clone();
+    assert!(
+        current_xmls.iter().all(|c| c.is_none()),
+        "patch must not send the full diagram as current_xml: {current_xmls:?}"
+    );
+
+    // The loop still converges with the patched cell applied back into the
+    // full diagram.
+    assert!(
+        outcome.final_xml.contains("value=\"Modified\""),
+        "patched cell must reflect the LLM's change"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Gated LLM for the live-streaming test: review_visual blocks until the
+// test releases it, so the loop is provably mid-flight when we observe
+// trajectory events on the EventBus.
+// ---------------------------------------------------------------------------
+
+struct GatedLlm {
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl GatedLlm {
+    fn new() -> Self {
+        Self {
+            release: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for GatedLlm {
+    fn name(&self) -> &str {
+        "gated"
+    }
+    async fn generate_xml(
+        &self,
+        _req: GenerateRequest,
+    ) -> Result<LlmResponse<String>, ProviderError> {
+        Ok(LlmResponse {
+            content: FULL_XML.to_string(),
+            usage: Usage::default(),
+            raw: Value::Null,
+            duration_ms: 0,
+            finish_reason: None,
+        })
+    }
+    async fn generate_streaming(
+        &self,
+        _req: GenerateRequest,
+    ) -> Result<LlmStream, ProviderError> {
+        unimplemented!()
+    }
+    async fn review_visual(
+        &self,
+        _req: ReviewRequest,
+    ) -> Result<LlmResponse<ReviewResponse>, ProviderError> {
+        self.release.notified().await;
+        Ok(LlmResponse {
+            content: ReviewResponse {
+                verdict: "pass".into(),
+                issues: vec![],
+            },
+            usage: Usage::default(),
+            raw: Value::Null,
+            duration_ms: 0,
+            finish_reason: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn agent_loop_streams_trajectory_events_during_loop() {
+    let llm = Arc::new(GatedLlm::new());
+    let state = state_with(llm.clone(), Arc::new(MockDriver::new()));
+    let app = router(state.clone());
+    let sid = create_session_with_xml(app.clone(), FULL_XML).await;
+
+    let session_id = drawio_agent_server::state::SessionId(sid.clone());
+    let mut rx = state.events.subscribe(&session_id).await.unwrap();
+
+    // Run the loop in a background task. Review blocks on the gate, so the
+    // loop stays mid-flight until the test releases it.
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/sessions/{sid}/agent-loop"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({"prompt": "improve"}))
+                .unwrap(),
+        ))
+        .unwrap();
+    let app2 = app.clone();
+    let handle = tokio::spawn(async move { app2.oneshot(req).await.unwrap() });
+
+    // Wait for a trajectory event on the bus BEFORE releasing the gate. If
+    // events stream live, RenderStarted arrives while the loop is still
+    // blocked in review.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut saw_live_event = false;
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(WsEvent::Trajectory(e))) => {
+                if e.kind.kind() == TrajectoryEventKind::RenderStarted {
+                    saw_live_event = true;
+                    break;
+                }
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    assert!(
+        saw_live_event,
+        "expected a live RenderStarted on the WS before the loop finished"
+    );
+
+    // Release the review gate; the loop converges and the request completes.
+    llm.release();
+    let resp = handle.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[allow(dead_code)]

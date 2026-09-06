@@ -65,7 +65,11 @@
     let data;
     try { data = JSON.parse(text); } catch { data = text; }
     if (!res.ok) {
-      const msg = data && data.message ? data.message : `HTTP ${res.status}`;
+      // Server errors are `{ "error": "..." }`; surface the real message so
+      // users see actionable text (e.g. "run /generate first") instead of a
+      // bare status code.
+      const serverMsg = data && (data.message || data.error);
+      const msg = serverMsg || `HTTP ${res.status}`;
       throw new Error(msg);
     }
     return data;
@@ -111,6 +115,9 @@
     btnExportPng.disabled = !enabled;
     downloadSvgBtn.disabled = !enabled;
     copyXmlUrlBtn.disabled = !enabled;
+    // Run Loop needs a diagram to improve: disable it on empty sessions
+    // (and while a run is already in progress).
+    loopBtn.disabled = !enabled || isRunning;
   }
 
   function setRunLoading(on, text = 'running…') {
@@ -508,7 +515,12 @@
   }
 
   function summarizeEvent(kind, payload) {
-    switch (kind) {
+    // TrajectoryEvent kinds arrive over WS snake_cased ("llm_call_started");
+    // normalize to the camel-case labels used by the cases below.
+    const k = typeof kind === 'string'
+      ? kind.replace(/_([a-z])/g, (_, c) => c.toUpperCase()).replace(/^[a-z]/, c => c.toUpperCase())
+      : kind;
+    switch (k) {
       case 'LlmCallStarted': return { stage: 'llm', text: `call started · ${payload.prompt_chars ?? '?'} chars` };
       case 'LlmCallCompleted': return { stage: 'llm', text: `${payload.input_tokens ?? 0}+${payload.output_tokens ?? 0} tok · ${payload.finish_reason ?? 'done'}` };
       case 'RenderStarted': return { stage: 'render', text: 'render started' };
@@ -639,6 +651,7 @@
       await loadSessionList();
     } catch (err) {
       showError(`Generate failed: ${err.message}`);
+      addActivity('Error', { stage: 'generate', message: err.message });
     } finally {
       setRunLoading(false);
       setLoading(false);
@@ -664,6 +677,7 @@
       }
     } catch (err) {
       showError(`Agent loop failed: ${err.message}`);
+      addActivity('Error', { stage: 'loop', message: err.message });
     } finally {
       setRunLoading(false);
       setLoading(false);

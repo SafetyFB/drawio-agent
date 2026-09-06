@@ -7,6 +7,8 @@
 #![deny(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -18,8 +20,13 @@ pub use deps::AgentDeps;
 pub use runner::run;
 pub use phase::{LoopPhase, LoopState};
 
+/// Callback invoked with each trajectory event as the loop records it,
+/// used to stream progress to subscribers while the run is still in
+/// flight (the events arrive in the order the loop records them).
+pub type ProgressCb = Arc<dyn Fn(drawio_agent_trajectory::TrajectoryEvent) + Send + Sync>;
+
 /// Configuration for a single Agent Loop run.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentLoop {
     /// Initial prompt for the codegen step. Required when `initial_xml`
     /// is `None`; ignored otherwise.
@@ -32,6 +39,23 @@ pub struct AgentLoop {
     pub patch_cell_ids: Vec<String>,
     /// Optional reviewer checks. Default: empty (VLM decides what to look for).
     pub review_checks: Vec<String>,
+    /// Optional live-progress callback. Invoked (synchronously, in record
+    /// order) for every trajectory event the loop records, before the run
+    /// finishes.
+    pub progress_cb: Option<ProgressCb>,
+}
+
+impl std::fmt::Debug for AgentLoop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentLoop")
+            .field("prompt", &self.prompt)
+            .field("initial_xml", &self.initial_xml)
+            .field("max_iterations", &self.max_iterations)
+            .field("patch_cell_ids", &self.patch_cell_ids)
+            .field("review_checks", &self.review_checks)
+            .field("progress_cb", &"<callback>")
+            .finish()
+    }
 }
 
 impl AgentLoop {
@@ -43,6 +67,7 @@ impl AgentLoop {
             max_iterations: 5,
             patch_cell_ids: Vec::new(),
             review_checks: Vec::new(),
+            progress_cb: None,
         }
     }
 }

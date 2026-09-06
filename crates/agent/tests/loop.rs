@@ -152,6 +152,7 @@ async fn converges_immediately_when_review_says_pass() {
         max_iterations: 5,
         patch_cell_ids: vec![],
         review_checks: vec![],
+        progress_cb: None,
     };
     let deps = StubDeps::pass_on_first_review();
     let outcome = run(config, &deps).await.expect("loop should converge");
@@ -170,6 +171,7 @@ async fn runs_full_initial_generate_when_initial_xml_is_none() {
         max_iterations: 5,
         patch_cell_ids: vec![],
         review_checks: vec![],
+        progress_cb: None,
     };
     let deps = StubDeps::pass_on_first_review();
     let outcome = run(config, &deps).await.expect("loop should converge");
@@ -193,6 +195,7 @@ async fn patches_and_reiterates_when_review_returns_issues() {
         max_iterations: 5,
         patch_cell_ids: vec![],
         review_checks: vec![],
+        progress_cb: None,
     };
     let deps = StubDeps::always_issues_and_patches_to_improved();
     let outcome = run(config, &deps).await.expect("loop should converge");
@@ -228,6 +231,7 @@ async fn gives_up_after_max_iterations() {
         max_iterations: 2,
         patch_cell_ids: vec![],
         review_checks: vec![],
+        progress_cb: None,
     };
     let deps = StubDeps::always_issues_and_patches_to_improved();
     let outcome = run(config, &deps).await.expect("loop terminates");
@@ -248,6 +252,7 @@ async fn trajectory_records_phase_transitions_in_order() {
         max_iterations: 5,
         patch_cell_ids: vec![],
         review_checks: vec![],
+        progress_cb: None,
     };
     let deps = StubDeps::pass_on_first_review();
     let outcome = run(config, &deps).await.unwrap();
@@ -306,9 +311,41 @@ async fn returns_error_on_deps_failure_during_generate() {
         max_iterations: 5,
         patch_cell_ids: vec![],
         review_checks: vec![],
+        progress_cb: None,
     };
     let result = run(config, &FailingDeps).await;
     assert!(result.is_err(), "expected error when generate fails");
+}
+
+#[tokio::test]
+async fn streams_progress_events_via_callback_in_order() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_cb = seen.clone();
+    let config = AgentLoop {
+        prompt: "draw".into(),
+        initial_xml: Some(INITIAL_XML.to_string()),
+        max_iterations: 5,
+        patch_cell_ids: vec![],
+        review_checks: vec![],
+        progress_cb: Some(Arc::new(
+            move |e: drawio_agent_trajectory::TrajectoryEvent| {
+                seen_cb.lock().unwrap().push(e.kind());
+            },
+        )),
+    };
+    let deps = StubDeps::pass_on_first_review();
+    let outcome = run(config, &deps).await.expect("loop should converge");
+
+    // The callback must have observed every event the loop recorded, in
+    // exactly the same order as the outcome's trajectory.
+    let cb_kinds = seen.lock().unwrap().clone();
+    let traj_kinds: Vec<TrajectoryEventKind> =
+        outcome.trajectory.iter().map(|e| e.kind.kind()).collect();
+    assert!(!cb_kinds.is_empty(), "callback should have seen events");
+    assert_eq!(
+        cb_kinds, traj_kinds,
+        "callback order must match recorded trajectory order"
+    );
 }
 
 #[allow(dead_code)]

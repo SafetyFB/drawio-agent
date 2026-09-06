@@ -646,7 +646,9 @@ async fn run_agent_loop(
         }
     }
 
-    // 400 if there's no XML to start from.
+    // 400 if there's no XML to start from. The message is structured so the
+    // client can surface it verbatim: the user knows to run /generate first
+    // without reading server logs.
     let initial_xml = state
         .sessions
         .read()
@@ -654,12 +656,39 @@ async fn run_agent_loop(
         .current_xml(&session_id)
         .await
         .ok_or_else(|| {
-            ServerError::BadRequest(
-                "session has no current XML — run /generate first".into(),
-            )
+            ServerError::BadRequest(format!(
+                "session {session_id} has no current XML — run /generate first"
+            ))
         })?;
 
-    // Bridge the server's shared providers into the Agent Loop.
+    // Bridge the server's shared providers into the Agent Loop. Wire the
+    // loop's progress callback to the EventBus through an unbounded channel
+    // so trajectory events stream to WS subscribers DURING the run instead
+    // of being dumped all at once after it finishes. The mpsc preserves the
+    // order the loop records events in; the emitter task drains it before
+    // the final VersionCreated is emitted, keeping end-to-end order intact.
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<drawio_agent_trajectory::TrajectoryEvent>();
+    let emit_state = state.clone();
+    let emit_session = session_id.clone();
+    let emitter = tokio::spawn(async move {
+        while let Some(evt) = rx.recv().await {
+            emit_state
+                .events
+                .emit(
+                    &emit_session,
+                    WsEvent::Trajectory(Box::new(drawio_agent_trajectory::Event {
+                        id: uuid::Uuid::new_v4(),
+                        seq: 0, // overwritten by the store's own seq; ignored on read
+                        at: std::time::SystemTime::now(),
+                        session_id: emit_session.0.clone(),
+                        kind: evt,
+                    })),
+                )
+                .await;
+        }
+    });
+
     let deps = ServerAgentDeps {
         llm: state.llm.clone(),
         renderer: state.renderer.clone(),
@@ -671,6 +700,9 @@ async fn run_agent_loop(
         max_iterations: req.max_iterations,
         patch_cell_ids: req.patch_cell_ids,
         review_checks: req.review_checks,
+        progress_cb: Some(std::sync::Arc::new(move |evt| {
+            let _ = tx.send(evt);
+        })),
     };
 
     let outcome = drawio_agent_agent::run(config, &deps).await.map_err(|e| {
@@ -684,16 +716,12 @@ async fn run_agent_loop(
         }
     })?;
 
-    // Stream each trajectory event to WS subscribers.
-    for traj_event in &outcome.trajectory {
-        state
-            .events
-            .emit(
-                &session_id,
-                WsEvent::Trajectory(Box::new(traj_event.clone())),
-            )
-            .await;
-    }
+    // Flush any progress events still in flight. The loop's callback held
+    // the only tx sender; `config` (and thus the closure) is dropped inside
+    // `run`, so the channel is closed once `run` returns — the emitter task
+    // drains the rest and finishes. Awaiting it here guarantees every
+    // trajectory event hits the WS before the VersionCreated below.
+    let _ = emitter.await;
 
     // Store the final XML as a new version.
     let version_id = state
