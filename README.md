@@ -58,7 +58,7 @@ Web 端：**每个会话绑定一个 .drawio 文件，创建会话 = 创建文�
 面板是只读时间线：自动展示当前会话的每次任务轨迹（工具调用/用量/回复），可导出会话 JSON；切换会话即切换历史。会话的记忆与用量随 `<name>.state.json` 持久化，重启后完整恢复；聊天实时流式渲染每轮工具
 调用与 token 花费（发送中可「停止」）。
 
-REPL（单文件模式）常用命令：`/history` `/restore N` `/ctx-save x.json`
+REPL（单文件模式）常用命令：`/history`（/history N 看轨迹）`/ctx-save x.json`
 `/ctx-load x.json` `/sel` `/stop`。
 
 ## 代码布局
