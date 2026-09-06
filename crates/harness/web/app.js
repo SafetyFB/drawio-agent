@@ -15,6 +15,8 @@ let selectedIds = [];      // cell ids of the current canvas selection
 let rubberBand = null;
 let rubberBandEl = null;
 let busy = false;
+let handleLayer = null; // 自绘 resize/rotate 手柄层（每次 loadXml 重建）
+let handleCell = null;  // 当前显示手柄的 cell（仅单选中叶子 cell）
 
 /// 任务运行中时，其它需要大锁的按钮直接提示，避免请求挂起等待。
 function guardBusy() {
@@ -82,6 +84,19 @@ function loadXmlIntoCanvas(xml) {
     graph.container.style.touchAction = 'none';
     patchGraphForBundle(graph);
     currentGraph = graph;
+    handleLayer = document.createElement('div');
+    handleLayer.id = 'cell-handles';
+    canvasEl.appendChild(handleLayer);
+    handleLayer.addEventListener('pointerdown', (e) => {
+      if (busy || !currentGraph || canvasMode !== 'select' || !handleCell) return;
+      const dir = e.target && e.target.dataset ? e.target.dataset.dir : null;
+      if (!dir) return;
+      e.stopPropagation();
+      e.preventDefault();
+      window.__pdHandled = true; // 阻断 fork 的 mousedown 兼容事件
+      if (dir === 'rotate') beginRotateDrag(e, handleCell);
+      else beginResizeDrag(e, handleCell, dir);
+    });
     // 缩放标签跟随 scale（常驻）
     const origSat = graph.view.scaleAndTranslate.bind(graph.view);
     graph.view.scaleAndTranslate = function (a, b, c) {
@@ -89,6 +104,8 @@ function loadXmlIntoCanvas(xml) {
       const el = document.getElementById('mode-zoom-100');
       if (el) el.textContent = Math.round(a * 100) + '%';
       if (window.__overlayPaint) window.__overlayPaint();
+      applyRotations();
+      refreshHandles();
     };
     applyMode();
 
@@ -97,12 +114,13 @@ function loadXmlIntoCanvas(xml) {
         .filter((c) => c.id && c.id !== '0' && c.id !== '1')
         .map((c) => c.id);
       setSelection(ids);
+      refreshHandles();
     });
 
-    // mini editor：编辑能力默认开启（拖动自实现，避免 fork 移动路径；
-    // resizable/editable 供手柄与双击文字使用）
+    // mini editor：拖动/缩放/旋转全部自实现。fork 自带的手柄可见但拖动
+    // 无效（官方拖动路径已死），关掉以免误导；我们自绘手柄接管。
     graph.setCellsMovable(false);
-    graph.setCellsResizable(true);
+    graph.setCellsResizable(false);
     graph.setCellsEditable(false); // fork 编辑器焦点/提交不可靠，自实现
     graph.setConnectable(false);
     // 初始 fit：模型几何计算，与 scale 无关
@@ -148,6 +166,7 @@ function applyMode() {
     currentGraph.setCellsSelectable(true);  // 点选/框选
   }
   cancelRubberBand();
+  refreshHandles();
 }
 $('mode-select').onclick = () => { canvasMode = 'select'; applyMode(); };
 $('mode-pan').onclick = () => { canvasMode = 'pan'; applyMode(); };
@@ -214,6 +233,48 @@ function getCellAtBbox(graph, x, y) {
 /// 用容器坐标对 state 比较——因此这里**不能**减 translate（那是经典
 /// mxGraph 的公式；照搬会造成点击偏移 translate 的量，花朵这类
 /// x≈340 的图在加载时 translate≈-316，直接偏出 300+px）。
+/// fork 的 scaleAndTranslate 在 scale/translate 同值时**跳过** viewStateChanged
+/// （不 revalidate）——这与经典 mxGraph 不同。我们直接改 geometry/style 后
+/// 必须显式 revalidate，否则 state/DOM 保持陈旧（拖动无视觉、手柄错位）。
+function revalidateView() {
+  if (!currentGraph) return;
+  currentGraph.view.revalidate();
+  applyRotations();
+  refreshHandles();
+}
+
+/// 从 style 字符串读取 rotation（无则 0）
+function styleRotation(style) {
+  const m = String(style || '').match(/(?:^|;)rotation=(-?\d+(?:\.\d+)?)/);
+  return m ? parseFloat(m[1]) : 0;
+}
+
+/// fork 的渲染器不画旋转（canvas.rotate 存在但无调用方）——自己在 cell 的
+/// shape 节点上附加 rotate transform。节点可能被 revalidate 重建/重置，
+/// 故在每次 revalidate 之后调用。rotate 中心 = state 中心（容器坐标，
+/// 节点 transform 仅 translate(0.5,0.5)，同一坐标系）。
+function applyRotations() {
+  if (!currentGraph) return;
+  const model = currentGraph.getModel();
+  const walk = (c) => {
+    if (c && model.isVertex(c)) {
+      const st = currentGraph.view.getState(c);
+      if (st && st.shape && st.shape.node) {
+        const deg = styleRotation(model.getStyle(c));
+        let t = st.shape.node.getAttribute('transform') || '';
+        t = t.replace(/\s*rotate\([^)]*\)\s*$/, '');
+        if (deg) {
+          const cx = st.x + st.width / 2, cy = st.y + st.height / 2;
+          t = (t ? t + ' ' : '') + 'rotate(' + deg + ' ' + cx + ' ' + cy + ')';
+        }
+        st.shape.node.setAttribute('transform', t || 'translate(0.5,0.5)');
+      }
+    }
+    if (c) for (let i = 0; i < model.getChildCount(c); i++) walk(model.getChildAt(c, i));
+  };
+  walk(model.getRoot());
+}
+
 function clientToGraph(clientX, clientY) {
   const rect = currentGraph.container.getBoundingClientRect();
   // 本 fork 的 state = (模型 + translate) × scale = 容器像素，
@@ -422,13 +483,148 @@ function beginCellDrag(e) {
       c.geometry.x += ddx;
       c.geometry.y += ddy;
     }
-    // 同值 scaleAndTranslate 也会触发 revalidate → 重绘
-    v.scaleAndTranslate(v.scale, v.translate.x, v.translate.y);
+    revalidateView();
   };
   const onUp = () => {
     window.removeEventListener('pointermove', onMove);
     window.removeEventListener('pointerup', onUp);
     if (moved > 2) markDirty();
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+}
+
+// ---------------------------------------------------------------------------
+// 自绘 resize / rotate 手柄（fork 自带手柄不可用，视觉可见但无拖动逻辑）
+// ---------------------------------------------------------------------------
+
+/// 重绘手柄层：仅当 select 模式、非 busy、恰好选中 1 个叶子 cell。
+/// 手柄位置用 state（=容器像素）直接定位；所有视图变化（缩放/平移/
+/// 拖动/revalidate）都经 scaleAndTranslate 钩子触发本函数跟随。
+function refreshHandles() {
+  if (handleLayer) handleLayer.innerHTML = '';
+  handleCell = null;
+  if (!currentGraph || busy || canvasMode !== 'select') return;
+  const model = currentGraph.getModel();
+  const sel = currentGraph.getSelectionCells().filter(
+    (c) => c && c.id && c.id !== '0' && c.id !== '1' && !model.isEdge(c) &&
+      model.getChildCount(c) === 0 && c.geometry
+  );
+  if (sel.length !== 1) return;
+  const cell = sel[0];
+  const st = currentGraph.view.getState(cell);
+  if (!st) return;
+  handleCell = cell;
+  // 旋转过的 cell：手柄跟随视觉 bbox（fork 的 state 不计算旋转外接盒）
+  let bx = st.x, by = st.y, bw = st.width, bh = st.height;
+  const deg = styleRotation(model.getStyle(cell));
+  if (deg) {
+    const cx = st.x + st.width / 2, cy = st.y + st.height / 2;
+    const rad = deg * Math.PI / 180, cos = Math.cos(rad), sin = Math.sin(rad);
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const [px, py] of [[st.x, st.y], [st.x + st.width, st.y],
+                            [st.x, st.y + st.height], [st.x + st.width, st.y + st.height]]) {
+      const dx = px - cx, dy = py - cy;
+      const rx = cx + dx * cos - dy * sin, ry = cy + dx * sin + dy * cos;
+      minX = Math.min(minX, rx); maxX = Math.max(maxX, rx);
+      minY = Math.min(minY, ry); maxY = Math.max(maxY, ry);
+    }
+    bx = minX; by = minY; bw = maxX - minX; bh = maxY - minY;
+  }
+  const CURSORS = { nw:'nwse-resize', se:'nwse-resize', ne:'nesw-resize', sw:'nesw-resize',
+                    n:'ns-resize', s:'ns-resize', e:'ew-resize', w:'ew-resize' };
+  const mk = (cls, cx, cy, dir) => {
+    const el = document.createElement('div');
+    el.className = 'mx-handle ' + cls;
+    el.dataset.dir = dir;
+    el.style.left = cx + 'px';
+    el.style.top = cy + 'px';
+    if (CURSORS[dir]) el.style.cursor = CURSORS[dir];
+    handleLayer.appendChild(el);
+    return el;
+  };
+  const x = bx, y = by, w = bw, h = bh;
+  mk('mx-handle-resize', x - 4, y - 4, 'nw');
+  mk('mx-handle-resize', x + w / 2 - 4, y - 4, 'n');
+  mk('mx-handle-resize', x + w - 4, y - 4, 'ne');
+  mk('mx-handle-resize', x + w - 4, y + h / 2 - 4, 'e');
+  mk('mx-handle-resize', x + w - 4, y + h - 4, 'se');
+  mk('mx-handle-resize', x + w / 2 - 4, y + h - 4, 's');
+  mk('mx-handle-resize', x - 4, y + h - 4, 'sw');
+  mk('mx-handle-resize', x - 4, y + h / 2 - 4, 'w');
+  // 旋转手柄：顶边中点上方 26px（手柄中心定位）；顶边贴近画布上缘时
+  // 翻到底边中点下方，连线方向同步翻转
+  let ry = y - 26 - 7;
+  let flip = false;
+  if (ry < 4) { ry = y + h + 26 - 7; flip = true; }
+  mk('mx-handle-rotate' + (flip ? ' mx-handle-rotate-flip' : ''), x + w / 2 - 7, ry, 'rotate');
+}
+
+/// 拖 resize 手柄：方向编码 n/e/s/w。数学全程在 state（容器像素）空间
+/// 做约束，最后一次性换算回模型几何（÷scale − translate）。
+function beginResizeDrag(e, cell, dir) {
+  const v = currentGraph.view;
+  const st0 = v.getState(cell);
+  const x0 = st0.x, y0 = st0.y, w0 = st0.width, h0 = st0.height;
+  const startX = e.clientX, startY = e.clientY;
+  const MIN = 20; // 状态空间最小 20px
+  let moved = false;
+  const onMove = (ev) => {
+    const dx = ev.clientX - startX, dy = ev.clientY - startY;
+    let x = x0, y = y0, w = w0, h = h0;
+    if (dir.includes('e')) w = w0 + dx;
+    if (dir.includes('s')) h = h0 + dy;
+    if (dir.includes('w')) { x = x0 + dx; w = w0 - dx; }
+    if (dir.includes('n')) { y = y0 + dy; h = h0 - dy; }
+    if (w < MIN) { if (dir.includes('w')) x = x0 + w0 - MIN; w = MIN; }
+    if (h < MIN) { if (dir.includes('n')) y = y0 + h0 - MIN; h = MIN; }
+    if (x !== x0 || y !== y0 || w !== w0 || h !== h0) moved = true;
+    cell.geometry.x = x / v.scale - v.translate.x;
+    cell.geometry.y = y / v.scale - v.translate.y;
+    cell.geometry.width = w / v.scale;
+    cell.geometry.height = h / v.scale;
+    revalidateView();
+  };
+  const onUp = () => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    if (moved) markDirty();
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+}
+
+/// style 字符串上更新 rotation= 项（其余项保持，顺序无关）
+function styleSetRotation(style, deg) {
+  const parts = String(style || '')
+    .split(';').map((s) => s.trim())
+    .filter((s) => s && !/^rotation=/.test(s));
+  parts.push('rotation=' + deg);
+  return parts.join(';');
+}
+
+/// 拖旋转手柄：绕 cell 中心（state bbox 中心 = 几何中心，旋转下不变）。
+/// 角度 = atan2（指针向右=90°，上方=0°，顺时针）。Shift 吸附 15°。
+function beginRotateDrag(e, cell) {
+  const v = currentGraph.view;
+  const model = currentGraph.getModel();
+  const st = v.getState(cell);
+  const cx = st.x + st.width / 2, cy = st.y + st.height / 2;
+  const rect = currentGraph.container.getBoundingClientRect();
+  let moved = false;
+  const onMove = (ev) => {
+    const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
+    let deg = Math.atan2(px - cx, cy - py) * 180 / Math.PI;
+    deg = ((deg % 360) + 360) % 360;
+    deg = ev.shiftKey ? Math.round(deg / 15) * 15 % 360 : Math.round(deg);
+    model.setStyle(cell, styleSetRotation(model.getStyle(cell), deg));
+    moved = true;
+    revalidateView();
+  };
+  const onUp = () => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    if (moved) markDirty();
   };
   window.addEventListener('pointermove', onMove);
   window.addEventListener('pointerup', onUp);
@@ -448,6 +644,7 @@ function startTextEdit(cell) {
   canvasEl.appendChild(input);
   input.focus();
   input.select();
+  if (handleLayer) handleLayer.innerHTML = '';
   let done = false; // Enter 提交后 blur 会再触发一次 commit
   const commit = () => {
     if (done) return;
@@ -457,19 +654,17 @@ function startTextEdit(cell) {
     window.removeEventListener('pointerdown', outside);
     if (v !== (cell.value || '')) {
       currentGraph.getModel().setValue(cell, v);
-      currentGraph.view.scaleAndTranslate(
-        currentGraph.view.scale,
-        currentGraph.view.translate.x,
-        currentGraph.view.translate.y
-      ); // 重绘标签
+      revalidateView(); // 重绘标签
       markDirty();
     }
+    refreshHandles();
   };
   const cancel = () => {
     if (done) return;
     done = true;
     input.remove();
     window.removeEventListener('pointerdown', outside);
+    refreshHandles();
   };
   const outside = (ev) => {
     if (ev.target !== input) commit();
@@ -801,6 +996,7 @@ $('chatform').onsubmit = async (ev) => {
   if (!text) return;
   if (!picker.value) { log('error', '先创建一个会话（＋ 新建会话）'); return; }
   busy = true;
+  refreshHandles();
   $('send').disabled = false;
   $('send').textContent = '停止';
   $('send').classList.add('danger');
@@ -842,6 +1038,7 @@ $('chatform').onsubmit = async (ev) => {
     }
   } finally {
     busy = false;
+    refreshHandles();
     $('send').textContent = '发送';
     $('send').classList.remove('danger');
     // 页面刷新/关闭会中断这些 fetch——兜底吞掉，不再产生未处理 rejection
