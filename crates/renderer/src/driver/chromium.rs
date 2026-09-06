@@ -153,10 +153,6 @@ struct ChromiumInner {
     pending: Arc<Mutex<PendingMap>>,
     /// Page-session id after `Target.attachToTarget`; `None` before then.
     session_id: Mutex<Option<String>>,
-    /// Directory containing `render.html` (and the viewer bundle).
-    assets_dir: PathBuf,
-    /// Background color used when `RenderOptions.background` is empty.
-    default_background: String,
     /// Keeps the WebSocket reader task alive.
     _reader_task: tokio::task::JoinHandle<()>,
 }
@@ -291,19 +287,12 @@ impl HeadlessChromiumDriver {
             }
         });
 
-        // Compile-time manifest dir: embeds the RENDERER crate's path, so the
-// driver finds render.html regardless of which binary is running (a
-// runtime env!() would be overridden by the host crate).
-let assets_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
-
         let inner = ChromiumInner {
             _child_pid: pid,
             write: out_tx,
             next_id: Mutex::new(1),
             pending,
             session_id: Mutex::new(None),
-            assets_dir,
-            default_background: "#ffffff".into(),
             _reader_task: reader_task,
         };
         let driver = Self {
