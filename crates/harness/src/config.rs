@@ -122,15 +122,33 @@ pub fn mask_secret(secret: &str) -> String {
 }
 
 /// Resolve the config file path: `DRAWIO_AGENT_CONFIG_FILE`, else
-/// `~/.drawio-agent/config.json`.
+/// 用户主目录：优先 `HOME`（Unix/macOS），Windows 回退 `USERPROFILE`。
+pub fn home_dir() -> Option<PathBuf> {
+    if let Some(h) = std::env::var_os("HOME") {
+        if !h.is_empty() {
+            return Some(PathBuf::from(h));
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(u) = std::env::var_os("USERPROFILE") {
+            if !u.is_empty() {
+                return Some(PathBuf::from(u));
+            }
+        }
+    }
+    None
+}
+
+/// `~/.drawio-agent/config.json`（Windows 上为 `%USERPROFILE%\.drawio-agent`）。
 pub fn config_file_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("DRAWIO_AGENT_CONFIG_FILE") {
         if !p.is_empty() {
             return Some(PathBuf::from(p));
         }
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".drawio-agent").join("config.json"))
+    let home = home_dir()?;
+    Some(home.join(".drawio-agent").join("config.json"))
 }
 
 pub fn load_config_file(path: &Path) -> Option<LlmSettings> {

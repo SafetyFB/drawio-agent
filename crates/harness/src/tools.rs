@@ -333,7 +333,11 @@ fn open_with_system_viewer(path: &std::path::Path) {
     #[cfg(all(unix, not(target_os = "macos")))]
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
     #[cfg(not(unix))]
-    let _ = std::process::Command::new("cmd").args(["/C", "start", ""]).arg(path).spawn();
+    {
+        // `start` 的第二个参数是窗口标题；给目标路径加引号防空格路径断裂
+        let quoted = format!("\"{}\"", path.display());
+        let _ = std::process::Command::new("cmd").args(["/C", "start", ""]).arg(quoted).spawn();
+    }
 }
 
 pub fn report_summary(r: &EditReport) -> String {

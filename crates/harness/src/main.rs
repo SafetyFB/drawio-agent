@@ -82,8 +82,10 @@ fn main() {
         let dir = dir
             .or_else(|| std::env::var("DRAWIO_DIR").ok().map(PathBuf::from))
             .unwrap_or_else(|| {
-                let home = std::env::var_os("HOME").unwrap_or_default();
-                PathBuf::from(home).join(".drawio-harness").join("files")
+                drawio_harness::config::home_dir()
+                    .unwrap_or_default()
+                    .join(".drawio-harness")
+                    .join("files")
             });
         if let Err(e) = rt.block_on(drawio_harness::web::serve(dir, port)) {
             eprintln!("{e}");
@@ -770,7 +772,7 @@ fn config_cli(args: &[String]) {
         "path" => match config::config_file_path() {
             Some(p) => println!("{}", p.display()),
             None => {
-                eprintln!("HOME 未设置");
+                eprintln!("找不到主目录（HOME/USERPROFILE 未设置）");
                 std::process::exit(1);
             }
         },

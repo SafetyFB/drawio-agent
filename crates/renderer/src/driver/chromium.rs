@@ -88,6 +88,13 @@ fn which(name: &str) -> Option<PathBuf> {
         if candidate.is_file() {
             return Some(candidate);
         }
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{name}.exe"));
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
     }
     None
 }
