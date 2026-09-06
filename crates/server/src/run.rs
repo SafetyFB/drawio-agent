@@ -242,10 +242,16 @@ pub async fn shutdown_signal() {
 // or when we need a real HTTP transport for OpenAiCompatProvider).
 // ---------------------------------------------------------------------------
 
-/// No-op LLM stub: returns `<mxfile/>` for any generate call. Lets the
-/// server run without API keys.
+/// No-op LLM stub for mock mode. For a fresh generate it returns a small
+/// fixed diagram so mock sessions have real cells; when patching (the request
+/// carries `current_xml`) it echoes that XML back so the patch handler gets a
+/// valid diagram to parse. (Previously it always returned `<mxfile/>`, which
+/// has no `<diagram>` — every patch failed with "no diagram in LLM response"
+/// after recording LlmCallCompleted, and the canvas never updated.)
 #[derive(Debug)]
 pub struct StubLlm;
+
+const MOCK_DIAGRAM: &str = r#"<mxfile host="app.diagrams.net"><diagram id="mock" name="Page-1"><mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="2" value="Box A" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1"><mxGeometry x="100" y="100" width="120" height="60" as="geometry"/></mxCell><mxCell id="3" value="Box B" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1"><mxGeometry x="300" y="100" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
 
 #[async_trait::async_trait]
 impl LlmProvider for StubLlm {
@@ -254,11 +260,14 @@ impl LlmProvider for StubLlm {
     }
     async fn generate_xml(
         &self,
-        _req: drawio_agent_llm_client::GenerateRequest,
+        req: drawio_agent_llm_client::GenerateRequest,
     ) -> Result<drawio_agent_llm_client::LlmResponse<String>, drawio_agent_llm_client::ProviderError>
     {
+        let content = req
+            .current_xml
+            .unwrap_or_else(|| MOCK_DIAGRAM.to_string());
         Ok(drawio_agent_llm_client::LlmResponse {
-            content: "<mxfile/>".to_string(),
+            content,
             usage: Usage::default(),
             raw: serde_json::Value::Null,
             duration_ms: 0,

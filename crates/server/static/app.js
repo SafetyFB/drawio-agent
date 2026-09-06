@@ -152,7 +152,13 @@
         json_mode: false,
       });
       if (result && result.xml) {
+        // If the LLM returned the same XML (e.g. the no-op mock LLM echoing
+        // the current diagram), say so instead of silently doing nothing.
+        const noVisualChange = result.xml === currentXml;
         loadXmlIntoCanvas(result.xml);
+        if (noVisualChange) {
+          addActivity('StateTransition', { from: 'patch', to: 'no visual change (LLM returned the same XML)' });
+        }
       }
       currentSelection = [];
       updateSelectionState([]);
@@ -357,9 +363,14 @@
   }
 
   function loadXmlIntoCanvas(xml) {
+    // Destroy the previous graph so its listeners/timers don't linger when a
+    // new mxGraph is built on the same container (patch/generate reloads).
+    if (currentGraph) {
+      try { currentGraph.destroy(); } catch (e) { /* ignore */ }
+      currentGraph = null;
+    }
     currentXml = xml;
     drawioContainer.innerHTML = '';
-    currentGraph = null;
     currentSelection = [];
     updateSelectionState([]);
     updateActionButtons();
