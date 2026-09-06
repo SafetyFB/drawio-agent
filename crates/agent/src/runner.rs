@@ -203,10 +203,16 @@ pub async fn run<D: AgentDeps + ?Sized>(
             "Fix the {} issue(s) flagged by the visual reviewer.",
             review.issues.len()
         );
+        // The recorded `prompt_chars` is the LLM's user-message size, not
+        // the cell-ids count. Use the instructions text length as a
+        // reasonable proxy; cell_ids.len() is wrong because it can be 0
+        // when the vision review returned issues without cell_ids (the
+        // Phase 37 Q2 gap) — which made the trajectory show "0 chars"
+        // even though the LLM was called with a real prompt.
         record_progress(
             &store,
             &config.progress_cb,
-            make_event(state.phase, cell_ids.len(), true),
+            make_event(state.phase, instructions.chars().count(), true),
         )
         .await;
         match deps.patch(xml, &cell_ids, &instructions).await {
