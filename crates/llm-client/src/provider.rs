@@ -101,16 +101,26 @@ pub struct FixRequest {
 }
 
 /// Parsed JSON envelope returned by the fix step:
-/// `{"done", "xml", "issues", "reasoning"}`.
+/// `{"done", "xml", "removed", "issues", "reasoning"}`.
+///
+/// The `xml` field is a DIFF, not necessarily the full document: it must
+/// contain every cell the model changed plus any new cells. Cells absent
+/// from `xml` are untouched by the server (byte-for-byte). Deletions are
+/// declared explicitly via `removed` (absence does NOT mean deletion).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FixEnvelope {
     /// `true` when the model fixed everything it can (or nothing needs
     /// fixing). Missing on the wire defaults to `true`.
     #[serde(default = "default_done")]
     pub done: bool,
-    /// The resulting document: full mxfile, or scope-only when the request
-    /// carried a `scope_xml`.
+    /// Changed/new cells as an mxfile document (a subset of the diagram is
+    /// fine and encouraged — output size should scale with the CHANGE, not
+    /// the diagram).
     pub xml: String,
+    /// Cell ids to delete from the diagram (with their descendants; edges
+    /// referencing them are cleaned up automatically).
+    #[serde(default)]
+    pub removed: Vec<String>,
     /// Items the model could not resolve / wants re-verified visually.
     #[serde(default)]
     pub issues: Vec<ReviewIssue>,
@@ -126,7 +136,8 @@ fn default_done() -> bool {
 /// the fields the loop actually gates on (`xml`, `done`); missing `issues`
 /// and `reasoning` are tolerated.
 pub fn parse_fix_envelope(content: &str) -> Result<FixEnvelope, String> {
-    let parsed: Value = serde_json::from_str(content).map_err(|e| {
+    let content = strip_code_fences(content);
+    let parsed: Value = serde_json::from_str(&content).map_err(|e| {
         format!("fix response is not a JSON object ({e}); expected envelope \
                  {{\"done\": bool, \"xml\": \"<mxfile>…\"}}")
     })?;
@@ -145,6 +156,12 @@ pub fn parse_fix_envelope(content: &str) -> Result<FixEnvelope, String> {
         .transpose()
         .map_err(|e| format!("fix response 'issues' is malformed: {e}"))?
         .unwrap_or_default();
+    let removed: Vec<String> = parsed
+        .get("removed")
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()
+        .map_err(|e| format!("fix response 'removed' is malformed: {e}"))?
+        .unwrap_or_default();
     let reasoning = parsed
         .get("reasoning")
         .and_then(Value::as_str)
@@ -153,6 +170,7 @@ pub fn parse_fix_envelope(content: &str) -> Result<FixEnvelope, String> {
         done,
         xml,
         issues,
+        removed,
         reasoning,
     })
 }
@@ -326,9 +344,9 @@ impl LlmProvider for OpenAiCompatProvider {
         // (and more actionable) failure, so it must be reported first.
         let content = if req.json_mode {
             let content_str = parse_content(&raw)?;
-            parse_json_codegen_content(&content_str)?
+            parse_json_codegen_content(&strip_code_fences(&content_str))?
         } else {
-            parse_content(&raw)?
+            strip_code_fences(&parse_content(&raw)?)
         };
         let usage = parse_usage(&raw)?;
         let finish_reason = parse_finish_reason(&raw);
@@ -408,7 +426,7 @@ impl LlmProvider for OpenAiCompatProvider {
             ],
         });
         let raw = self.post(&body).await?;
-        let content_str = parse_content(&raw)?;
+        let content_str = strip_code_fences(&parse_content(&raw)?);
         let content = serde_json::from_str(&content_str)
             .map_err(|e| ProviderError::Provider(format!("invalid review JSON: {e}")))?;
         let usage = parse_usage(&raw)?;
@@ -454,7 +472,7 @@ impl LlmProvider for OpenAiCompatProvider {
         let raw = self.post(&body).await?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        let content = parse_content(&raw)?;
+        let content = strip_code_fences(&parse_content(&raw)?);
         let usage = parse_usage(&raw)?;
         let finish_reason = parse_finish_reason(&raw);
 
@@ -510,6 +528,26 @@ fn parse_json_codegen_content(content_str: &str) -> Result<String, TransportErro
                 "json_mode: response missing string 'xml' field".to_string(),
             )
         })
+}
+
+/// Trim markdown code fences some models wrap around their output
+/// (```xml … ``` / ```json … ```) despite "output ONLY the XML/JSON"
+/// instructions. Real-model finding: deepseek-v4-flash-vision wraps XML
+/// responses in fences, which made every parse fail at the caller.
+pub fn strip_code_fences(content: &str) -> String {
+    let mut t = content.trim();
+    // Strip a leading ```lang … line (```xml, ```json, or bare ```).
+    if let Some(rest) = t.strip_prefix("```") {
+        t = match rest.find('\n') {
+            Some(i) => rest[i + 1..].trim_start(),
+            None => "",
+        };
+    }
+    // Strip a trailing fence line.
+    if let Some(rest) = t.strip_suffix("```") {
+        t = rest.trim_end();
+    }
+    t.to_string()
 }
 
 /// Parse an SSE-formatted response body into a stream of [`StreamChunk`]s.
@@ -697,5 +735,35 @@ mod tests {
             err.contains("JSON"),
             "bare XML must be rejected with a JSON hint: {err}"
         );
+    }
+
+    #[test]
+    fn strip_code_fences_removes_xml_and_json_fences() {
+        assert_eq!(
+            strip_code_fences("```xml\n<mxfile/>\n```"),
+            "<mxfile/>",
+            "xml fence must be stripped"
+        );
+        assert_eq!(
+            strip_code_fences("```json\n{\"done\": true}\n```"),
+            "{\"done\": true}",
+            "json fence must be stripped"
+        );
+        assert_eq!(
+            strip_code_fences("<mxfile/>"),
+            "<mxfile/>",
+            "unfenced content must pass through untouched"
+        );
+    }
+
+    #[test]
+    fn parse_fix_envelope_accepts_fenced_envelope() {
+        // Real-model shape: the model wraps the JSON envelope in ```json.
+        let env = parse_fix_envelope(
+            "```json\n{\"done\": true, \"xml\": \"<mxfile/>\", \"issues\": []}\n```",
+        )
+        .unwrap();
+        assert!(env.done);
+        assert_eq!(env.xml, "<mxfile/>");
     }
 }

@@ -156,10 +156,43 @@ impl MxGraphModel {
     /// - Cells not in the subgraph: untouched, attributes byte-for-byte
     ///   preserved.
     pub fn apply_subgraph(&mut self, sub: &Subgraph) -> ApplyResult {
+        let (updated, added) =
+            self.apply_cells(sub.primary.iter().chain(sub.edges.iter()));
+        ApplyResult {
+            updated,
+            added,
+            context_ignored: sub.context.len(),
+        }
+    }
+
+    /// Apply a cell-level diff (fix-diff protocol of the v2 loop):
+    ///
+    /// - every cell in `incoming` is replaced in-place if its id already
+    ///   exists, or inserted under its declared `parent` if it is new;
+    /// - cells ABSENT from `incoming` are untouched (byte-for-byte) — this
+    ///   is what makes "only output what you changed" safe;
+    /// - then every id in `removed_ids` is deleted together with its
+    ///   descendants and any dangling edges.
+    pub fn apply_cell_diff(&mut self, incoming: &[Cell], removed_ids: &[&str]) -> ApplyResult {
+        let (updated, added) = self.apply_cells(incoming.iter());
+        if !removed_ids.is_empty() {
+            self.remove_cells(removed_ids);
+        }
+        ApplyResult {
+            updated,
+            added,
+            context_ignored: 0,
+        }
+    }
+
+    /// Shared replace-or-insert loop for subgraph / cell-diff applies.
+    fn apply_cells<'a>(
+        &mut self,
+        cells: impl Iterator<Item = &'a Cell>,
+    ) -> (Vec<String>, Vec<String>) {
         let mut updated: Vec<String> = Vec::new();
         let mut added: Vec<String> = Vec::new();
-
-        for cell in sub.primary.iter().chain(sub.edges.iter()) {
+        for cell in cells {
             let id = cell.id.clone();
             if id.is_empty() {
                 continue;
@@ -172,12 +205,75 @@ impl MxGraphModel {
                 added.push(id);
             }
         }
+        (updated, added)
+    }
 
-        ApplyResult {
-            updated,
-            added,
-            context_ignored: sub.context.len(),
+    /// Remove the given cells (and their descendants) from the model.
+    /// Edges whose `source` or `target` points at a removed cell are
+    /// removed too (dangling-edge cleanup). The synthetic root ("0") and
+    /// the default layer ("1") are never removed. Returns the ids that
+    /// were actually removed (present in the model).
+    ///
+    /// Used by the fix-diff protocol (v2 loop): the model declares
+    /// deletions explicitly via `removed: [...]` in its envelope.
+    pub fn remove_cells(&mut self, ids: &[&str]) -> Vec<String> {
+        use std::collections::HashSet;
+
+        let mut doomed: HashSet<String> = ids
+            .iter()
+            .filter(|id| !matches!(**id, "0" | "1"))
+            .map(|s| s.to_string())
+            .collect();
+
+        // Expand to descendants of every doomed cell, to a fixpoint.
+        fn expand_once(root: &Cell, doomed: &HashSet<String>) -> Vec<String> {
+            fn add_subtree_ids(cell: &Cell, out: &mut Vec<String>) {
+                out.push(cell.id.clone());
+                for c in &cell.children {
+                    add_subtree_ids(c, out);
+                }
+            }
+            let mut to_add: Vec<String> = Vec::new();
+            fn walk(cell: &Cell, doomed: &HashSet<String>, to_add: &mut Vec<String>) {
+                if doomed.contains(&cell.id) {
+                    for c in &cell.children {
+                        add_subtree_ids(c, to_add);
+                    }
+                }
+                for c in &cell.children {
+                    walk(c, doomed, to_add);
+                }
+            }
+            walk(root, doomed, &mut to_add);
+            to_add
         }
+        loop {
+            let to_add = expand_once(&self.root, &doomed);
+            let grew = to_add.into_iter().any(|id| doomed.insert(id));
+            if !grew {
+                break;
+            }
+        }
+
+        // Dangling-edge cleanup: an edge referencing a doomed endpoint dies
+        // with it (the model may also list edges explicitly; this is the
+        // safety net).
+        let mut edges: Vec<&Cell> = Vec::new();
+        collect_edges(&self.root, &mut edges);
+        for edge in edges {
+            let hits = [edge.source.as_deref(), edge.target.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|id| doomed.contains(id));
+            if hits {
+                doomed.insert(edge.id.clone());
+            }
+        }
+
+        // Prune the tree.
+        let mut removed: Vec<String> = Vec::new();
+        prune_cells(&mut self.root, &doomed, &mut removed);
+        removed
     }
 
     /// Validate structural integrity of the model. Collects **all** errors
@@ -350,6 +446,24 @@ fn try_insert_under(root: &mut Cell, parent_id: &str, cell: Cell) -> bool {
         }
     }
     false
+}
+
+/// Remove every cell whose id is in `doomed` (in place, recursively).
+/// The root itself is never pruned (its id is never in `doomed` — callers
+/// protect "0"). Records removed ids into `removed`.
+fn prune_cells(cell: &mut Cell, doomed: &std::collections::HashSet<String>, removed: &mut Vec<String>) {
+    let mut survivors: Vec<Cell> = Vec::with_capacity(cell.children.len());
+    for child in std::mem::take(&mut cell.children) {
+        if doomed.contains(&child.id) {
+            removed.push(child.id.clone());
+        } else {
+            survivors.push(child);
+        }
+    }
+    cell.children = survivors;
+    for child in &mut cell.children {
+        prune_cells(child, doomed, removed);
+    }
 }
 
 /// A scope extracted from a model for selection-based editing.

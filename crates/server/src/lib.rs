@@ -186,7 +186,8 @@ pub struct AgentLoopRequest {
     /// back to the session's stored current XML.
     #[serde(default)]
     pub initial_xml: Option<String>,
-    /// Maximum render-review-patch iterations. Defaults to 5.
+    /// Maximum render-review-patch iterations. Defaults to 3 (real-model
+    /// runs showed 5 rounds × ~1-4 min each is too long to wait).
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
     /// Cells to focus on during Patch (e.g. specific node IDs).
@@ -198,5 +199,5 @@ pub struct AgentLoopRequest {
 }
 
 fn default_max_iterations() -> u32 {
-    5
+    3
 }

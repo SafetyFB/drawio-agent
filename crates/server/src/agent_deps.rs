@@ -90,6 +90,7 @@ impl AgentDeps for ServerAgentDeps {
         // classify anything unusable as Rejected so the loop can retry with
         // the reason instead of dying.
         let envelope = parse_fix_envelope(&resp.content).map_err(FixError::Rejected)?;
+        let removed_refs: Vec<&str> = envelope.removed.iter().map(|s| s.as_str()).collect();
 
         let new_full_xml: String = if subgraph.is_some() {
             // Scope mode: the returned document should contain (at least)
@@ -119,17 +120,32 @@ impl AgentDeps for ServerAgentDeps {
                 .and_then(|d| d.model.as_mut())
                 .ok_or_else(|| FixError::Llm("no model in original".into()))?;
             model.apply_subgraph(&patched_subgraph);
+            if !removed_refs.is_empty() {
+                model.remove_cells(&removed_refs);
+            }
             file.to_xml()
                 .map_err(|e| FixError::Llm(format!("serialize merged XML: {e}")))?
         } else {
-            // Full-document mode: the model returns the whole diagram. It
-            // must at least parse; round-trip through the canonical
-            // serializer so the no-op comparison below is formatting-blind.
-            let parsed = drawio_agent_xml_core::MxFile::parse(envelope.xml.as_bytes())
+            // Diff mode (no explicit scope): the model saw the full diagram
+            // but must output ONLY the cells it changed (plus `removed` for
+            // deletions). Every cell absent from the response stays
+            // byte-for-byte untouched — that is what makes output tokens
+            // scale with the change, not the diagram. A model that ignores
+            // the rule and echoes everything back still merges correctly.
+            let patched = drawio_agent_xml_core::MxFile::parse(envelope.xml.as_bytes())
                 .map_err(|e| FixError::Rejected(format!("fix output is not valid mxfile: {e}")))?;
-            parsed
-                .to_xml()
-                .map_err(|e| FixError::Llm(format!("serialize fix output: {e}")))?
+            let incoming = collect_visible_cells(&patched);
+            let file = full_file
+                .as_mut()
+                .ok_or_else(|| FixError::Llm("original file lost".into()))?;
+            let model = file
+                .diagrams
+                .first_mut()
+                .and_then(|d| d.model.as_mut())
+                .ok_or_else(|| FixError::Llm("no model in original".into()))?;
+            model.apply_cell_diff(&incoming, &removed_refs);
+            file.to_xml()
+                .map_err(|e| FixError::Llm(format!("serialize merged XML: {e}")))?
         };
 
         // No-op detection on canonical forms: both sides pass through
@@ -156,4 +172,26 @@ impl AgentDeps for ServerAgentDeps {
 fn canonicalize(xml: &str) -> Option<String> {
     let file = drawio_agent_xml_core::MxFile::parse(xml.as_bytes()).ok()?;
     file.to_xml().ok()
+}
+
+/// Collect every visible cell (all except synthetic root "0" and default
+/// layer "1") from a parsed fix-diff response document, in tree order.
+/// These become the diff's `incoming` set.
+fn collect_visible_cells(file: &drawio_agent_xml_core::MxFile) -> Vec<drawio_agent_xml_core::Cell> {
+    fn walk(
+        cell: &drawio_agent_xml_core::Cell,
+        out: &mut Vec<drawio_agent_xml_core::Cell>,
+    ) {
+        if cell.id != "0" && cell.id != "1" {
+            out.push(cell.clone());
+        }
+        for child in &cell.children {
+            walk(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(model) = file.diagrams.first().and_then(|d| d.model.as_ref()) {
+        walk(&model.root, &mut out);
+    }
+    out
 }

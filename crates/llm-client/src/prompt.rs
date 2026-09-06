@@ -216,21 +216,27 @@ Draw.io conventions:
 - Cell id="0" is the synthetic root (not rendered); visible cells declare a parent.
 - Preserve existing cell ids EXACTLY. Never invent ids for existing cells.
 - When a Scope section is present, ONLY cells inside the scope may be
-  modified; return a document containing just those cells (the server merges
-  them back). Never touch cells outside the scope.
+  modified (the server merges them back). Never touch cells outside the scope.
 - New cells (e.g. an added arrow) get fresh unique ids and a parent.
 
+DIFF OUTPUT RULE (critical for cost and safety):
+- Put ONLY the cells you changed or added into the "xml" field. Cells you
+  leave out are left byte-for-byte untouched by the server — never echo the
+  whole diagram back.
+- To DELETE a cell, do NOT include it in xml; list its id in "removed".
+  Descendants and edges referencing a removed cell are cleaned up
+  automatically, but you may list edges explicitly too.
+- A document containing just one changed cell is a perfectly valid answer.
+
 Respond with ONLY this JSON object (no commentary, no markdown fences):
-{"done": true|false, "xml": "<mxfile>...</mxfile>",
+{"done": true|false, "xml": "<mxfile>...</mxfile>", "removed": ["cell_id", ...],
  "issues": [{"kind": "...", "severity": "high|medium|low",
              "cell_ids": [...], "description": "..."}],
  "reasoning": "short summary of what you changed and why"}
 
-- Set done=true when you have fixed everything fixable (or nothing needs
-  fixing). The XML field must ALWAYS contain the current full document state.
-- Set done=false and list items in issues when you made changes that need
-  visual re-verification, or when something remains unresolved: the loop will
-  re-render and show you the new image next round.
+- Set done=true when you have completed all the changes you intend to make
+  in this response. done=false is ONLY for when something remains that you
+  genuinely cannot resolve without seeing the next render.
 - issues kinds: overlap | text_overflow | edge_crossing | arrow_wrong | layout_bad.
   Be conservative: only flag real, visible problems."#
 }
