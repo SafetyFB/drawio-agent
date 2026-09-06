@@ -45,10 +45,12 @@
   let activityEntries = [];
   let currentSelection = [];
   let currentGraph = null;
-  // Track pan/select modes in JS: the old mxGraph bundle has setPanning but
-  // no isPanning(), so we can't read the current state back from the graph.
-  let panEnabled = true;
-  let selectEnabled = true;
+  // Canvas interaction mode: 'pan' (default) or 'select' (rubber-band marquee).
+  let canvasMode = 'pan';
+  // In-progress rubber band, in raw client (viewport) coordinates.
+  let rubberBand = null;
+  // The visible <div> rectangle overlay.
+  let rubberBandEl = null;
 
   async function api(method, path, body) {
     const opts = { method, headers: {} };
@@ -180,6 +182,140 @@
       .replace(/(&gt;)([^&]+)(&lt;)/g, '$1<span class="text">$2</span>$3');
   }
 
+  // ---------------------------------------------------------------------------
+  // Marquee (rubber-band) box selection. The vendored 2018-era mxGraph has no
+  // setRubberBandSelection API, so we draw the rectangle ourselves and hit-test
+  // cell bounds against it on mouseup.
+  // ---------------------------------------------------------------------------
+
+  function setCanvasMode(mode) {
+    canvasMode = mode;
+    drawioContainer.dataset.mode = mode;
+    drawioContainer.style.cursor = mode === 'select' ? 'crosshair' : '';
+    canvasToolPan.classList.toggle('active', mode === 'pan');
+    canvasToolSelect.classList.toggle('active', mode === 'select');
+    canvasToolPan.setAttribute('aria-pressed', String(mode === 'pan'));
+    canvasToolSelect.setAttribute('aria-pressed', String(mode === 'select'));
+    // Select mode turns panning off so a drag draws a box instead of panning;
+    // returning to pan mode re-enables it.
+    if (currentGraph) currentGraph.setPanning(mode === 'pan');
+    cancelRubberBand();
+  }
+
+  /// Start a rubber band at a client point. Returns false if the pointer is on
+  /// a cell (single-select handles it) or a band is already active.
+  function startRubberBand(clientX, clientY, cell) {
+    if (cell) return false;
+    if (!currentGraph) return false;
+    rubberBand = { startX: clientX, startY: clientY, currentX: clientX, currentY: clientY };
+    const p = mxUtils.convertPoint(currentGraph.container, clientX, clientY);
+    rubberBandEl = document.createElement('div');
+    rubberBandEl.className = 'rubber-band';
+    rubberBandEl.style.left = p.x + 'px';
+    rubberBandEl.style.top = p.y + 'px';
+    rubberBandEl.style.width = '0px';
+    rubberBandEl.style.height = '0px';
+    drawioContainer.appendChild(rubberBandEl);
+    currentGraph.setPanning(false); // don't pan while the box is being drawn
+    return true;
+  }
+
+  function updateRubberBand(clientX, clientY) {
+    if (!rubberBand || !rubberBandEl || !currentGraph) return;
+    rubberBand.currentX = clientX;
+    rubberBand.currentY = clientY;
+    const p1 = mxUtils.convertPoint(currentGraph.container, rubberBand.startX, rubberBand.startY);
+    const p2 = mxUtils.convertPoint(currentGraph.container, clientX, clientY);
+    rubberBandEl.style.left = Math.min(p1.x, p2.x) + 'px';
+    rubberBandEl.style.top = Math.min(p1.y, p2.y) + 'px';
+    rubberBandEl.style.width = Math.abs(p2.x - p1.x) + 'px';
+    rubberBandEl.style.height = Math.abs(p2.y - p1.y) + 'px';
+  }
+
+  function endRubberBand() {
+    if (!rubberBand || !currentGraph) {
+      cancelRubberBand();
+      return;
+    }
+    const rect = screenRectToGraphRect(
+      Math.min(rubberBand.startX, rubberBand.currentX),
+      Math.min(rubberBand.startY, rubberBand.currentY),
+      Math.abs(rubberBand.currentX - rubberBand.startX),
+      Math.abs(rubberBand.currentY - rubberBand.startY)
+    );
+    const cells = hitTestCells(currentGraph, rect);
+    try {
+      currentGraph.setSelectionCells(cells);
+    } catch (err) {
+      // Safety net: if the bundle still throws somewhere, the selection model
+      // was already updated — the panel update below covers it.
+      console.warn('setSelectionCells threw (selection applied anyway):', err);
+    }
+    // The SELECTION_CHANGED listener normally updates the panel; this is a
+    // belt-and-suspenders call so "N selected" is always correct.
+    updateSelectionState(cells.filter(c => c.id && c.id !== '0' && c.id !== '1').map(c => c.id));
+    cancelRubberBand();
+  }
+
+  function cancelRubberBand() {
+    if (rubberBandEl) { rubberBandEl.remove(); rubberBandEl = null; }
+    rubberBand = null;
+    // Restore panning only when back in pan mode (select mode keeps it off).
+    if (currentGraph && canvasMode === 'pan') currentGraph.setPanning(true);
+  }
+
+  /// Convert a client-coordinate rectangle into graph/view coordinates.
+  function screenRectToGraphRect(x, y, w, h) {
+    const p1 = mxUtils.convertPoint(currentGraph.container, x, y);
+    const p2 = mxUtils.convertPoint(currentGraph.container, x + w, y + h);
+    return { x: p1.x, y: p1.y, width: p2.x - p1.x, height: p2.y - p1.y };
+  }
+
+  /// Return all cells whose rendered bounds intersect the given graph rect.
+  function hitTestCells(graph, rect) {
+    const model = graph.getModel();
+    const root = model.getRoot();
+    const result = [];
+    // Cells live under the default parent (id="1"), which itself is a root
+    // child — walk the whole tree. `graph.getCellBounds` returns null in the
+    // vendored bundle, so use the view state's x/y/width/height (view space).
+    const walk = (cell) => {
+      if (!cell) return;
+      if (cell.id !== '0' && cell.id !== '1') {
+        const st = graph.getView().getState(cell);
+        if (st && st.width > 0 && st.height > 0) {
+          if (!(
+            st.x + st.width < rect.x ||
+            rect.x + rect.width < st.x ||
+            st.y + st.height < rect.y ||
+            rect.y + rect.height < st.y
+          )) {
+            result.push(cell);
+          }
+        }
+      }
+      for (let i = 0; i < model.getChildCount(cell); i++) {
+        walk(model.getChildAt(cell, i));
+      }
+    };
+    for (let i = 0; i < model.getChildCount(root); i++) {
+      walk(model.getChildAt(root, i));
+    }
+    return result;
+  }
+
+  /// The vendored bundle is a draw.io fork whose selection/handle handlers call
+  /// Graph.prototype methods the base mxGraph lacks (isTableCell, isTableRow,
+  /// isTable, getLinksForState). Without them setSelectionCells throws mid-
+  /// update and SELECTION_CHANGED never fires, so the selection panel stays
+  /// stale. Stub them with correct defaults for non-table diagrams.
+  function patchGraphForBundle(graph) {
+    if (typeof graph.isTableCell !== 'function') graph.isTableCell = () => false;
+    if (typeof graph.isTableRow !== 'function') graph.isTableRow = () => false;
+    if (typeof graph.isTable !== 'function') graph.isTable = () => false;
+    if (typeof graph.getLinksForState !== 'function') graph.getLinksForState = () => [];
+  }
+
   function loadXmlIntoCanvas(xml) {
     currentXml = xml;
     drawioContainer.innerHTML = '';
@@ -213,6 +349,7 @@
 
       const graph = new window.mxGraph(drawioContainer, model);
       currentGraph = graph;
+      patchGraphForBundle(graph);
       graph.setEnabled(true);
       graph.setPanning(true);
       graph.setCellsEditable(false);   // pan/zoom/gestures on; cells stay read-only
@@ -245,13 +382,8 @@
         }, { passive: false });
       }
 
-      // Keep the Pan/Select toolbar in sync with the fresh graph.
-      panEnabled = true;
-      selectEnabled = true;
-      canvasToolPan.classList.add('active');
-      canvasToolSelect.classList.add('active');
-      canvasToolPan.setAttribute('aria-pressed', 'true');
-      canvasToolSelect.setAttribute('aria-pressed', 'true');
+      // Keep the toolbar in sync with a fresh graph and reset to pan mode.
+      setCanvasMode('pan');
 
       graph.getSelectionModel().addListener(window.mxEvent.SELECTION_CHANGED, () => {
         const selected = graph.getSelectionCells();
@@ -629,19 +761,26 @@
       }
     });
 
-    canvasToolPan.addEventListener('click', () => {
-      if (!currentGraph) return;
-      panEnabled = !panEnabled;
-      currentGraph.setPanning(panEnabled);
-      canvasToolPan.classList.toggle('active', panEnabled);
-      canvasToolPan.setAttribute('aria-pressed', String(panEnabled));
-    });
-    canvasToolSelect.addEventListener('click', () => {
-      if (!currentGraph) return;
-      selectEnabled = !selectEnabled;
-      currentGraph.setCellsSelectable(selectEnabled);
-      canvasToolSelect.classList.toggle('active', selectEnabled);
-      canvasToolSelect.setAttribute('aria-pressed', String(selectEnabled));
+    canvasToolPan.addEventListener('click', () => setCanvasMode('pan'));
+    canvasToolSelect.addEventListener('click', () => setCanvasMode('select'));
+
+    // Marquee drag: only in select mode, left button, on empty canvas. The
+    // container element survives graph rebuilds, so one listener is enough.
+    drawioContainer.addEventListener('pointerdown', (e) => {
+      if (canvasMode !== 'select' || e.button !== 0 || !currentGraph) return;
+      const p = mxUtils.convertPoint(currentGraph.container, e.clientX, e.clientY);
+      const cell = currentGraph.getCellAt(p.x, p.y);
+      if (startRubberBand(e.clientX, e.clientY, cell)) {
+        e.preventDefault();
+        const onMove = (ev) => updateRubberBand(ev.clientX, ev.clientY);
+        const onUp = () => {
+          window.removeEventListener('pointermove', onMove);
+          window.removeEventListener('pointerup', onUp);
+          endRubberBand();
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
+      }
     });
 
     window.addEventListener('hashchange', async () => {
