@@ -331,8 +331,9 @@ fn final_outcome(
     AgentOutcome {
         final_xml: state.current_xml.clone().unwrap_or_default(),
         iterations: state.iteration,
-        final_phase,
-        last_verdict: state.last_verdict,
+        converged: matches!(final_phase, LoopPhase::Done),
+        final_phase: final_phase.clone(),
+        last_verdict: state.last_verdict.clone(),
         last_issue_count: state.last_issue_count,
         trajectory,
     }

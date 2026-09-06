@@ -90,9 +90,18 @@ pub enum LoopError {
 pub struct AgentOutcome {
     /// The XML at termination (either the converged diagram or the best
     /// attempt after `max_iterations`).
+    ///
+    /// Serialized as `xml` so the wire shape stays short and friendly to
+    /// the JS client (`result.xml`); Rust callers use the field directly
+    /// via `final_xml`.
+    #[serde(rename = "xml")]
     pub final_xml: String,
     /// How many full Generate-Render-Review iterations ran.
     pub iterations: u32,
+    /// `true` when the final phase is `Done` (verdict was "pass").
+    /// Serialized as a field (not just a method) so the JS client can
+    /// branch on it without re-deriving from `final_phase`.
+    pub converged: bool,
     /// Final phase at termination (Done or Failed).
     pub final_phase: LoopPhase,
     /// Verdict of the most recent review (None if review never ran).
@@ -105,6 +114,8 @@ pub struct AgentOutcome {
 
 impl AgentOutcome {
     /// `true` when the final phase is `Done` (verdict was "pass").
+    /// Kept for backward compat; new code should use the `converged`
+    /// field directly (it's serialized, unlike this method).
     pub fn converged(&self) -> bool {
         matches!(self.final_phase, LoopPhase::Done)
     }

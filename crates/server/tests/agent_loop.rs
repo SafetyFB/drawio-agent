@@ -433,14 +433,23 @@ async fn agent_loop_empty_session_auto_generates_baseline() {
         .await
         .unwrap();
     let outcome: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    // The runner returned an AgentOutcome with a non-empty final_xml
-    // (StubLlm's MOCK_DIAGRAM, since the codegen step ran on the empty session).
-    let final_xml = outcome["final_xml"]
+    // The runner returned an AgentOutcome serialized as { xml, converged, ... }
+    // (`final_xml` is renamed to `xml` on the wire; the Rust field is still
+    // `final_xml`). StubLlm's review returns "pass" after the first call, so
+    // the loop should converge on the first iteration.
+    let xml = outcome["xml"]
         .as_str()
-        .expect("final_xml must be a string");
+        .expect("xml field must be a string");
     assert!(
-        !final_xml.is_empty() && final_xml.contains("<mxfile"),
-        "loop should have produced a diagram from scratch, got: {final_xml:?}"
+        !xml.is_empty() && xml.contains("<mxfile"),
+        "loop should have produced a diagram from scratch, got: {xml:?}"
+    );
+    let converged = outcome["converged"]
+        .as_bool()
+        .expect("converged field must be present and a bool");
+    assert!(
+        converged,
+        "loop should have converged (review returned 'pass' on first call), got outcome: {outcome}"
     );
 
     // The session should now have a stored current_xml.
