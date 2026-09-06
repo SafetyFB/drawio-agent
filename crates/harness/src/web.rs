@@ -182,25 +182,14 @@ async fn js() -> impl IntoResponse {
     static_text(include_str!("../web/app.js"), "text/javascript")
 }
 
-/// The 3.4MB draw.io viewer bundle lives in the renderer crate's assets
-/// (single copy, runtime-read — same approach renderer itself uses).
+/// The draw.io viewer bundle is embedded into the binary at build time —
+/// no runtime path lookup, no env var, works regardless of where the
+/// binary runs from. (renderer keeps its own copy for headless rendering.)
 async fn viewer_bundle() -> Response {
-    let mut path: Option<PathBuf> = std::env::var("DRAWIO_VIEWER_PATH").ok().map(PathBuf::from);
-    if path.is_none() {
-        let guess = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../renderer/assets/viewer-static.min.js");
-        if guess.exists() {
-            path = Some(guess);
-        }
-    }
-    match path.and_then(|p| std::fs::read(p).ok()) {
-        Some(bytes) => static_bytes(bytes, "text/javascript"),
-        None => (
-            StatusCode::NOT_FOUND,
-            "viewer-static.min.js 未找到（设 DRAWIO_VIEWER_PATH）",
-        )
-            .into_response(),
-    }
+    static_bytes(
+        include_bytes!("../../renderer/assets/viewer-static.min.js").to_vec(),
+        "text/javascript",
+    )
 }
 
 fn static_text(s: &'static str, ct: &'static str) -> Response {
