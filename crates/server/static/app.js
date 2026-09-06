@@ -212,7 +212,9 @@
       graph.setCellsEditable(false);   // pan/zoom/gestures on; cells stay read-only
       graph.setCellsMovable(false);
       graph.setCellsResizable(false);
-      graph.setCellsConnectable(false);
+      // The vendored mxGraph bundle predates Graph.prototype.setCellsConnectable;
+      // guard it so the canvas doesn't fall back to XML on an older bundle.
+      if (typeof graph.setCellsConnectable === 'function') graph.setCellsConnectable(false);
       graph.centerZoom = true;
       graph.refresh();
 
