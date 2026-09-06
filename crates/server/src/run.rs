@@ -242,8 +242,10 @@ pub async fn shutdown_signal() {
 // or when we need a real HTTP transport for OpenAiCompatProvider).
 // ---------------------------------------------------------------------------
 
-/// No-op LLM stub for mock mode. For a fresh generate it returns a small
-/// fixed diagram so mock sessions have real cells; when patching (the request
+/// No-op LLM stub for mock mode. For a fresh generate it returns a richer
+/// fixed diagram (2 ellipses, 2 rectangles, 1 rhombus/decision, 1 cylinder,
+/// 6 edges with "Yes"/"No" labels and a dashed error path) so mock sessions
+/// exercise the full shape vocabulary in the UI. When patching (the request
 /// carries `current_xml`) it echoes that XML back so the patch handler gets a
 /// valid diagram to parse. (Previously it always returned `<mxfile/>`, which
 /// has no `<diagram>` — every patch failed with "no diagram in LLM response"
@@ -251,7 +253,52 @@ pub async fn shutdown_signal() {
 #[derive(Debug)]
 pub struct StubLlm;
 
-const MOCK_DIAGRAM: &str = r#"<mxfile host="app.diagrams.net"><diagram id="mock" name="Page-1"><mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="2" value="Box A" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1"><mxGeometry x="100" y="100" width="120" height="60" as="geometry"/></mxCell><mxCell id="3" value="Box B" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1"><mxGeometry x="300" y="100" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+const MOCK_DIAGRAM: &str = r#"<mxfile host="app.diagrams.net">
+  <diagram id="mock" name="Page-1">
+    <mxGraphModel dx="800" dy="600" grid="1" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="2" value="Start" style="ellipse;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="200" y="80" width="80" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="3" value="Process Input" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="160" y="180" width="160" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="4" value="Valid?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="180" y="300" width="120" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="5" value="Save to DB" style="shape=cylinder3;whiteSpace=wrap;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="320" y="320" width="80" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="6" value="Show Error" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="40" y="320" width="100" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="7" value="End" style="ellipse;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="200" y="440" width="80" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="8" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="2" target="3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="9" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="3" target="4">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="10" value="Yes" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="4" target="5">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="11" value="No" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="4" target="6">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="12" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="5" target="7">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="13" style="endArrow=classic;html=1;rounded=0;dashed=1;" edge="1" parent="1" source="6" target="7">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>"#;
 
 #[async_trait::async_trait]
 impl LlmProvider for StubLlm {

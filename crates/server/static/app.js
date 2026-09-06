@@ -667,7 +667,14 @@
     setRunLoading(true, 'agent loop running…');
     setLoading(true, 'agent loop running…');
     try {
-      const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}/agent-loop`, { prompt });
+      // Pass the canvas's current diagram as initial_xml so the loop skips
+      // the Generate phase and improves exactly what the user sees. When the
+      // canvas is empty `undefined` is sent and the server 400s with a clear
+      // "run /generate first" message.
+      const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}/agent-loop`, {
+        prompt,
+        initial_xml: currentXml || undefined,  // server treats undefined as "no initial XML"
+      });
       loadXmlIntoCanvas(result.xml || '');
       await loadSessionList();
       if (result.converged) {

@@ -742,3 +742,158 @@ async fn agent_loop_streams_trajectory_events_during_loop() {
 
 #[allow(dead_code)]
 fn _suppress_unused(_o: &Event, _l: &AgentLoop) {}
+
+// ---------------------------------------------------------------------------
+// Counting LLM for the Q3 regression: the loop must NOT re-run Generate
+// when the caller supplies an initial_xml (the canvas's current diagram).
+// ---------------------------------------------------------------------------
+
+/// Counts every `generate_xml` call so the test can assert the loop never
+/// re-generates when handed a starting XML. Reviews always pass (no patch →
+/// no extra generate call from the inner patch step).
+#[derive(Clone)]
+struct CountingLlm {
+    generate_calls: Arc<std::sync::Mutex<u32>>,
+}
+
+impl CountingLlm {
+    fn new() -> Self {
+        Self {
+            generate_calls: Arc::new(std::sync::Mutex::new(0)),
+        }
+    }
+    fn generate_count(&self) -> u32 {
+        *self.generate_calls.lock().unwrap()
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for CountingLlm {
+    fn name(&self) -> &str {
+        "counting"
+    }
+    async fn generate_xml(
+        &self,
+        _req: GenerateRequest,
+    ) -> Result<LlmResponse<String>, ProviderError> {
+        *self.generate_calls.lock().unwrap() += 1;
+        Ok(LlmResponse {
+            content: FULL_XML.to_string(),
+            usage: Usage::default(),
+            raw: Value::Null,
+            duration_ms: 0,
+            finish_reason: None,
+        })
+    }
+    async fn generate_streaming(
+        &self,
+        _req: GenerateRequest,
+    ) -> Result<LlmStream, ProviderError> {
+        unimplemented!()
+    }
+    async fn review_visual(
+        &self,
+        _req: ReviewRequest,
+    ) -> Result<LlmResponse<ReviewResponse>, ProviderError> {
+        Ok(LlmResponse {
+            content: ReviewResponse {
+                verdict: "pass".into(),
+                issues: vec![],
+            },
+            usage: Usage::default(),
+            raw: Value::Null,
+            duration_ms: 0,
+            finish_reason: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn agent_loop_with_initial_xml_does_not_call_generate() {
+    let llm = Arc::new(CountingLlm::new());
+    let state = state_with(llm.clone(), Arc::new(MockDriver::new()));
+    let app = router(state);
+
+    // Fresh session (no XML yet) — the UX flow: user clicks Generate.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&CreateSessionRequest::default()).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), 4096)
+        .await
+        .unwrap();
+    let parsed: drawio_agent_server::CreateSessionResponse = serde_json::from_slice(&body).unwrap();
+    let sid = parsed.session_id.as_str().to_string();
+
+    // 1. The initial generate — this is the ONE allowed generate_xml call.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid}/generate"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"prompt": "draw something"}))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 65536)
+        .await
+        .unwrap();
+    let gen: drawio_agent_server::GenerateResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        llm.generate_count(),
+        1,
+        "generate endpoint must call the LLM exactly once"
+    );
+
+    // 2. Run Loop with the generated diagram as initial_xml (what the canvas
+    // holds) — must NOT re-run the Generate phase.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid}/agent-loop"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "prompt": "improve",
+                        "initial_xml": gen.xml,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 65536)
+        .await
+        .unwrap();
+    let outcome: AgentOutcome = serde_json::from_slice(&body).unwrap();
+    assert!(outcome.converged(), "got {:?}", outcome.final_phase);
+
+    assert_eq!(
+        llm.generate_count(),
+        1,
+        "agent-loop with initial_xml must NOT call generate_xml again \
+         (only the initial /generate did)"
+    );
+}

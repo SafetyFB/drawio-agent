@@ -646,15 +646,22 @@ async fn run_agent_loop(
         }
     }
 
-    // 400 if there's no XML to start from. The message is structured so the
-    // client can surface it verbatim: the user knows to run /generate first
-    // without reading server logs.
-    let initial_xml = state
+    // 400 if there's no XML to start from. A caller-supplied initial_xml
+    // (the canvas's current diagram from the frontend) takes precedence so
+    // the loop improves exactly what the user sees instead of re-generating
+    // from scratch; otherwise fall back to the session's stored current XML.
+    // The message is structured so the client can surface it verbatim: the
+    // user knows to run /generate first without reading server logs.
+    let session_xml = state
         .sessions
         .read()
         .await
         .current_xml(&session_id)
-        .await
+        .await;
+    let initial_xml = req
+        .initial_xml
+        .clone()
+        .or(session_xml)
         .ok_or_else(|| {
             ServerError::BadRequest(format!(
                 "session {session_id} has no current XML — run /generate first"

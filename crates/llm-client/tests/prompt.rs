@@ -16,6 +16,30 @@ fn codegen_system_prompt_mentions_xml() {
 }
 
 #[test]
+fn codegen_system_prompt_documents_shape_vocabulary_and_edge_styles() {
+    let p = codegen_system_prompt();
+    let lower = p.to_lowercase();
+    // Locks the shape vocabulary so the LLM knows it can produce more than
+    // plain rectangles.
+    for shape in ["ellipse", "rhombus", "cylinder", "hexagon", "swimlane"] {
+        assert!(
+            lower.contains(shape),
+            "codegen prompt must document the '{shape}' shape: {p}"
+        );
+    }
+    // And at least one edge style hint (arrows / orthogonal routing).
+    assert!(
+        lower.contains("endarrow=classic") || lower.contains("edgestyle=orthogonal"),
+        "codegen prompt must document an edge style: {p}"
+    );
+    // Token budget: the prompt is sent on every generate call.
+    assert!(
+        p.split_whitespace().count() < 1000,
+        "codegen system prompt should stay under ~1000 tokens"
+    );
+}
+
+#[test]
 fn codegen_user_prompt_includes_user_text() {
     let out = codegen_user_prompt("Draw a circle", None, None, None);
     assert!(out.contains("Draw a circle"));

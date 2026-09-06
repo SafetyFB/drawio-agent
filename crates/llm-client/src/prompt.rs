@@ -12,9 +12,44 @@ Draw.io conventions (must follow):
 - Use elastic containers (swimlane or container) so cells auto-wrap when adjacent.
 - Prefer orthogonalEdgeStyle for hierarchical diagrams — avoid free-form angles.
 
-Example fragment:
-<mxCell id="2" value="Hello" style="rounded=0;whiteSpace=wrap;" vertex="1" parent="1">
-  <mxGeometry x="100" y="100" width="120" height="60" as="geometry"/>
+Available shapes (use the `style` attribute):
+- Rectangle: `rounded=0;whiteSpace=wrap;html=1;` (default for process steps)
+- Rounded rectangle: `rounded=1;whiteSpace=wrap;html=1;` (for service / role nodes)
+- Ellipse: `shape=ellipse;whiteSpace=wrap;html=1;` (for start/end nodes)
+- Diamond / decision (rhombus): `shape=mxgraph.flowchart.decision;whiteSpace=wrap;html=1;` (for if/then branches)
+- Cylinder: `shape=cylinder3;whiteSpace=wrap;boundedLbl=1;backgroundOutline=1;size=15;` (for databases / data stores)
+- Hexagon: `shape=hexagon;perimeter=hexagonPerimeter2;whiteSpace=wrap;html=1;` (for preparation / initial states)
+- Parallelogram: `shape=parallelogram;perimeter=parallelogramPerimeter;whiteSpace=wrap;html=1;` (for input/output)
+- Document: `shape=note;whiteSpace=wrap;html=1;backgroundOutline=1;darkOpacity=0.05;` (for documents / records)
+- Cloud: `ellipse;shape=cloud;whiteSpace=wrap;html=1;` (for external services)
+- Swimlane (group): `swimlane;html=1;startSize=24;` (for grouping related steps)
+
+Edges (mxCell edge="1"):
+- Default: `endArrow=classic;html=1;rounded=0;`
+- Decision branch (yes/no): add `endArrow=classic;startArrow=classic;` for the "yes" branch and `endArrow=none;` for the implicit "no" continuation
+- Hierarchical: `endArrow=classic;html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;`
+
+Example — a 4-node flowchart with a decision:
+<mxCell id="2" value="Start" style="rounded=1;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+  <mxGeometry x="200" y="80" width="120" height="60" as="geometry"/>
+</mxCell>
+<mxCell id="3" value="Process A" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+  <mxGeometry x="180" y="180" width="120" height="60" as="geometry"/>
+</mxCell>
+<mxCell id="4" value="Decision" style="shape=mxgraph.flowchart.decision;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+  <mxGeometry x="200" y="280" width="100" height="80" as="geometry"/>
+</mxCell>
+<mxCell id="5" value="Process B" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+  <mxGeometry x="360" y="290" width="120" height="60" as="geometry"/>
+</mxCell>
+<mxCell id="6" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="2" target="3">
+  <mxGeometry relative="1" as="geometry"/>
+</mxCell>
+<mxCell id="7" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="3" target="4">
+  <mxGeometry relative="1" as="geometry"/>
+</mxCell>
+<mxCell id="8" value="Yes" style="endArrow=classic;startArrow=classic;html=1;" edge="1" parent="1" source="4" target="5">
+  <mxGeometry relative="1" as="geometry"/>
 </mxCell>
 
 Output ONLY the XML — no commentary, no markdown fences, no preamble."#

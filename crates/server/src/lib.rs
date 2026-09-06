@@ -175,6 +175,12 @@ pub struct ReviewRequest {
 pub struct AgentLoopRequest {
     /// Prompt for the Agent Loop (used for patch instructions).
     pub prompt: String,
+    /// Starting diagram. When `Some`, the loop skips the Generate phase and
+    /// goes straight to Render → Review → Patch on this XML (the frontend
+    /// sends the canvas's current diagram). When `None`, the server falls
+    /// back to the session's stored current XML.
+    #[serde(default)]
+    pub initial_xml: Option<String>,
     /// Maximum render-review-patch iterations. Defaults to 5.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
