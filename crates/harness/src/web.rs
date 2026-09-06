@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+
 
 use axum::body::Body;
 use tokio::sync::mpsc;
@@ -33,18 +33,18 @@ use crate::refs;
 use crate::tools::Tools;
 use crate::xmlfile::{check_doc, XmlDoc};
 
-/// Separate, small lock for the running job's abort handle so /cancel stays
-/// responsive even while the big state lock is held by a running engine.
+/// 取消槽：一个小锁，只存当前任务的取消标志（Arc<AtomicBool>）。
+/// /cancel 只是置位；运行中的引擎 select 监视到标志后自然走完收尾。
 #[derive(Debug, Default)]
-pub struct JobControl {
-    pub current: Mutex<Option<(u64, tokio::task::AbortHandle)>>,
+pub struct CancelSlot {
+    pub flag: std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 /// Router state bundle (axum resolves per-handler State via FromRef).
 #[derive(Clone)]
 struct AppState {
     big: Arc<Mutex<WebState>>,
-    jobs: Arc<JobControl>,
+    cancel: Arc<CancelSlot>,
 }
 
 impl FromRef<AppState> for Arc<Mutex<WebState>> {
@@ -52,9 +52,9 @@ impl FromRef<AppState> for Arc<Mutex<WebState>> {
         s.big.clone()
     }
 }
-impl FromRef<AppState> for Arc<JobControl> {
+impl FromRef<AppState> for Arc<CancelSlot> {
     fn from_ref(s: &AppState) -> Self {
-        s.jobs.clone()
+        s.cancel.clone()
     }
 }
 
@@ -65,6 +65,18 @@ pub struct SessionState {
     pub stats: crate::engine::SessionStats,
 }
 
+/// 运行中任务的公开快照：锁只短暂持有，运行期间 /api/state 用这份数据
+/// 即时响应（不再排队等大锁）。
+#[derive(Debug, Clone, Default)]
+pub struct RunningSnapshot {
+    pub name: String,
+    pub cells: usize,
+    pub lines: usize,
+    pub usage_in: u64,
+    pub usage_out: u64,
+    pub cost_yuan: f64,
+}
+
 #[derive(Debug)]
 pub struct WebState {
     /// Directory holding one .drawio per session.
@@ -72,20 +84,24 @@ pub struct WebState {
     /// File name of the session currently open in the UI.
     pub current: Option<String>,
     /// Loaded sessions keyed by file name (doc + memory/usage stats).
+    /// 运行中时该会话被任务"拿走"，不在 map 里——槽位为空 = 忙，
+    /// 这是并发控制的唯一信号（没有独立标志，也就没有清理竞态）。
     pub sessions: std::collections::HashMap<String, SessionState>,
     pub chat: Option<OpenAiChat>,
     pub tools: Tools,
     /// ¥ session budget from the config at the last ask (per-session cap).
     pub budget_yuan: Option<f64>,
-    /// One engine job at a time (single user; extra asks fail fast).
-    pub running_job: bool,
+    /// 正在运行的任务占用的会话名；任务结束（成功/失败/取消/断开）后
+    /// 在收尾里无条件归还并清空。
+    pub running: Option<String>,
+    /// 运行期间的快照（/api/state 即时应答用）。
+    pub snapshot: RunningSnapshot,
 }
 
 impl WebState {
     fn llm_ready(&self) -> bool {
         self.chat.is_some()
     }
-
 }
 
 pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
@@ -113,11 +129,12 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
         chat,
         tools: Tools::new(true),
         budget_yuan: None,
-        running_job: false,
+        running: None,
+        snapshot: RunningSnapshot::default(),
     }));
 
-    let jobs = Arc::new(JobControl::default());
-    let app_state = AppState { big: state, jobs };
+    let cancel = Arc::new(CancelSlot::default());
+    let app_state = AppState { big: state, cancel };
     let app = Router::new()
         .route("/", get(page))
         .route("/app.css", get(css))
@@ -128,7 +145,6 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
         .route("/api/sessions/switch", post(api_sessions_switch))
         .route("/api/sessions/:name", axum::routing::delete(api_sessions_delete))
         .route("/api/file", get(api_file))
-        .route("/api/chat", post(api_chat))
         .route("/api/check", post(api_check))
         .route("/api/undo", post(api_undo))
         .route("/api/reload", post(api_reload))
@@ -206,6 +222,26 @@ fn current_err() -> Json<serde_json::Value> {
 
 async fn api_state(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::Value> {
     let st = st.lock().await;
+    // 运行中：用快照即时响应（任务持有 doc，不在 sessions 里）
+    if let Some(run) = st.running.clone() {
+        let snap = st.snapshot.clone();
+        return Json(json!({
+            "file": st.dir.join(&run).display().to_string(),
+            "current": run,
+            "busy": true,
+            "lines": snap.lines,
+            "cells": snap.cells,
+            "llm_ready": st.llm_ready(),
+            "render": st.tools.render,
+            "config_source": config_source_label(),
+            "session": json!({
+                "in": snap.usage_in,
+                "out": snap.usage_out,
+                "cost_yuan": snap.cost_yuan,
+                "budget_yuan": st.budget_yuan,
+            }),
+        }));
+    }
     let Some(cur) = st.current.as_ref() else {
         return Json(json!({ "file": null, "lines": 0, "cells": 0, "llm_ready": st.llm_ready(),
             "render": st.tools.render, "config_source": config_source_label(), "current": null,
@@ -215,6 +251,7 @@ async fn api_state(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::V
     Json(json!({
         "file": ss.doc.path.display().to_string(),
         "current": cur,
+        "busy": false,
         "lines": ss.doc.canonical().lines().count(),
         "cells": ss.doc.cells.len(),
         "llm_ready": st.llm_ready(),
@@ -230,19 +267,24 @@ async fn api_state(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::V
 }
 
 async fn api_file(State(st): State<Arc<Mutex<WebState>>>) -> Response {
-    let st = st.lock().await;
-    let Some(cur) = st.current.as_ref() else {
-        return (StatusCode::NOT_FOUND, "no session").into_response();
+    // 直接读磁盘：每次 edit 都即时落盘，运行中画布也能拿到最新内容，
+    // 完全不需要等锁。
+    let path = {
+        let st = st.lock().await;
+        match &st.current {
+            Some(cur) => st.dir.join(cur),
+            None => return (StatusCode::NOT_FOUND, "no session").into_response(),
+        }
     };
-    let Some(ss) = st.sessions.get(cur) else {
-        return (StatusCode::NOT_FOUND, "no session").into_response();
-    };
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/xml")],
-        ss.doc.canonical().to_string(),
-    )
-        .into_response()
+    match std::fs::read_to_string(&path) {
+        Ok(xml) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/xml")],
+            xml,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "no session file").into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -273,72 +315,14 @@ fn selection_ctx(cell_ids: &[String], doc: &XmlDoc) -> String {
     }
 }
 
-async fn api_chat(
-    State(st): State<Arc<Mutex<WebState>>>,
-    Json(req): Json<ChatReq>,
-) -> Json<serde_json::Value> {
-    let mut st = st.lock().await;
-    if st.running_job {
-        return Json(json!({ "reply": null, "error": "另一个任务正在运行中——先点「停止」或等它完成" }));
-    }
-    if st.chat.is_none() {
-        return Json(json!({
-            "reply": null,
-            "error": "LLM 未配置：点右上角 ⚙ 填写并保存"
-        }));
-    }
-    let Some(cur) = st.current.clone() else { return current_err() };
-    let ctx = selection_ctx(&req.cell_ids, &st.sessions.get(&cur).map(|s| &s.doc).unwrap());
-    let cfg = config::effective_settings().unwrap_or_default();
-    let budget_yuan = cfg.budget_yuan;
-    let opts = {
-        let mut o = crate::engine::RunOpts::from_settings(&cfg);
-        if let Some(b) = budget_yuan {
-            o.budget_remaining = (b - st.sessions[&cur].stats.cost_yuan).max(0.0);
-        }
-        o
-    };
-    let harness = Harness::default();
-    let WebState { sessions, chat, tools, .. } = &mut *st;
-    let ss = sessions.get_mut(&cur).expect("session exists");
-    let SessionState { doc, stats } = ss;
-    let chat = chat.as_mut().expect("checked above");
-    let outcome = harness
-        .run(chat, tools, doc, &req.text, &ctx, &opts, stats, &None)
-        .await;
-    let _ = history::save_session_state(&doc.path, stats);
-    match outcome {
-        Ok(outcome) => Json(json!({
-            "reply": outcome.reply,
-            "tool_calls": outcome.tool_calls,
-            "cells": doc.cells.len(),
-            "selected_refs": if ctx.is_empty() { 0 } else { ctx.lines().count() },
-            "usage": json!({ "in": outcome.usage.input_tokens, "out": outcome.usage.output_tokens }),
-            "cost_yuan": outcome.cost_yuan,
-            "session": json!({
-                "in": stats.usage.input_tokens,
-                "out": stats.usage.output_tokens,
-                "cost_yuan": stats.cost_yuan,
-                "budget_yuan": budget_yuan,
-            }),
-            "error": null,
-        })),
-        Err(e) => Json(json!({
-            "reply": null, "tool_calls": 0, "error": e,
-            "session": json!({
-                "in": stats.usage.input_tokens,
-                "out": stats.usage.output_tokens,
-                "cost_yuan": stats.cost_yuan,
-                "budget_yuan": budget_yuan,
-            }),
-        })),
-    }
+fn busy_err() -> Json<serde_json::Value> {
+    Json(json!({ "ok": false, "error": "任务运行中——先点「停止」或等它完成" }))
 }
 
 async fn api_check(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::Value> {
     let st = st.lock().await;
     let Some(cur) = st.current.as_ref() else { return current_err() };
-    let Some(ss) = st.sessions.get(cur) else { return current_err() };
+    let Some(ss) = st.sessions.get(cur) else { return busy_err() };
     match check_doc(ss.doc.canonical()) {
         Ok(r) => Json(json!({
             "ok": r.ok(),
@@ -353,7 +337,7 @@ async fn api_check(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::V
 async fn api_undo(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::Value> {
     let mut st = st.lock().await;
     let Some(cur) = st.current.clone() else { return current_err() };
-    let Some(ss) = st.sessions.get_mut(&cur) else { return current_err() };
+    let Some(ss) = st.sessions.get_mut(&cur) else { return busy_err() };
     match ss.doc.undo() {
         Some(_) => {
             let _ = ss.doc.save();
@@ -366,7 +350,7 @@ async fn api_undo(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::Va
 async fn api_reload(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::Value> {
     let mut st = st.lock().await;
     let Some(cur) = st.current.clone() else { return current_err() };
-    let Some(ss) = st.sessions.get_mut(&cur) else { return current_err() };
+    let Some(ss) = st.sessions.get_mut(&cur) else { return busy_err() };
     let path = ss.doc.path.clone();
     match XmlDoc::load(&path) {
         Ok(d) => {
@@ -531,8 +515,6 @@ async fn api_config_test(Json(req): Json<ConfigPutReq>) -> Json<serde_json::Valu
 // R4: streaming progress (NDJSON over fetch) + cancel
 // ---------------------------------------------------------------------------
 
-static JOB_ID: AtomicU64 = AtomicU64::new(0);
-
 /// One engine event -> one NDJSON line for the frontend.
 fn event_line(ev: &EngineEvent) -> serde_json::Value {
     match ev {
@@ -568,14 +550,15 @@ fn truncate_utf8(s: &str, n: usize) -> String {
 
 async fn api_chat_stream(
     State(st): State<Arc<Mutex<WebState>>>,
-    State(jobs): State<Arc<JobControl>>,
+    State(cancel): State<Arc<CancelSlot>>,
     Json(req): Json<ChatReq>,
 ) -> Response {
-    // One job at a time: fail fast instead of queueing behind the lock
-    // (the UI guards too; this covers second tabs / curl).
-    {
+    let cfg = config::effective_settings().unwrap_or_default();
+    // 短暂持锁：检查忙/配置/会话，把会话"拿走"。槽位为空 = 忙，
+    // 这是唯一的并发信号；归还发生在任务收尾（所有退出路径都走同一条）。
+    let taken = {
         let mut st = st.lock().await;
-        if st.running_job {
+        if st.running.is_some() {
             return Json(json!({
                 "type": "error",
                 "error": "另一个任务正在运行中——先点「停止」或等它完成"
@@ -589,38 +572,48 @@ async fn api_chat_stream(
             }))
             .into_response();
         }
-        if st.current.is_none() {
+        let Some(cur) = st.current.clone() else {
             return Json(json!({
                 "type": "error",
                 "error": "还没有打开的会话：先点「＋ 新建会话」"
             }))
             .into_response();
-        }
-        st.running_job = true;
-    }
+        };
+        let ss = st.sessions.remove(&cur).expect("current session is loaded");
+        let budget = cfg.budget_yuan;
+        st.budget_yuan = budget;
+        st.running = Some(cur.clone());
+        st.snapshot = RunningSnapshot {
+            name: cur.clone(),
+            cells: ss.doc.cells.len(),
+            lines: ss.doc.canonical().lines().count(),
+            usage_in: ss.stats.usage.input_tokens,
+            usage_out: ss.stats.usage.output_tokens,
+            cost_yuan: ss.stats.cost_yuan,
+        };
+        (cur, ss, st.chat.clone().expect("checked"), st.tools.clone(), budget)
+    };
+    let (cur, ss, mut chat, mut tools, budget_yuan) = taken;
+    let SessionState { mut doc, mut stats } = ss;
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
-    let job_id = JOB_ID.fetch_add(1, Ordering::SeqCst) + 1;
     let st2 = st.clone();
-    let jobs2 = jobs.clone();
-    let task = tokio::spawn(async move {
-        let mut st = st2.lock().await;
-        let cur = st.current.clone().expect("pre-checked");
-        let WebState { sessions, chat, tools, budget_yuan, .. } = &mut *st;
-        let chat = chat.as_mut().expect("pre-checked");
-        let ss = sessions.get_mut(&cur).expect("pre-checked");
-        let SessionState { doc, stats } = ss;
-        let cfg = config::effective_settings().unwrap_or_default();
-        *budget_yuan = cfg.budget_yuan;
+    let cancel2 = cancel.clone();
+    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Ok(mut g) = cancel.flag.lock() {
+        *g = Some(cancel_flag.clone());
+    }
+
+    let _task = tokio::spawn(async move {
         let opts = {
             let mut o = crate::engine::RunOpts::from_settings(&cfg);
-            if let Some(b) = *budget_yuan {
+            if let Some(b) = budget_yuan {
                 o.budget_remaining = (b - stats.cost_yuan).max(0.0);
             }
             o
         };
-        // Canvas selection -> @cell refs (same as REPL /sel / old endpoint).
-        let ctx = selection_ctx(&req.cell_ids, doc);
+        // Canvas selection -> @cell refs (same as REPL /sel)。
+        let ctx = selection_ctx(&req.cell_ids, &doc);
         let harness = Harness::default();
         let tx2 = tx.clone();
         let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
@@ -633,47 +626,41 @@ async fn api_chat_stream(
             let _ = tx2.try_send(format!("{line}\n").into_bytes());
         });
 
-        // 客户端断开监视器：接收端掉线（页面刷新/关闭）即中止引擎并释放
-        // 大锁。Sender::is_closed 与发送无关，模型长时间思考时同样即时。
+        // 监视器：客户端断开（页面刷新/关闭）或用户点「停止」→ 引擎被
+        // select 取消（drop 掉当前 await 的网络调用），任务走正常收尾。
+        let flag2 = cancel_flag.clone();
         let tx3 = tx.clone();
         let monitor = async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                if tx3.is_closed() {
+                if tx3.is_closed() || flag2.load(std::sync::atomic::Ordering::SeqCst) {
                     return;
                 }
             }
         };
         let run_fut = async {
             harness
-                .run(chat, tools, doc, &req.text, &ctx, &opts, stats, &Some(progress))
+                .run(
+                    &mut chat,
+                    &mut tools,
+                    &mut doc,
+                    &req.text,
+                    &ctx,
+                    &opts,
+                    &mut stats,
+                    &Some(progress),
+                )
                 .await
         };
         let outcome = tokio::select! {
-            _ = monitor => Err("客户端已断开（页面刷新/关闭），任务已停止。".to_string()),
+            _ = monitor => Err("已停止（客户端断开或用户取消）".to_string()),
             r = run_fut => r,
         };
-        let (reply, error, tool_calls) = match &outcome {
-            Ok(o) => (o.reply.clone(), None, o.tool_calls),
-            Err(e) => (String::new(), Some(e.clone()), 0),
-        };
-        // R5: durable per-file history with the full trajectory.
-        let rec = HistoryRec {
-            ts: history::now_secs(),
-            user: req.text.clone(),
-            reply: reply.clone(),
-            tool_calls: tool_calls as u32,
-            usage_in: stats.usage.input_tokens,
-            usage_out: stats.usage.output_tokens,
-            cost_yuan: stats.cost_yuan,
-            events: events.lock().map(|v| v.clone()).unwrap_or_default(),
-            xml: doc.canonical().to_string(),
-            error,
-        };
-        let _ = history::append(&history::history_path(&doc.path), &rec);
-        let _ = history::save_session_state(&doc.path, stats);
-        if !tx.is_closed() {
-            match outcome {
+        let disconnected = tx.is_closed();
+
+        // 事件收尾：断开时接收端已不在，跳过发送
+        if !disconnected {
+            match &outcome {
                 Ok(o) => {
                     let _ = tx
                         .send(
@@ -701,21 +688,49 @@ async fn api_chat_stream(
                 }
             }
         }
-        // Clear this job's abort handle, then release the big lock and
-        // mark the slot free (drop(st) first: we still hold it here).
-        drop(st);
-        let mut cur = jobs2.current.lock().await;
-        if let Some((id, _)) = cur.as_ref() {
-            if *id == job_id {
-                *cur = None;
+        // 历史记录：只记录真正完成的任务（断开/取消不污染聊天重放）
+        if !disconnected {
+            if let Ok(o) = &outcome {
+                let rec = HistoryRec {
+                    ts: history::now_secs(),
+                    user: req.text.clone(),
+                    reply: o.reply.clone(),
+                    tool_calls: o.tool_calls as u32,
+                    usage_in: stats.usage.input_tokens,
+                    usage_out: stats.usage.output_tokens,
+                    cost_yuan: stats.cost_yuan,
+                    events: events.lock().map(|v| v.clone()).unwrap_or_default(),
+                    xml: doc.canonical().to_string(),
+                    error: None,
+                };
+                let _ = history::append(&history::history_path(&doc.path), &rec);
             }
         }
-        if let Ok(mut st) = st2.try_lock() {
-            st.running_job = false;
+        // 记忆/用量无论如何落盘
+        let _ = history::save_session_state(&doc.path, &stats);
+
+        // 归还：唯一收尾路径，槽位不可能被卡死
+        {
+            let mut st = st2.lock().await;
+            if st.running.as_deref() == Some(cur.as_str()) {
+                st.running = None;
+                st.snapshot = RunningSnapshot {
+                    name: cur.clone(),
+                    cells: doc.cells.len(),
+                    lines: doc.canonical().lines().count(),
+                    usage_in: stats.usage.input_tokens,
+                    usage_out: stats.usage.output_tokens,
+                    cost_yuan: stats.cost_yuan,
+                };
+                st.sessions.insert(cur, SessionState { doc, stats });
+            }
+        }
+        // 清取消槽
+        if let Ok(mut g) = cancel2.flag.lock() {
+            *g = None;
         }
     });
 
-    jobs.current.lock().await.replace((job_id, task.abort_handle()));
     let stream = ReceiverStream::new(rx).map(|bytes| Ok::<_, std::io::Error>(axum::body::Bytes::from(bytes)));
     (
         axum::http::StatusCode::OK,
@@ -726,37 +741,35 @@ async fn api_chat_stream(
 }
 
 async fn api_chat_cancel(
-    State(st): State<Arc<Mutex<WebState>>>,
-    State(jobs): State<Arc<JobControl>>,
+    State(cancel): State<Arc<CancelSlot>>,
 ) -> Json<serde_json::Value> {
-    let mut cur = jobs.current.lock().await;
-    match cur.take() {
-        Some((id, handle)) => {
-            handle.abort();
-            // The aborted task drops the big lock at its next await; once we
-            // can take it, mark the job slot free.
-            drop(cur);
-            st.lock().await.running_job = false;
-            Json(json!({ "ok": true, "job": id, "note": "已停止" }))
+    let flag = cancel
+        .flag
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
+    match flag {
+        Some(f) => {
+            f.store(true, std::sync::atomic::Ordering::SeqCst);
+            Json(json!({ "ok": true, "note": "已停止" }))
         }
         None => Json(json!({ "ok": false, "error": "当前没有运行中的任务" })),
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // R5: per-file history + session context save/load
 // ---------------------------------------------------------------------------
 
-fn hp(doc: &XmlDoc) -> std::path::PathBuf {
-    history::history_path(&doc.path)
+fn history_path_for(st: &WebState) -> Option<std::path::PathBuf> {
+    let cur = st.current.as_ref()?;
+    Some(history::history_path(&st.dir.join(cur)))
 }
 
 async fn api_history_list(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::Value> {
     let st = st.lock().await;
-    let Some(cur) = st.current.as_ref() else { return current_err() };
-    let Some(ss) = st.sessions.get(cur) else { return current_err() };
-    let recs = history::list(&hp(&ss.doc), 50);
+    let Some(hp) = history_path_for(&st) else { return current_err() };
+    let recs = history::list(&hp, 50);
     let list: Vec<serde_json::Value> = recs
         .iter()
         .enumerate()
@@ -776,7 +789,7 @@ async fn api_history_list(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_
             })
         })
         .collect();
-    Json(json!({ "records": list, "file": hp(&ss.doc).display().to_string() }))
+    Json(json!({ "records": list, "file": hp.display().to_string() }))
 }
 
 async fn api_history_detail(
@@ -784,9 +797,8 @@ async fn api_history_detail(
     axum::extract::Path(idx): axum::extract::Path<usize>,
 ) -> Json<serde_json::Value> {
     let st = st.lock().await;
-    let Some(cur) = st.current.as_ref() else { return current_err() };
-    let Some(ss) = st.sessions.get(cur) else { return current_err() };
-    let recs = history::list(&hp(&ss.doc), 50);
+    let Some(hp) = history_path_for(&st) else { return current_err() };
+    let recs = history::list(&hp, 50);
     match recs.get(idx) {
         Some(r) => Json(json!({ "ok": true, "record": r })),
         None => Json(json!({ "ok": false, "error": format!("没有第 {idx} 条历史记录") })),
@@ -808,7 +820,7 @@ async fn api_context_load(
     };
     let mut st = st.lock().await;
     let Some(cur) = st.current.clone() else { return current_err() };
-    let Some(ss) = st.sessions.get_mut(&cur) else { return current_err() };
+    let Some(ss) = st.sessions.get_mut(&cur) else { return busy_err() };
     let save_path = ss.doc.path.clone();
     let doc = match XmlDoc::from_text_at(&bundle.xml, &save_path) {
         Ok(d) => d,
@@ -891,8 +903,10 @@ async fn api_sessions_list(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let running = st.running.as_deref() == Some(name.as_str());
             let (cells, loaded) = match st.sessions.get(&name) {
                 Some(ss) => (Some(ss.doc.cells.len()), true),
+                None if running => (Some(st.snapshot.cells), true),
                 None => (None, false),
             };
             json!({
@@ -900,6 +914,7 @@ async fn api_sessions_list(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde
                 "size": std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
                 "loaded": loaded,
                 "cells": cells,
+                "busy": running,
                 "current": st.current.as_deref() == Some(name.as_str()),
             })
         })
@@ -913,6 +928,9 @@ async fn api_sessions_create(
     body: Option<Json<serde_json::Value>>,
 ) -> Json<serde_json::Value> {
     let mut st = st.lock().await;
+    if st.running.is_some() {
+        return busy_err();
+    }
     let payload = body.map(|Json(b)| b).unwrap_or(serde_json::json!({}));
     let want = payload
         .get("name")
@@ -967,6 +985,9 @@ async fn api_sessions_switch(
         .unwrap_or_default()
         .to_string();
     let mut st = st.lock().await;
+    if st.running.is_some() {
+        return busy_err();
+    }
     if !st.sessions.contains_key(&name) {
         let path = st.dir.join(&name);
         if !path.exists() {
@@ -996,6 +1017,9 @@ async fn api_sessions_delete(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
     let mut st = st.lock().await;
+    if st.running.is_some() {
+        return busy_err();
+    }
     let path = st.dir.join(&name);
     if !path.exists() {
         return Json(json!({ "ok": false, "error": format!("会话不存在: {name}") }));

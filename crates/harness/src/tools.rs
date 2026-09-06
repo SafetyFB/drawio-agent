@@ -36,6 +36,7 @@ impl ToolOutput {
 
 /// Renderer backend shared across `view` calls (constructed lazily per call
 /// for now — chromium launch is ~1s, fine for interactive use).
+#[derive(Clone)]
 pub struct Tools {
     pub render: bool,
     pub renderer: Option<Arc<drawio_agent_renderer::Renderer>>,
