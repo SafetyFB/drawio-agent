@@ -199,13 +199,27 @@ async function refreshCanvas() {
   setSelection([]);
 }
 
-async function api(path, body) {
-  const resp = await fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body || {}),
-  });
-  return resp.json();
+async function api(path, body, method) {
+  let resp;
+  try {
+    resp = await fetch(path, {
+      method: method || 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+  } catch (e) {
+    return { ok: false, error: '请求失败: ' + e.message };
+  }
+  const text = await resp.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); }
+    catch (e) { data = null; }
+  }
+  if (!resp.ok) {
+    return { ok: false, error: 'HTTP ' + resp.status + ': ' + (data && data.error ? data.error : (text.slice(0, 200) || resp.statusText)) };
+  }
+  return data || {};
 }
 
 async function loadState() {
