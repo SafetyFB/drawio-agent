@@ -7,3 +7,4 @@ pub use chromium::{
     bundled_chromium_path, find_chromium, HeadlessChromiumDriver, PINNED_CHROMIUM_VERSION,
 };
 pub use mock::MockDriver;
+pub mod drawio_server;

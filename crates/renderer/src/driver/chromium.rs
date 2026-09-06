@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::timeout;
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream};
 use tracing::{debug, info, warn};
+use base64::Engine as _;
 
 use crate::{RenderDriver, RenderError, RenderOptions};
 
@@ -402,25 +403,21 @@ impl RenderDriver for HeadlessChromiumDriver {
             return Err(RenderError::Xml("empty xml".into()));
         }
 
-        let render_html = self.inner.assets_dir.join("render.html");
-        let url = url::Url::from_file_path(&render_html)
-            .map_err(|_| {
-                RenderError::Browser(format!("bad assets path: {}", render_html.display()))
-            })?;
-
-        // 1. Navigate to render.html.
+        // 1. Navigate to the export wrapper (drawio webapp in an iframe,
+        //    native export protocol).
+        let url = crate::driver::drawio_server::export_url(xml, opts);
         self.send("Page.enable", None).await?;
-        self.send("Page.navigate", Some(json!({ "url": url.as_str() }))).await?;
+        self.send("Page.navigate", Some(json!({ "url": url }))).await?;
 
-        // 2. Wait for the page to load and define window.renderXml.
-        let mut loaded = false;
-        for _ in 0..40 {
+        // 2. Wait for the wrapper to load the app and hand over the xml.
+        let mut ready = false;
+        for _ in 0..400 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             match self
                 .send(
                     "Runtime.evaluate",
                     Some(json!({
-                        "expression": "typeof window.renderXml !== 'undefined'",
+                        "expression": "window.__ready === true",
                         "returnByValue": true,
                     })),
                 )
@@ -432,100 +429,67 @@ impl RenderDriver for HeadlessChromiumDriver {
                         .and_then(|v| v.as_bool())
                         == Some(true)
                     {
-                        loaded = true;
+                        ready = true;
                         break;
                     }
                 }
-                // Navigation in progress: context may be gone; keep polling.
                 Err(_) => continue,
             }
         }
-        if !loaded {
+        if !ready {
             return Err(RenderError::Page(
-                "render.html did not define window.renderXml".into(),
+                "drawio webapp did not become ready (offline? app not cached?)".into(),
             ));
         }
 
-        // 3. Call window.renderXml synchronously.
-        let bg = if opts.background.is_empty() {
-            &self.inner.default_background
-        } else {
-            &opts.background
-        };
-        let expr = format!(
-            r#"window.renderXml({xml_json}, {scale}, {bg_json}, {border})"#,
-            xml_json = serde_json::Value::String(xml.to_string()),
-            scale = opts.scale,
-            bg_json = serde_json::Value::String(bg.clone()),
-            border = opts.border,
-        );
-        let result = self
-            .send(
-                "Runtime.evaluate",
-                Some(json!({
-                    "expression": expr,
-                    "awaitPromise": false,
-                    "returnByValue": true,
-                })),
-            )
-            .await?;
-        if let Some(exception) = result.get("exceptionDetails") {
-            if !exception.is_null() {
-                return Err(RenderError::Xml(format!("renderXml threw: {exception}")));
-            }
-        }
-        let value = result
-            .get("result")
-            .and_then(|v| v.get("value"))
-            .cloned()
-            .unwrap_or(json!({}));
-        if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let msg = value
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("renderXml reported failure");
-            return Err(RenderError::Xml(msg.to_string()));
-        }
-        let w = value.get("width").and_then(|v| v.as_u64()).unwrap_or(800);
-        let h = value.get("height").and_then(|v| v.as_u64()).unwrap_or(600);
-
-        // 4. Size the viewport to the diagram + border so the screenshot
-        //    captures exactly the rendered content.
+        // 3. Trigger the native export.
         self.send(
-            "Emulation.setDeviceMetricsOverride",
+            "Runtime.evaluate",
             Some(json!({
-                "width": w + 2 * opts.border as u64,
-                "height": h + 2 * opts.border as u64,
-                "deviceScaleFactor": opts.scale,
-                "mobile": false,
+                "expression": "window.__doExport()",
+                "returnByValue": true,
             })),
         )
         .await?;
 
-        // Give the compositor a beat to paint after the resize.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // 5. Capture PNG.
-        let capture = self
-            .send("Page.captureScreenshot", Some(json!({ "format": "png" })))
-            .await?;
-        let b64 = capture
-            .get("data")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| RenderError::Export("captureScreenshot missing 'data'".into()))?;
-        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-            .map_err(|e| RenderError::Export(format!("base64 decode: {e}")))?;
-
-        // 6. PNG signature check.
-        const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-        if bytes.len() < 8 || bytes[..8] != PNG_SIG {
-            return Err(RenderError::Export(format!(
-                "screenshot is not PNG (got {} bytes)",
-                bytes.len()
-            )));
+        // 4. Wait for the export result.
+        let mut png_b64: Option<String> = None;
+        for _ in 0..400 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            match self
+                .send(
+                    "Runtime.evaluate",
+                    Some(json!({
+                        "expression": "window.__exportDone === true ? window.__exportPng : undefined",
+                        "returnByValue": true,
+                    })),
+                )
+                .await
+            {
+                Ok(r) => {
+                    if let Some(v) = r
+                        .get("result")
+                        .and_then(|x| x.get("value"))
+                        .and_then(|x| x.as_str())
+                    {
+                        png_b64 = Some(v.to_string());
+                        break;
+                    }
+                }
+                Err(_) => continue,
+            }
         }
-        info!(target: "renderer", bytes = bytes.len(), "chromium render ok");
-        Ok(bytes)
+        let Some(png_b64) = png_b64 else {
+            return Err(RenderError::Page("drawio export timed out".into()));
+        };
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(png_b64.trim())
+            .map_err(|e| RenderError::Export(format!("base64 decode: {e}")))?;
+        if png.len() < 8 || &png[..4] != b"\x89PNG" {
+            return Err(RenderError::Export("export data is not a PNG".into()));
+        }
+        info!(target: "renderer", bytes = png.len(), "drawio export ok");
+        Ok(png)
     }
 }
 
