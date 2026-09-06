@@ -236,7 +236,8 @@ async function switchSession(name, announce) {
   $('chatlog').innerHTML = '';
   if (announce) log('tool-note', `已进入会话（文件）: ${name}`);
   await loadSessions();
-  await openHistory(false);
+  // 选中会话即看到它的历史记录（只读时间线）
+  await openHistory(true);
   return true;
 }
 
@@ -493,6 +494,8 @@ $('chatform').onsubmit = async (ev) => {
     const cur = list.find((x) => x.current);
     if (cur) {
       await refreshCanvas();
+      // 进入页面即展示当前会话的历史记录（只读时间线）
+      await openHistory(true);
     } else if (list.length) {
       await switchSession(list[0].name, false);
     } else {
@@ -685,7 +688,9 @@ async function openHistory(force) {
   if (!histOpen) return;
   let data;
   try { data = await (await fetch('/api/history')).json(); }
-  catch (e) { log('error', '历史读取失败: ' + e); return; }
+  catch (e) { log('error', '历史读取失败: ' + e); return 0; }
+  const count = (data.records || []).length;
+  $('hist-btn').textContent = count ? `历史(${count})` : '历史';
   histLog.innerHTML = '';
   // 作用域标注：历史属于「当前会话（文件）」这条时间线
   const scope = document.createElement('div');
@@ -700,7 +705,7 @@ async function openHistory(force) {
     d.className = 'dim';
     d.textContent = '暂无历史记录（完成一次对话后自动记录）';
     histLog.appendChild(d);
-    return;
+    return count;
   }
   for (const r of data.records) {
     const item = document.createElement('div');
@@ -732,17 +737,9 @@ async function openHistory(force) {
       if (rec.error) txt += `错误: ${rec.error}\n`;
       txt += `\n最终回复: ${rec.reply}\n（xml ${rec.xml.length} 字符）`;
       detail.textContent = txt;
-      // action buttons
+      // 历史是只读记录：仅提供导出，不做回溯
       const acts = document.createElement('div');
       acts.className = 'hist-actions';
-      const restore = document.createElement('button');
-      restore.textContent = '恢复此版本';
-      restore.onclick = async (e) => {
-        e.stopPropagation();
-        const r2 = await api('/api/history/' + r.idx + '/restore');
-        if (r2.ok) { log('ok', '✓ 已恢复到该历史版本'); await refreshCanvas(); }
-        else log('error', '恢复失败: ' + (r2.error || ''));
-      };
       const dl = document.createElement('button');
       dl.textContent = '导出会话 JSON';
       dl.onclick = (e) => {
@@ -753,26 +750,14 @@ async function openHistory(force) {
         a.download = `drawio-ctx-${r.idx}.json`;
         a.click();
       };
-      const fork = document.createElement('button');
-      fork.textContent = '从此版本新建会话';
-      fork.title = '把该历史快照另存为一个新会话（新文件），不动当前会话';
-      fork.onclick = async (e) => {
-        e.stopPropagation();
-        const base = (picker.value || 'diagram').replace(/\.drawio$/i, '');
-        const name = `${base}-v${r.idx + 1}`;
-        const r2 = await api('/api/sessions', { name, xml: rec.xml });
-        if (r2.ok) {
-          log('ok', `✓ 已从历史快照创建新会话 ${r2.name}`);
-          await switchSession(r2.name, true);
-        } else log('error', '创建失败: ' + (r2.error || ''));
-      };
-      acts.append(restore, fork, dl);
+      acts.append(dl);
       detail.appendChild(acts);
     };
     histLog.appendChild(item);
   }
+  return count;
 }
-$('hist-btn').onclick = openHistory;
+$('hist-btn').onclick = () => openHistory();
 
 $('ctx-import-btn').onclick = () => { if (guardBusy()) return; $('ctx-file').click(); };
 $('ctx-file').onchange = async () => {

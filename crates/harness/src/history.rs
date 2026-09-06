@@ -133,6 +133,64 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Per-session runtime state persisted next to the file: rolling memory
+/// transcript + usage/cost. Restored on server start / session switch so
+/// a session survives restarts with its full conversational context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStateFile {
+    pub version: u32,
+    pub saved_at: u64,
+    pub memory: Vec<crate::chat::Message>,
+    pub usage_in: u64,
+    pub usage_out: u64,
+    pub cost_yuan: f64,
+}
+
+/// `<docdir>/<stem>.state.json`
+pub fn state_path(doc_path: &Path) -> PathBuf {
+    let stem = doc_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "diagram".into());
+    doc_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{stem}.state.json"))
+}
+
+/// Persist a session's memory + usage next to its file. Images are elided
+/// (folded transcript may hold the latest screenshot; JSON arrays of PNG
+/// bytes would be huge and useless after restart — re-view when needed).
+pub fn save_session_state(
+    doc_path: &Path,
+    stats: &crate::engine::SessionStats,
+) -> Result<(), String> {
+    let bundle = SessionStateFile {
+        version: 1,
+        saved_at: now_secs(),
+        memory: SessionBundle::strip_images(&stats.transcript),
+        usage_in: stats.usage.input_tokens,
+        usage_out: stats.usage.output_tokens,
+        cost_yuan: stats.cost_yuan,
+    };
+    let json = serde_json::to_string_pretty(&bundle).map_err(|e| format!("ser: {e}"))?;
+    std::fs::write(state_path(doc_path), json).map_err(|e| format!("write state: {e}"))
+}
+
+/// Load persisted session state (memory + usage) into a SessionStats.
+pub fn load_session_state(doc_path: &Path, stats: &mut crate::engine::SessionStats) {
+    if let Ok(raw) = std::fs::read_to_string(state_path(doc_path)) {
+        if let Ok(bundle) = serde_json::from_str::<SessionStateFile>(&raw) {
+            stats.transcript = SessionBundle::strip_images(&bundle.memory);
+            stats.usage = crate::chat::Usage {
+                input_tokens: bundle.usage_in,
+                output_tokens: bundle.usage_out,
+            };
+            stats.cost_yuan = bundle.cost_yuan;
+        }
+    }
+}
+
 /// Whole-session context bundle for save/load (R5): transcript + doc + usage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionBundle {

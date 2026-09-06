@@ -347,7 +347,7 @@ fn main() {
                                 for (i, rec) in recs.iter().enumerate() {
                                     println!("[{}] {}", i, rec.summary());
                                 }
-                                println!("查看详情: /history <序号>；恢复: /restore <序号>");
+                                println!("查看详情: /history <序号>");
                             }
                             Some(i) => match recs.get(i) {
                                 Some(rec) => {
@@ -386,33 +386,6 @@ fn main() {
                                 }
                                 None => eprintln!("没有第 {i} 条"),
                             },
-                        }
-                    });
-                }
-                "restore" => {
-                    let st = repl.clone();
-                    let idx = rest.parse::<usize>();
-                    rt.block_on(async move {
-                        let mut r = st.lock().await;
-                        let Ok(idx) = idx else {
-                            eprintln!("用法: /restore <序号>（/history 查看）");
-                            return;
-                        };
-                        let p = history::history_path(&r.doc.path);
-                        let recs = history::list(&p, 50);
-                        match recs.get(idx) {
-                            Some(rec) => {
-                                let p = r.doc.path.clone();
-                                match XmlDoc::from_text_at(&rec.xml, &p) {
-                                    Ok(d) => {
-                                        r.doc = d;
-                                        let _ = r.doc.save();
-                                        println!("已恢复到历史 #{}（{} cells）", idx, r.doc.cells.len());
-                                    }
-                                    Err(e) => eprintln!("恢复失败: {e}"),
-                                }
-                            }
-                            None => eprintln!("没有第 {idx} 条"),
                         }
                     });
                 }
@@ -616,6 +589,9 @@ async fn run_one_ask(
     };
     if let Err(e) = history::append(&history::history_path(&doc.path), &rec) {
         eprintln!("警告: 写入历史失败: {e}");
+    }
+    if let Err(e) = history::save_session_state(&doc.path, usage) {
+        eprintln!("警告: 保存会话状态失败: {e}");
     }
     outcome
 }

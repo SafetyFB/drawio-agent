@@ -100,14 +100,10 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
         if let Ok(doc) = XmlDoc::load(first) {
+            let mut stats = crate::engine::SessionStats::default();
+            history::load_session_state(first, &mut stats);
             current = Some(name.clone());
-            sessions.insert(
-                name,
-                SessionState {
-                    doc,
-                    stats: crate::engine::SessionStats::default(),
-                },
-            );
+            sessions.insert(name, SessionState { doc, stats });
         }
     }
     let state = Arc::new(Mutex::new(WebState {
@@ -142,7 +138,6 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
         .route("/api/chat/cancel", post(api_chat_cancel))
         .route("/api/history", get(api_history_list))
         .route("/api/history/:idx", get(api_history_detail))
-        .route("/api/history/:idx/restore", post(api_history_restore))
         .route("/api/context/load", post(api_context_load))
         .with_state(app_state);
 
@@ -308,7 +303,11 @@ async fn api_chat(
     let ss = sessions.get_mut(&cur).expect("session exists");
     let SessionState { doc, stats } = ss;
     let chat = chat.as_mut().expect("checked above");
-    match harness.run(chat, tools, doc, &req.text, &ctx, &opts, stats, &None).await {
+    let outcome = harness
+        .run(chat, tools, doc, &req.text, &ctx, &opts, stats, &None)
+        .await;
+    let _ = history::save_session_state(&doc.path, stats);
+    match outcome {
         Ok(outcome) => Json(json!({
             "reply": outcome.reply,
             "tool_calls": outcome.tool_calls,
@@ -672,6 +671,7 @@ async fn api_chat_stream(
             error,
         };
         let _ = history::append(&history::history_path(&doc.path), &rec);
+        let _ = history::save_session_state(&doc.path, stats);
         if !tx.is_closed() {
             match outcome {
                 Ok(o) => {
@@ -791,28 +791,6 @@ async fn api_history_detail(
     }
 }
 
-async fn api_history_restore(
-    State(st): State<Arc<Mutex<WebState>>>,
-    axum::extract::Path(idx): axum::extract::Path<usize>,
-) -> Json<serde_json::Value> {
-    let mut st = st.lock().await;
-    let Some(cur) = st.current.clone() else { return current_err() };
-    let Some(ss) = st.sessions.get_mut(&cur) else { return current_err() };
-    let recs = history::list(&hp(&ss.doc), 50);
-    let Some(rec) = recs.get(idx) else {
-        return Json(json!({ "ok": false, "error": format!("没有第 {idx} 条历史记录") }));
-    };
-    let save_path = ss.doc.path.clone();
-    match XmlDoc::from_text_at(&rec.xml, &save_path) {
-        Ok(d) => {
-            ss.doc = d;
-            let _ = ss.doc.save();
-            Json(json!({ "ok": true, "cells": ss.doc.cells.len(), "note": "已恢复到该历史版本的 xml（会话统计不清零）" }))
-        }
-        Err(e) => Json(json!({ "ok": false, "error": format!("历史 xml 无法加载: {e}") })),
-    }
-}
-
 /// Import a SessionBundle (whole-context save/load): replaces the doc with
 /// the bundle's xml and replays its transcript into the rolling memory.
 async fn api_context_load(
@@ -842,6 +820,7 @@ async fn api_context_load(
         output_tokens: bundle.usage_out,
     };
     ss.stats.cost_yuan = bundle.cost_yuan;
+    let _ = history::save_session_state(&ss.doc.path, &ss.stats);
     Json(json!({
         "ok": true,
         "cells": ss.doc.cells.len(),
@@ -995,13 +974,9 @@ async fn api_sessions_switch(
             Ok(d) => d,
             Err(e) => return Json(json!({ "ok": false, "error": format!("加载失败: {e}") })),
         };
-        st.sessions.insert(
-            name.clone(),
-            SessionState {
-                doc,
-                stats: crate::engine::SessionStats::default(),
-            },
-        );
+        let mut stats = crate::engine::SessionStats::default();
+        history::load_session_state(&path, &mut stats);
+        st.sessions.insert(name.clone(), SessionState { doc, stats });
     }
     st.current = Some(name.clone());
     let ss = st.sessions.get(&name).expect("just inserted");
@@ -1024,8 +999,8 @@ async fn api_sessions_delete(
         return Json(json!({ "ok": false, "error": format!("会话不存在: {name}") }));
     }
     let _ = std::fs::remove_file(&path);
-    let hp = history::history_path(&path);
-    let _ = std::fs::remove_file(&hp);
+    let _ = std::fs::remove_file(history::history_path(&path));
+    let _ = std::fs::remove_file(history::state_path(&path));
     st.sessions.remove(&name);
     if st.current.as_deref() == Some(name.as_str()) {
         st.current = None;
