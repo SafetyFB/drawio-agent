@@ -157,6 +157,16 @@ function clientToGraph(clientX, clientY) {
   };
 }
 
+// 关键：capture 阶段阻断 mousedown。Safari/WebKit 不会因 pointerdown 的
+// preventDefault 而抑制兼容 mousedown，mxGraph 自己的 mousedown 处理器
+// （shift 时它会再做一次 toggle）会造成双重选择/抵消。本页交互全部走
+// pointerdown，mxGraph 的鼠标路径不需要；此监听注册于页面加载，早于
+// mxGraph 的 bubble 监听，stopPropagation 可确定性阻止它。
+canvasEl.addEventListener('mousedown', (e) => {
+  e.stopPropagation();
+  e.preventDefault();
+}, true);
+
 canvasEl.addEventListener('pointerdown', (e) => {
   if (e.button !== 0 || !currentGraph || busy) return;
 
@@ -168,18 +178,39 @@ canvasEl.addEventListener('pointerdown', (e) => {
     const startX = e.clientX, startY = e.clientY;
     const t0 = { x: v.translate.x, y: v.translate.y };
     let raf = 0;
+    let pending = null;
+    const apply = (pt) => {
+      v.scaleAndTranslate(
+        v.scale,
+        t0.x + (pt.x - startX) / v.scale,
+        t0.y + (pt.y - startY) / v.scale
+      );
+    };
     const onMove = (ev) => {
-      if (raf) return; // rAF 节流：每帧最多一次
-      raf = requestAnimationFrame(() => {
-        raf = 0;
-        v.scaleAndTranslate(
-          v.scale,
-          t0.x + (ev.clientX - startX) / v.scale,
-          t0.y + (ev.clientY - startY) / v.scale
-        );
-      });
+      // WebKit 会把一帧内的多次 pointermove 突发投递；只记最新坐标，
+      // rAF 回调读 pending，绝不丢最后一个事件。
+      pending = { x: ev.clientX, y: ev.clientY };
+      if (!raf) {
+        raf = requestAnimationFrame(() => {
+          raf = 0;
+          if (pending) {
+            apply(pending);
+            pending = null;
+          }
+        });
+      }
     };
     const onUp = () => {
+      // 松开时同步落位：cancel rAF、立即应用最新坐标，图一定停在
+      // 光标释放的位置（跨浏览器一致）。
+      if (raf) {
+        cancelAnimationFrame(raf);
+        raf = 0;
+      }
+      if (pending) {
+        apply(pending);
+        pending = null;
+      }
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
     };
