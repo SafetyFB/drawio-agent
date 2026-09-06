@@ -197,6 +197,7 @@ fn cell_count_and_value(xml: &str) -> (usize, bool, bool) {
 
 #[tokio::test]
 async fn diff_output_is_merged_and_untouched_cells_survive() {
+    drawio_agent_server::agent_deps::reset_vision_rejection_flag();
     let llm = Arc::new(DiffLlm::new());
     let state = state_with(llm.clone(), Arc::new(MockDriver::new()));
     let app = router(state);
@@ -270,6 +271,7 @@ async fn diff_output_is_merged_and_untouched_cells_survive() {
 /// without burning a version change.
 #[tokio::test]
 async fn empty_diff_with_done_converges_as_noop() {
+    drawio_agent_server::agent_deps::reset_vision_rejection_flag();
     #[derive(Clone)]
     struct NoopLlm;
     #[async_trait::async_trait]
@@ -443,6 +445,7 @@ impl LlmProvider for VisionRejectThenAcceptLlm {
 
 #[tokio::test]
 async fn vision_rejection_falls_back_to_text_only_fix() {
+    drawio_agent_server::agent_deps::reset_vision_rejection_flag();
     let llm = Arc::new(VisionRejectThenAcceptLlm::new());
     let state = state_with(llm.clone(), Arc::new(MockDriver::new()));
     let app = router(state);

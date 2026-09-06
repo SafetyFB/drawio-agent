@@ -11,6 +11,18 @@ use drawio_agent_llm_client::{
 };
 use drawio_agent_renderer::{RenderDriver, RenderError, RenderOptions};
 
+/// Process-wide flag: the configured provider rejected an image input at
+/// least once (non-vision model, gateway policy, or an unparseable image).
+/// Once set, all fix rounds in this process run text-only.
+static VISION_REJECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Reset the process-wide vision-rejection flag (tests switch providers
+/// between cases; a real server only changes models across restarts).
+#[doc(hidden)]
+pub fn reset_vision_rejection_flag() {
+    VISION_REJECTED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Bridges the Agent Loop to the server's shared LLM + renderer.
 pub struct ServerAgentDeps {
     pub llm: Arc<dyn LlmProvider>,
@@ -71,6 +83,12 @@ impl AgentDeps for ServerAgentDeps {
         };
 
         let prior_issues: Vec<ReviewIssue> = req.prior_issues.clone();
+        // Process-level memory of a vision rejection: once the configured
+        // provider refuses an image, every later fix round in this process
+        // goes straight to text-only mode (no more 400 round-trips per
+        // iteration). Reset by restarting the server after a model change.
+        let text_only = VISION_REJECTED.load(std::sync::atomic::Ordering::Relaxed)
+            || req.image_png.is_empty();
         let resp = self
             .llm
             .fix_diagram(ProviderFixRequest {
@@ -79,21 +97,22 @@ impl AgentDeps for ServerAgentDeps {
                 scope_xml: scope_xml.clone(),
                 issues: prior_issues,
                 checks: req.checks.clone(),
-                image_png: req.image_png.clone(),
+                image_png: if text_only { Vec::new() } else { req.image_png.clone() },
                 memory: req.memory.clone(),
             })
             .await;
         // Vision rejection fallback: when the configured model/provider
-        // refuses image input (e.g. a non-vision model behind an OpenAI-
-        // compatible gateway), retry ONCE without the image so the user can
-        // still get a text-based fix instead of a hard failure. The prompt
-        // tells the model it cannot see the render.
+        // refuses image input (e.g. a non-vision model or an image the
+        // gateway cannot parse), retry ONCE without the image so the user
+        // can still get a text-based fix instead of a hard failure — and
+        // remember the rejection so subsequent rounds skip the image too.
         let resp = match resp {
             Ok(r) => r,
-            Err(e) if is_vision_rejection(&e) => {
+            Err(e) if !text_only && is_vision_rejection(&e) => {
+                VISION_REJECTED.store(true, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(
                     error = %e,
-                    "vision input rejected by provider; retrying fix without image"
+                    "vision input rejected by provider; retrying fix without image                      (later rounds will go text-only)"
                 );
                 self.llm
                     .fix_diagram(ProviderFixRequest {
