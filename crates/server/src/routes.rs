@@ -16,7 +16,8 @@ use tokio::sync::broadcast;
 use crate::{
     state::WsEvent, AgentLoopRequest, AppState, CreateSessionRequest, CreateSessionResponse,
     GenerateRequest, GenerateResponse, PatchRequest, PatchResponse, RenderResponse,
-    ReviewRequest, ServerAgentDeps, SessionInfoResponse, ServerError, VersionsResponse,
+    ReviewRequest, ServerAgentDeps, SessionInfoResponse, SessionSummary, ServerError,
+    VersionsResponse,
 };
 
 /// Record a TrajectoryEvent to the store AND emit it on the EventBus as
@@ -72,7 +73,7 @@ impl IntoResponse for ServerError {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/api/sessions", post(create_session))
+        .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session))
         .route("/api/sessions/:id/versions", get(list_versions))
         .route("/api/sessions/:id/generate", post(generate))
@@ -108,6 +109,32 @@ async fn create_session(
             .await;
     }
     Ok((StatusCode::CREATED, Json(CreateSessionResponse { session_id: id })))
+}
+
+/// List all sessions, newest first, with a friendly title sourced from the
+/// latest version's summary (the first ~80 chars of the prompt).
+async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<SessionSummary>>, ServerError> {
+    let store = state.sessions.read().await;
+    let mut summaries: Vec<SessionSummary> = store
+        .list_all()
+        .await
+        .into_iter()
+        .map(|entry| SessionSummary {
+            id: entry.meta.id.0,
+            title: entry
+                .versions
+                .iter()
+                .rev()
+                .find_map(|v| v.meta.summary.clone())
+                .unwrap_or_default(),
+            version_count: entry.versions.len(),
+            created_at: entry.created_at,
+        })
+        .collect();
+    summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(Json(summaries))
 }
 
 async fn get_session(

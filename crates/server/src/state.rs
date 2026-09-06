@@ -75,6 +75,8 @@ pub struct VersionMeta {
 pub struct SessionData {
     pub meta: SessionMeta,
     pub versions: Vec<VersionEntry>,
+    /// Unix milliseconds at creation (used to order the session list).
+    pub created_at: u64,
 }
 
 /// One past (or current) version: the XML plus metadata.
@@ -168,9 +170,14 @@ impl SessionStore {
             version_count: 0,
             current_version: None,
         };
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let data = SessionData {
             meta,
             versions: Vec::new(),
+            created_at,
         };
         self.inner.write().await.insert(id.clone(), data);
         id
@@ -226,6 +233,12 @@ impl SessionStore {
             .get(id)
             .map(|d| d.versions.iter().map(|v| v.meta.clone()).collect())
             .unwrap_or_default()
+    }
+
+    /// List every session's data (caller sorts/orders as needed).
+    pub async fn list_all(&self) -> Vec<SessionData> {
+        let guard = self.inner.read().await;
+        guard.values().cloned().collect()
     }
 }
 

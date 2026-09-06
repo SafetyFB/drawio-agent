@@ -95,6 +95,18 @@ pub struct CreateSessionResponse {
     pub session_id: SessionId,
 }
 
+/// Summary row for the session list (`GET /api/sessions`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    /// Human-friendly title: the latest version's summary (first ~80 chars
+    /// of the prompt), empty if the session has no generated content yet.
+    pub title: String,
+    pub version_count: usize,
+    /// Unix milliseconds at creation. The list is newest-first.
+    pub created_at: u64,
+}
+
 /// Response body for `GET /api/sessions/:id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfoResponse {

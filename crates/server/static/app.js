@@ -164,7 +164,10 @@
       (sessions || []).forEach(s => {
         const opt = document.createElement('option');
         opt.value = s.id;
-        opt.textContent = s.id.slice(0, 12) + (s.versions?.length ? ` · ${s.versions.length} version${s.versions.length === 1 ? '' : 's'}` : '');
+        const shortId = s.id.slice(0, 8);
+        const title = s.title ? `${s.title} · ${shortId}` : shortId;
+        const versions = s.version_count > 0 ? ` · ${s.version_count}v` : '';
+        opt.textContent = `${title}${versions}`;
         sessionSelect.appendChild(opt);
       });
       if (currentVal) sessionSelect.value = currentVal;
@@ -282,8 +285,8 @@
     if (!currentSessionId) return;
     try {
       const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}/render`);
-      previewArea.innerHTML = `<img src="data:image/png;base64,${result.png}" alt="render preview">`;
-      renderMeta.textContent = result.bytes ? `${(result.bytes / 1024).toFixed(1)} KB · ${(result.duration_ms / 1000).toFixed(1)}s` : '';
+      previewArea.innerHTML = `<img src="data:image/png;base64,${result.png_base64}" alt="render preview">`;
+      renderMeta.textContent = result.bytes ? `${(result.bytes / 1024).toFixed(1)} KB` : '';
       downloadSvgBtn.disabled = false;
       copyXmlUrlBtn.disabled = false;
     } catch (err) {
@@ -338,15 +341,99 @@
     }
   }
 
-  function downloadSvg() {
-    if (!currentXml || !currentSessionId) return;
-    const blob = new Blob([currentXml], { type: 'image/svg+xml' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `drawio-agent-${currentSessionId.slice(0,8)}.svg`;
-    a.click();
-    URL.revokeObjectURL(url);
+  async function downloadSvg() {
+    if (!currentSessionId) { showError('No session selected'); return; }
+    setLoading(true, 'exporting SVG…');
+    try {
+      const session = await api('GET', `/api/sessions/${encodeURIComponent(currentSessionId)}`);
+      const xml = session.current_xml || '';
+      if (!xml) { showError('Session has no XML yet'); return; }
+
+      if (typeof window.mxUtils === 'undefined' || typeof window.mxSvgCanvas2D === 'undefined' ||
+          typeof window.mxImageExport === 'undefined' || typeof window.mxConstants === 'undefined') {
+        showError('SVG export requires the mxGraph bundle (viewer-static.min.js)');
+        return;
+      }
+
+      // Load XML into a fresh mxGraph (same path as the canvas render).
+      const xmlDoc = window.mxUtils.parseXml(xml);
+      const modelEl = xmlDoc.getElementsByTagName('mxGraphModel')[0];
+      if (!modelEl) throw new Error('no <mxGraphModel> in session XML');
+      const model = new window.mxGraphModel();
+      new window.mxCodec(xmlDoc).decode(modelEl, model);
+
+      // Off-screen container so mxGraph can lay out and we can read bounds.
+      const off = document.createElement('div');
+      off.style.cssText = 'position:absolute;left:-99999px;top:-99999px;width:1px;height:1px;';
+      document.body.appendChild(off);
+      const graph = new window.mxGraph(off, model);
+      graph.setEnabled(false);
+      graph.refresh();
+      const bounds = graph.getGraphBounds();
+
+      const border = 20;
+      const scale = 1;
+      const background = '#ffffff';
+
+      // Render the cells into a real SVG document via mxSvgCanvas2D.
+      const svgDoc = window.mxUtils.createXmlDocument();
+      const root = svgDoc.createElementNS(window.mxConstants.NS_SVG, 'svg');
+      root.setAttribute('xmlns', window.mxConstants.NS_SVG);
+      root.setAttribute('width', Math.max(1, Math.round((bounds.width + 2 * border) * scale)) + 'px');
+      root.setAttribute('height', Math.max(1, Math.round((bounds.height + 2 * border) * scale)) + 'px');
+      root.setAttribute('version', '1.1');
+      root.setAttribute('style', `background:${background};`);
+
+      const canvas = new window.mxSvgCanvas2D(root, background);
+      canvas.scale(scale / graph.view.scale);
+      canvas.translate(-bounds.x + border, -bounds.y + border);
+      const imgExport = new window.mxImageExport();
+      imgExport.drawState(graph.getView().getState(graph.getModel().getRoot()), canvas);
+
+      document.body.removeChild(off);
+
+      const svg = new XMLSerializer().serializeToString(root);
+      const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `drawio-agent-${currentSessionId.slice(0, 8)}.svg`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      showError(`SVG export failed: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function copyToClipboard(text) {
+    // Try the modern async API first (requires a secure context + gesture).
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch (err) {
+        console.warn('clipboard.writeText failed:', err);
+      }
+    }
+    // Fallback: hidden textarea + execCommand('copy').
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    let ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } catch (err) {
+      console.warn('execCommand copy failed:', err);
+    }
+    document.body.removeChild(ta);
+    return ok;
   }
 
   async function copyXmlUrl() {
@@ -357,8 +444,12 @@
       const url = latest
         ? `${location.origin}/api/sessions/${encodeURIComponent(currentSessionId)}/versions/${encodeURIComponent(latest)}`
         : `${location.origin}/api/sessions/${encodeURIComponent(currentSessionId)}`;
-      await navigator.clipboard.writeText(url);
-      addActivity('state', { from: 'clipboard', to: 'XML URL copied' });
+      const ok = await copyToClipboard(url);
+      if (ok) {
+        addActivity('state', { from: 'clipboard', to: 'XML URL copied' });
+      } else {
+        showError(`Copy failed — URL: ${url}`);
+      }
     } catch (err) {
       showError(`Copy failed: ${err.message}`);
     }

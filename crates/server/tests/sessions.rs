@@ -33,7 +33,15 @@ impl LlmProvider for StubLlm {
         &self,
         _req: GenerateRequest,
     ) -> Result<LlmResponse<String>, ProviderError> {
-        unimplemented!()
+        // Canned response so a generate call can record a version+summary
+        // for the session-list title test.
+        Ok(LlmResponse {
+            content: "<mxfile/>".to_string(),
+            usage: drawio_agent_llm_client::Usage::default(),
+            raw: serde_json::Value::Null,
+            duration_ms: 0,
+            finish_reason: None,
+        })
     }
 
     async fn generate_streaming(
@@ -345,3 +353,124 @@ async fn review_returns_501_for_unknown_session() {
 // Reference imports we don't actually use yet (silence warnings).
 #[allow(dead_code)]
 fn _phantom(_g: GenReq, _p: PatchReq, _r: RevReq, _id: Uuid) {}
+
+// ---------------------------------------------------------------------------
+// GET /api/sessions (session list for the dropdown)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_sessions_returns_200_with_empty_array_when_none() {
+    let app = router(test_state());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 4096)
+        .await
+        .unwrap();
+    let sessions: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert!(sessions.is_empty(), "no sessions → empty array");
+}
+
+#[tokio::test]
+async fn list_sessions_includes_created_session() {
+    let app = router(test_state());
+    let sid = create_session_id(app.clone()).await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 8192)
+        .await
+        .unwrap();
+    let sessions: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["id"], sid);
+    assert_eq!(sessions[0]["version_count"], 0, "fresh session has no versions");
+    assert_eq!(sessions[0]["title"], "", "fresh session has no title yet");
+}
+
+#[tokio::test]
+async fn list_sessions_orders_newest_first_and_titles_from_latest_version() {
+    let app = router(test_state());
+    let sid1 = create_session_id(app.clone()).await;
+    // Ensure the two sessions have distinct created_at timestamps so the
+    // newest-first ordering is deterministic.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let sid2 = create_session_id(app.clone()).await;
+
+    // Give sid2 (the newer session) a generate so it has a summary title.
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid2}/generate"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&GenReq {
+                        prompt: "draw a tiny box".into(),
+                        json_mode: false,
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 8192)
+        .await
+        .unwrap();
+    let sessions: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(sessions.len(), 2);
+    // Newest first: sid2 (created after sid1) is first.
+    assert_eq!(sessions[0]["id"], sid2, "newest session must come first");
+    assert_eq!(sessions[0]["title"], "draw a tiny box");
+    assert_eq!(sessions[0]["version_count"], 1);
+    assert_eq!(sessions[1]["id"], sid1);
+}
+
+async fn create_session_id(app: axum::Router) -> String {
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&CreateSessionRequest::default()).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), 4096)
+        .await
+        .unwrap();
+    let parsed: CreateSessionResponse = serde_json::from_slice(&body).unwrap();
+    parsed.session_id.as_str().to_string()
+}
