@@ -57,6 +57,14 @@ button.secondary:hover { background:#252a36; }
 .send-btn:disabled { opacity:.4; cursor:not-allowed; box-shadow:none; }
 .send-btn svg { transform:rotate(45deg); }
 
+.refine-hint { display:flex; align-items:center; gap:.55rem; padding:.5rem .7rem; border-radius:6px; background:rgba(10,124,185,.1); border:1px solid rgba(10,124,185,.25); border-left:3px solid var(--brand); color:#bae6fd; font-size:.8rem; opacity:0; transform:translateY(-4px); transition:opacity .2s ease, transform .2s ease; }
+.refine-hint[hidden] { display:none; }
+.refine-hint.visible { opacity:1; transform:translateY(0); }
+.refine-hint-icon { flex:none; }
+.refine-hint-text { flex:1; }
+.refine-hint-cta { flex:none; padding:.25rem .6rem; border-radius:999px; background:rgba(10,124,185,.2); color:#e0f2fe; font:inherit; font-size:.75rem; font-weight:600; border:1px solid rgba(10,124,185,.35); cursor:pointer; transition:background .15s ease; }
+.refine-hint-cta:hover { background:var(--brand); border-color:var(--brand); }
+
 .run-status { display:flex; align-items:center; gap:.5rem; font-size:.85rem; color:var(--text-dim); }
 .error-box { padding:.6rem .75rem; border-radius:6px; background:rgba(239,68,68,.12); border:1px solid rgba(239,68,68,.35); color:#fca5a5; font-size:.85rem; }
 

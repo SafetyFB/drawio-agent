@@ -21,6 +21,8 @@
   const promptEl = $('prompt');
   const sendBtn = $('send-btn');
   const thinkingOptions = document.querySelectorAll('.thinking-option');
+  const refineHint = $('refine-hint');
+  const refineHintCta = $('refine-hint-cta');
   const runStatus = $('run-status');
   const runStatusText = $('run-status-text');
   const errorBox = $('error-box');
@@ -145,6 +147,21 @@
       opt.classList.toggle('active', checked);
     });
     updateSendButton();
+    updateRefineHint();
+  }
+
+  function updateRefineHint() {
+    const hasSession = !!currentSessionId;
+    const hasPrompt = !!promptEl.value.trim();
+    const hasXml = !!(currentXml && currentXml.trim());
+    const shouldShow = hasSession && hasPrompt && currentDepth === 'refine' && !hasXml && !isRunning;
+    if (shouldShow) {
+      refineHint.hidden = false;
+      requestAnimationFrame(() => refineHint.classList.add('visible'));
+    } else {
+      refineHint.classList.remove('visible');
+      setTimeout(() => { if (!refineHint.classList.contains('visible')) refineHint.hidden = true; }, 200);
+    }
   }
 
   function updateSelectionState(cellIds) {
@@ -400,6 +417,7 @@
     currentSelection = [];
     updateSelectionState([]);
     updateActionButtons();
+    updateRefineHint();
     if (!xml || !xml.trim()) {
       drawioContainer.style.display = 'none';
       canvasPlaceholder.style.display = 'flex';
@@ -676,6 +694,7 @@
       const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}${endpoint}`, body);
       loadXmlIntoCanvas(result.xml || '');
       promptEl.value = '';
+      updateRefineHint();
       await loadSessionList();
       if (isRefine) {
         if (result.converged) {
@@ -822,6 +841,10 @@
     thinkingOptions.forEach(opt => {
       opt.addEventListener('click', () => setDepth(opt.dataset.depth));
     });
+    refineHintCta.addEventListener('click', () => {
+      setDepth('fast');
+      promptEl.focus();
+    });
     btnExportPng.addEventListener('click', exportPng);
     downloadSvgBtn.addEventListener('click', downloadSvg);
     copyXmlUrlBtn.addEventListener('click', copyXmlUrl);
@@ -846,7 +869,7 @@
         runSend();
       }
     });
-    promptEl.addEventListener('input', updateSendButton);
+    promptEl.addEventListener('input', () => { updateSendButton(); updateRefineHint(); });
 
     canvasToolPan.addEventListener('click', () => setCanvasMode('pan'));
     canvasToolSelect.addEventListener('click', () => setCanvasMode('select'));
@@ -904,6 +927,7 @@
       const id = hashSession();
       if (id) await selectSession(id);
     }
+    updateRefineHint();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
