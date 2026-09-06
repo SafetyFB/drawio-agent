@@ -19,8 +19,8 @@
   const canvasOverlay = $('canvas-overlay');
   const canvasOverlayText = $('canvas-overlay-text');
   const promptEl = $('prompt');
-  const generateBtn = $('generate-btn');
-  const loopBtn = $('loop-btn');
+  const sendBtn = $('send-btn');
+  const thinkingOptions = document.querySelectorAll('.thinking-option');
   const runStatus = $('run-status');
   const runStatusText = $('run-status-text');
   const errorBox = $('error-box');
@@ -45,6 +45,7 @@
   let activityEntries = [];
   let currentSelection = [];
   let currentGraph = null;
+  let currentDepth = 'fast';
   // Canvas interaction mode: 'pan' (default) or 'select' (rubber-band marquee).
   let canvasMode = 'pan';
   // In-progress rubber band, in raw client (viewport) coordinates.
@@ -115,17 +116,35 @@
     btnExportPng.disabled = !enabled;
     downloadSvgBtn.disabled = !enabled;
     copyXmlUrlBtn.disabled = !enabled;
-    // Run Loop needs a diagram to improve: disable it on empty sessions
-    // (and while a run is already in progress).
-    loopBtn.disabled = !enabled || isRunning;
+    updateSendButton();
+  }
+
+  function canSend() {
+    const hasSession = !!currentSessionId;
+    const hasPrompt = !!promptEl.value.trim();
+    const hasXml = !!(currentXml && currentXml.trim());
+    return hasSession && hasPrompt && !isRunning && (currentDepth === 'fast' || hasXml);
+  }
+
+  function updateSendButton() {
+    sendBtn.disabled = !canSend();
   }
 
   function setRunLoading(on, text = 'running…') {
     isRunning = on;
-    generateBtn.disabled = on;
-    loopBtn.disabled = on;
+    sendBtn.disabled = !canSend();
     runStatus.style.display = on ? 'flex' : 'none';
     runStatusText.textContent = text;
+  }
+
+  function setDepth(depth) {
+    currentDepth = depth === 'refine' ? 'refine' : 'fast';
+    thinkingOptions.forEach(opt => {
+      const checked = opt.dataset.depth === currentDepth;
+      opt.setAttribute('aria-checked', String(checked));
+      opt.classList.toggle('active', checked);
+    });
+    updateSendButton();
   }
 
   function updateSelectionState(cellIds) {
@@ -638,53 +657,37 @@
     }
   }
 
-  async function runGenerate() {
-    if (!currentSessionId) { showError('Select or create a session first.'); return; }
+  async function runSend() {
+    if (!canSend()) return;
     const prompt = promptEl.value.trim();
-    if (!prompt) { showError('Enter a prompt first.'); return; }
     clearError();
-    setRunLoading(true, 'generating…');
-    setLoading(true, 'generating…');
-    try {
-      const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}/generate`, { prompt });
-      loadXmlIntoCanvas(result.xml || '');
-      await loadSessionList();
-    } catch (err) {
-      showError(`Generate failed: ${err.message}`);
-      addActivity('Error', { stage: 'generate', message: err.message });
-    } finally {
-      setRunLoading(false);
-      setLoading(false);
-    }
-  }
+    if (currentDepth === 'refine') clearActivity();
 
-  async function runLoop() {
-    if (!currentSessionId) { showError('Select or create a session first.'); return; }
-    const prompt = promptEl.value.trim();
-    if (!prompt) { showError('Enter a prompt first.'); return; }
-    clearError();
-    clearActivity();
-    setRunLoading(true, 'agent loop running…');
-    setLoading(true, 'agent loop running…');
+    const isRefine = currentDepth === 'refine';
+    const statusText = isRefine ? '🔄 Refining…' : '⚡ Generating…';
+    const loadingText = isRefine ? 'refining…' : 'generating…';
+    setRunLoading(true, statusText);
+    setLoading(true, loadingText);
+
     try {
-      // Pass the canvas's current diagram as initial_xml so the loop skips
-      // the Generate phase and improves exactly what the user sees. When the
-      // canvas is empty `undefined` is sent and the server 400s with a clear
-      // "run /generate first" message.
-      const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}/agent-loop`, {
-        prompt,
-        initial_xml: currentXml || undefined,  // server treats undefined as "no initial XML"
-      });
+      const body = { prompt };
+      if (isRefine && currentXml) body.initial_xml = currentXml;
+      const endpoint = isRefine ? '/agent-loop' : '/generate';
+      const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}${endpoint}`, body);
       loadXmlIntoCanvas(result.xml || '');
+      promptEl.value = '';
       await loadSessionList();
-      if (result.converged) {
-        addActivity('StateTransition', { from: 'loop', to: `converged · ${result.iterations} iterations` });
-      } else {
-        addActivity('StateTransition', { from: 'loop', to: `finished · ${result.iterations} iterations · not converged` });
+      if (isRefine) {
+        if (result.converged) {
+          addActivity('StateTransition', { from: 'loop', to: `converged · ${result.iterations} iterations` });
+        } else {
+          addActivity('StateTransition', { from: 'loop', to: `finished · ${result.iterations} iterations · not converged` });
+        }
       }
     } catch (err) {
-      showError(`Agent loop failed: ${err.message}`);
-      addActivity('Error', { stage: 'loop', message: err.message });
+      const label = isRefine ? 'Refine' : 'Generate';
+      showError(`${label} failed: ${err.message}`);
+      addActivity('Error', { stage: currentDepth, message: err.message });
     } finally {
       setRunLoading(false);
       setLoading(false);
@@ -815,8 +818,10 @@
     });
 
     newSessionBtn.addEventListener('click', createSession);
-    generateBtn.addEventListener('click', runGenerate);
-    loopBtn.addEventListener('click', runLoop);
+    sendBtn.addEventListener('click', runSend);
+    thinkingOptions.forEach(opt => {
+      opt.addEventListener('click', () => setDepth(opt.dataset.depth));
+    });
     btnExportPng.addEventListener('click', exportPng);
     downloadSvgBtn.addEventListener('click', downloadSvg);
     copyXmlUrlBtn.addEventListener('click', copyXmlUrl);
@@ -834,6 +839,14 @@
         patchSelected();
       }
     });
+
+    promptEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        runSend();
+      }
+    });
+    promptEl.addEventListener('input', updateSendButton);
 
     canvasToolPan.addEventListener('click', () => setCanvasMode('pan'));
     canvasToolSelect.addEventListener('click', () => setCanvasMode('select'));
