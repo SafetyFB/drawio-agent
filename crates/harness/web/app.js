@@ -161,14 +161,23 @@ canvasEl.addEventListener('pointerdown', (e) => {
   if (e.button !== 0 || !currentGraph || busy) return;
 
   if (canvasMode === 'pan') {
-    // 自实现拖拽平移：容器像素差 / scale → view.translate 增量
+    // 自实现拖拽平移：用 fork 的正确原语 scaleAndTranslate（更新
+    // translate + revalidate 状态），保持"渲染/状态/命中检测"三者同步；
+    // 不用 refresh()（它清空全部 state 且触发 SIZE 事件，是副作用来源）。
     const v = currentGraph.view;
     const startX = e.clientX, startY = e.clientY;
     const t0 = { x: v.translate.x, y: v.translate.y };
+    let raf = 0;
     const onMove = (ev) => {
-      v.translate.x = t0.x + (ev.clientX - startX) / v.scale;
-      v.translate.y = t0.y + (ev.clientY - startY) / v.scale;
-      currentGraph.refresh();
+      if (raf) return; // rAF 节流：每帧最多一次
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        v.scaleAndTranslate(
+          v.scale,
+          t0.x + (ev.clientX - startX) / v.scale,
+          t0.y + (ev.clientY - startY) / v.scale
+        );
+      });
     };
     const onUp = () => {
       window.removeEventListener('pointermove', onMove);
