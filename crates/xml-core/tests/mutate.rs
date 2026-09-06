@@ -90,6 +90,7 @@ fn apply_inserts_new_primary_cell() {
         primary: vec![new_cell.clone()],
         edges: vec![],
         context: vec![],
+        parents: vec![],
         missing: vec![],
     };
 
@@ -245,6 +246,7 @@ fn apply_reports_context_count_even_when_primary_empty() {
         primary: vec![],
         edges: vec![],
         context: vec![Cell::new("3")],
+        parents: vec![],
         missing: vec![],
     };
 

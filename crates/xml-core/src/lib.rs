@@ -46,7 +46,9 @@ impl MxGraphModel {
 
     /// Extract a subgraph containing the requested cells and the edges
     /// that connect them. Cells adjacent to the selection via edges are
-    /// returned in `context` (read-only on apply).
+    /// returned in `context` (read-only on apply). Ancestor containers
+    /// (e.g. the swimlane holding a selected cell) are returned in
+    /// `parents` (read-only on apply).
     ///
     /// Requested ids not found in the model are reported in `missing`.
     /// Duplicate ids are deduplicated.
@@ -100,10 +102,34 @@ impl MxGraphModel {
             }
         }
 
+        // Collect ancestor containers of every primary cell (e.g. the
+        // swimlane holding a selected cell). Read-only context for the LLM
+        // so it sees where each cell lives.
+        let mut parents: Vec<Cell> = Vec::new();
+        for cell in &primary {
+            let mut current = cell.parent.as_ref();
+            while let Some(parent_id) = current {
+                if parent_id == "0" || parent_id == "1" {
+                    break; // skip synthetic root and default layer
+                }
+                if let Some(p) = self.get(parent_id) {
+                    if !parents.iter().any(|x| x.id == p.id)
+                        && !primary.iter().any(|x| x.id == p.id)
+                    {
+                        parents.push(p.clone());
+                    }
+                    current = p.parent.as_ref();
+                } else {
+                    break;
+                }
+            }
+        }
+
         Subgraph {
             primary,
             edges,
             context,
+            parents,
             missing,
         }
     }
@@ -259,10 +285,25 @@ impl std::fmt::Display for ValidationReport {
 fn replace_cell_in_place(root: &mut Cell, id: &str, replacement: &Cell) {
     fn walk(node: &mut Cell, id: &str, replacement: &Cell) -> bool {
         if node.id == id {
-            // Preserve children — they are not part of the subgraph scope.
-            let children = std::mem::take(&mut node.children);
-            *node = replacement.clone();
-            node.children = children;
+            // Keep the original's children byte-identical (they aren't part
+            // of the patch scope), then append any NEW children the
+            // replacement introduced (ids the original didn't have). This
+            // preserves the LLM's freshly-added child cells (e.g. a new
+            // arrow) without duplicating or dropping existing ones.
+            use std::collections::HashSet;
+            let original_children = std::mem::take(&mut node.children);
+            let original_child_ids: HashSet<String> = original_children
+                .iter()
+                .map(|c| c.id.clone())
+                .collect();
+            let mut new_cell = replacement.clone();
+            new_cell.children = original_children;
+            for child in &replacement.children {
+                if !original_child_ids.contains(&child.id) {
+                    new_cell.children.push(child.clone());
+                }
+            }
+            *node = new_cell;
             return true;
         }
         for child in node.children.iter_mut() {
@@ -300,14 +341,76 @@ fn try_insert_under(root: &mut Cell, parent_id: &str, cell: Cell) -> bool {
 
 /// A scope extracted from a model for selection-based editing.
 ///
-/// `primary` and `edges` are mutable on apply; `context` is read-only
-/// context for the LLM and must not be modified on apply.
+/// `primary` and `edges` are mutable on apply; `context` and `parents` are
+/// read-only context for the LLM and must not be modified on apply.
 #[derive(Debug, Clone, Default)]
 pub struct Subgraph {
     pub primary: Vec<Cell>,
     pub edges: Vec<Cell>,
     pub context: Vec<Cell>,
+    /// Ancestor containers of the selected cells (read-only context).
+    pub parents: Vec<Cell>,
     pub missing: Vec<String>,
+}
+
+/// Serialize a [`Subgraph`] to a minimal, self-contained `<mxfile>` document
+/// containing ONLY the subgraph's cells (parents, primary, edges, context)
+/// plus a stub root/layer. Used to build the LLM's patch scope so it never
+/// sees the full diagram.
+///
+/// Cells whose declared `parent` is not part of the subgraph (or is the
+/// synthetic root/layer) are re-homed to the default layer (`id="1"`), so
+/// the document round-trips through [`MxFile::parse`] without dangling
+/// parent references.
+pub fn serialize_subgraph(subgraph: &Subgraph) -> Result<String, SerializeError> {
+    use std::collections::HashSet;
+
+    let mut ids: HashSet<&str> = HashSet::new();
+    for cell in subgraph
+        .parents
+        .iter()
+        .chain(subgraph.primary.iter())
+        .chain(subgraph.edges.iter())
+        .chain(subgraph.context.iter())
+    {
+        ids.insert(cell.id.as_str());
+    }
+
+    let mut root = Cell::new("0");
+    let mut layer = Cell::new("1");
+    layer.parent = Some("0".to_string());
+    root.children.push(layer);
+
+    let mut emit = |cell: &Cell| {
+        let mut c = cell.clone();
+        match &c.parent {
+            Some(p) if p == "0" || p == "1" || ids.contains(p.as_str()) => {}
+            _ => c.parent = Some("1".to_string()),
+        }
+        root.children.push(c);
+    };
+
+    for cell in &subgraph.parents {
+        emit(cell);
+    }
+    for cell in &subgraph.primary {
+        emit(cell);
+    }
+    for cell in &subgraph.edges {
+        emit(cell);
+    }
+    for cell in &subgraph.context {
+        emit(cell);
+    }
+
+    let file = MxFile {
+        diagrams: vec![Diagram {
+            id: "patch".to_string(),
+            name: "Page-1".to_string(),
+            model: Some(MxGraphModel { root }),
+        }],
+    };
+    file.to_xml()
 }
 
 fn find_in<'a>(cell: &'a Cell, id: &str) -> Option<&'a Cell> {

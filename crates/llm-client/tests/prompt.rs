@@ -1,7 +1,8 @@
 //! TDD tests for prompt template rendering.
 
 use drawio_agent_llm_client::{
-    codegen_system_prompt, codegen_user_prompt, review_system_prompt, review_user_prompt,
+    codegen_system_prompt, codegen_user_prompt, patch_system_prompt, review_system_prompt,
+    review_user_prompt,
 };
 
 #[test]
@@ -124,6 +125,34 @@ fn review_user_prompt_handles_empty_checks() {
     // spurious "Focus on these checks:" header for an empty list.
     assert!(!out.contains("- \n"));
     assert!(out.contains("<mxfile/>"));
+}
+
+#[test]
+fn patch_system_prompt_mentions_scope_and_id_preservation() {
+    let p = patch_system_prompt();
+    assert!(!p.is_empty(), "patch system prompt must not be empty");
+    let lower = p.to_lowercase();
+    assert!(
+        lower.contains("scope"),
+        "must mention the <scope> section: {p}"
+    );
+    assert!(
+        lower.contains("id") && lower.contains("preserve"),
+        "must require preserving cell ids: {p}"
+    );
+    assert!(
+        lower.contains("<mxfile>"),
+        "must instruct a complete <mxfile> output: {p}"
+    );
+    assert!(
+        lower.contains("add"),
+        "must address adding new elements: {p}"
+    );
+    // Keep it lean — the prompt is sent on every patch call.
+    assert!(
+        p.split_whitespace().count() < 600,
+        "patch system prompt should be under ~600 tokens"
+    );
 }
 
 #[test]

@@ -20,6 +20,35 @@ Example fragment:
 Output ONLY the XML — no commentary, no markdown fences, no preamble."#
 }
 
+/// System prompt for patching selected cells in an existing diagram.
+///
+/// The LLM receives a `<scope>` section containing ONLY the cells it should
+/// modify (plus their immediate neighborhood), and must return a complete
+/// `<mxfile>` containing just those cells — with ids preserved so the server
+/// can match them back. New children (e.g. an added arrow) are allowed with
+/// fresh ids.
+pub fn patch_system_prompt() -> String {
+    r#"You are a Draw.io XML editor. The user has selected specific cells in an existing
+diagram and asked you to modify them. You will receive a `<scope>` section containing
+ONLY the cells you should change, plus their immediate neighborhood (edges, parent
+containers).
+
+Your job: output a complete <mxfile> document containing ONLY the modified versions of
+the targeted cells. Do NOT include cells that weren't in the scope.
+
+Rules:
+- Preserve cell ids EXACTLY as they appear in the scope (the server matches by id).
+- Preserve cell attributes (style, vertex/edge type, parent) unless the user asked
+to change them.
+- If the user asked to ADD a new element (e.g. 'add an arrow from A to B'), include it
+with a new unique id (e.g. id="100") and parent pointing to the appropriate parent.
+- Output valid Draw.io XML. Wrap in <mxfile host="app.diagrams.net"><diagram
+id="patch" name="Page-1"><mxGraphModel>...</mxGraphModel></diagram></mxfile>.
+
+Output ONLY the <mxfile>...</mxfile> document, no commentary."#
+        .to_string()
+}
+
 /// User prompt for a single XML generation call.
 ///
 /// The raw `user_prompt` is always included. Optional sections are appended in

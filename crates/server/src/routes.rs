@@ -317,16 +317,19 @@ async fn patch(
         .ok_or_else(|| ServerError::BadRequest("no model in current XML".into()))?;
 
     let cell_id_refs: Vec<&str> = req.cell_ids.iter().map(|s| s.as_str()).collect();
-    // (The subgraph itself isn't sent to the LLM in this stub; we send the
-    // full current XML so the LLM stub can respond with a coherent diagram.
-    // A future iteration can serialize the subgraph more compactly.)
-    let _subgraph = model.extract_subgraph(&cell_id_refs);
+    let subgraph = model.extract_subgraph(&cell_id_refs);
+    // Plan B: serialize ONLY the subgraph as the LLM's scope (limited
+    // context). The full diagram is deliberately NOT sent, so the LLM edits
+    // the selected cells in place instead of regenerating coordinates from
+    // scratch.
+    let scope_xml = drawio_agent_xml_core::serialize_subgraph(&subgraph)
+        .map_err(|e| ServerError::Internal(format!("subgraph serialize: {e}")))?;
 
     // 4. Call LLM.
     let llm_req = drawio_agent_llm_client::GenerateRequest {
         user_prompt: format!("Patch: {}", req.instruction),
-        current_xml: Some(current_xml.clone()),
-        scope: Some(current_xml.clone()),
+        current_xml: None,
+        scope: Some(scope_xml),
         feedback: None,
         json_mode: req.json_mode,
     };

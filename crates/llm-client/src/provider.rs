@@ -14,7 +14,9 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::prompt::{codegen_system_prompt, review_system_prompt};
+use crate::prompt::{
+    codegen_system_prompt, codegen_user_prompt, patch_system_prompt, review_system_prompt,
+};
 use crate::transport::{HttpTransport, TransportError};
 use crate::Usage;
 
@@ -183,11 +185,28 @@ impl LlmProvider for OpenAiCompatProvider {
         req: GenerateRequest,
     ) -> Result<LlmResponse<String>, ProviderError> {
         let start = Instant::now();
+        // A `scope` marks a patch call: the LLM sees only the selected
+        // subgraph (plus the patch-specific system prompt) rather than the
+        // full diagram, so it must edit in place instead of regenerating
+        // coordinates from scratch.
+        let (system_msg, user_msg) = if req.scope.is_some() {
+            (
+                patch_system_prompt(),
+                codegen_user_prompt(
+                    &req.user_prompt,
+                    req.current_xml.as_deref(),
+                    req.scope.as_deref(),
+                    req.feedback.as_deref(),
+                ),
+            )
+        } else {
+            (codegen_system_prompt().to_string(), req.user_prompt.clone())
+        };
         let mut body = json!({
             "model": self.config.model,
             "messages": [
-                {"role": "system", "content": codegen_system_prompt()},
-                {"role": "user", "content": req.user_prompt},
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
             ],
         });
         if req.json_mode {
@@ -222,12 +241,25 @@ impl LlmProvider for OpenAiCompatProvider {
         &self,
         req: GenerateRequest,
     ) -> Result<LlmStream, ProviderError> {
+        let (system_msg, user_msg) = if req.scope.is_some() {
+            (
+                patch_system_prompt(),
+                codegen_user_prompt(
+                    &req.user_prompt,
+                    req.current_xml.as_deref(),
+                    req.scope.as_deref(),
+                    req.feedback.as_deref(),
+                ),
+            )
+        } else {
+            (codegen_system_prompt().to_string(), req.user_prompt.clone())
+        };
         let mut body = json!({
             "model": self.config.model,
             "stream": true,
             "messages": [
-                {"role": "system", "content": codegen_system_prompt()},
-                {"role": "user", "content": req.user_prompt},
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
             ],
         });
         if req.json_mode {
