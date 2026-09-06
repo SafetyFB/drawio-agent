@@ -171,28 +171,33 @@ canvasEl.addEventListener('pointerdown', (e) => {
   if (e.button !== 0 || !currentGraph || busy) return;
 
   if (canvasMode === 'pan') {
-    // 自实现拖拽平移：用 fork 的正确原语 scaleAndTranslate（更新
-    // translate + revalidate 状态），保持"渲染/状态/命中检测"三者同步；
-    // 不用 refresh()（它清空全部 state 且触发 SIZE 事件，是副作用来源）。
+    // 拖拽设计（v2）：拖拽期间完全不碰 mxGraph —— 把容器子节点包进
+    // wrapper，只用 CSS transform 移动整层（GPU 合成、瞬时、跨浏览器
+    // 一致）。松开时一次性提交 translate（单次 revalidate），状态与
+    // SVG 同步落位。不存在"状态先走、视觉后追"的错位窗口。
+    const container = currentGraph.container;
+    const wrapper = document.createElement('div');
+    wrapper.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;will-change:transform;';
+    while (container.firstChild) wrapper.appendChild(container.firstChild);
+    container.appendChild(wrapper);
     const v = currentGraph.view;
     const startX = e.clientX, startY = e.clientY;
-    const t0 = { x: v.translate.x, y: v.translate.y };
-    // 每个 pointermove 同步更新：scaleAndTranslate 内部同步 revalidate
-    // （状态）并重绘 SVG（视觉）。Safari 下 SVG 重绘有自己的节奏，
-    // 任何节流都会制造"视觉滞后于状态"的窗口——松开后立刻 shift 点选
-    // 就会命中旧视觉位置的 cell。同步更新则两套坐标永远锁步。
-    const apply = (ev) => {
-      v.scaleAndTranslate(
-        v.scale,
-        t0.x + (ev.clientX - startX) / v.scale,
-        t0.y + (ev.clientY - startY) / v.scale
-      );
+    let dx = 0, dy = 0;
+    const onMove = (ev) => {
+      dx = (ev.clientX - startX) / v.scale;
+      dy = (ev.clientY - startY) / v.scale;
+      wrapper.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
     };
-    const onMove = (ev) => apply(ev);
-    const onUp = (ev) => {
-      apply(ev); // 松开时用最终坐标同步落位
+    const onUp = () => {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      // 提交：unwrap + 单次 scaleAndTranslate
+      wrapper.style.transform = '';
+      while (wrapper.firstChild) container.appendChild(wrapper.firstChild);
+      wrapper.remove();
+      if (dx !== 0 || dy !== 0) {
+        v.scaleAndTranslate(v.scale, v.translate.x + dx, v.translate.y + dy);
+      }
     };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
