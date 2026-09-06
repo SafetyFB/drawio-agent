@@ -29,6 +29,7 @@
   const activityLog = $('activity-log');
   const chatThread = $('chat-thread');
   const promptAttachments = $('prompt-attachments');
+  const regenBtn = $('regen-btn');
   const btnExportPng = $('export-png-btn');
   const downloadSvgBtn = $('download-svg-btn');
   const copyXmlUrlBtn = $('copy-xml-url-btn');
@@ -118,6 +119,7 @@
     btnExportPng.disabled = !enabled;
     downloadSvgBtn.disabled = !enabled;
     copyXmlUrlBtn.disabled = !enabled;
+    regenBtn.hidden = !enabled;
     updateSendButton();
   }
 
@@ -620,7 +622,13 @@
 
   /** Append (or resolve) an agent bubble. Pass an existing element as
    *  `pendingEl` to turn a running placeholder into the final message. */
+  let pendingTimer = null;
+
   function addAgentBubble(kind, text, opts = {}) {
+    if (opts.pendingEl && pendingTimer) {
+      clearInterval(pendingTimer);
+      pendingTimer = null;
+    }
     const el = opts.pendingEl || document.createElement('div');
     el.className = `bubble agent${opts.isError ? ' error' : ''}${opts.pending ? ' pending' : ''}`;
     el.innerHTML = '';
@@ -666,7 +674,16 @@
   }
 
   function runningBubble(text) {
-    return addAgentBubble('system', text, { pending: true });
+    const el = addAgentBubble('system', text, { pending: true });
+    const wait = document.createElement('span');
+    wait.className = 'bubble-meta';
+    el.appendChild(wait);
+    const t0 = Date.now();
+    pendingTimer = setInterval(() => {
+      const secs = Math.round((Date.now() - t0) / 1000);
+      wait.textContent = `⏱ ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
+    }, 1000);
+    return el;
   }
 
   function handleWsMessage(data) {
@@ -756,23 +773,39 @@
     }
   }
 
+  function sendRoute(cellIds) {
+    // Intent routing: what does the user mean, not which toggle is on.
+    //   with selection      -> agent-loop + patch_cell_ids (visual scoped fix)
+    //   has diagram         -> agent-loop (modify the current diagram)
+    //   empty session, deep -> agent-loop without initial (generate + self-review)
+    //   empty session, fast -> /generate (single shot)
+    //   forceRegen          -> /generate (from scratch, replaces canvas)
+    if (cellIds.length) return { endpoint: '/agent-loop', scope: cellIds };
+    if (currentXml && currentXml.trim()) return { endpoint: '/agent-loop' };
+    if (currentDepth === 'refine') return { endpoint: '/agent-loop' };
+    return { endpoint: '/generate' };
+  }
+
   async function runSend() {
     if (!canSend()) return;
+    await sendMessage({ forceRegen: false });
+  }
+
+  /** The single composer path. `forceRegen` = explicit "from scratch"
+   *  (used by the ↺ button); everything else follows intent routing. */
+  async function sendMessage({ forceRegen }) {
     const prompt = promptEl.value.trim();
     const cellIds = currentSelection.slice();
     clearError();
-    if (currentDepth === 'refine') clearActivity();
 
-    // One composer, three backends (until they converge on a chat turn API):
-    //   with a selection reference  -> /patch      (scope: ONLY these cells)
-    //   no reference + refine depth -> /agent-loop (visual self-review loop)
-    //   no reference + fast depth   -> /generate   (single shot from scratch)
-    const isPatch = cellIds.length > 0;
-    const endpoint = isPatch ? '/patch' : (currentDepth === 'refine' ? '/agent-loop' : '/generate');
-    const statusText = isPatch ? '✂ Patching selected…' : (currentDepth === 'refine' ? '🔄 Refining…' : '⚡ Generating…');
-    const loadingText = isPatch ? 'patching selected cells…' : (currentDepth === 'refine' ? 'refining…' : 'generating…');
+    const route = forceRegen ? { endpoint: '/generate' } : sendRoute(cellIds);
+    const isScoped = !!route.scope;
+    const isModify = route.endpoint === '/agent-loop' && currentXml && currentXml.trim() && !isScoped;
+    const isRegen = forceRegen || (route.endpoint === '/generate' && !isScoped);
+    const maxIter = currentDepth === 'refine' ? undefined : 1; // deep=default(3), fast=1 round
+    const loadingText = isScoped ? 'patching selected cells…' : (isRegen ? 'generating…' : (currentXml && currentXml.trim() ? 'refining current diagram…' : 'generating draft + self-review…'));
 
-    setRunLoading(true, statusText);
+    setRunLoading(true, loadingText);
     setLoading(true, loadingText);
     const chipLabel = cellIds.length ? `◎ ${cellIds.length} selected` : null;
     addUserBubble(prompt, chipLabel);
@@ -786,51 +819,54 @@
 
     try {
       const body = { prompt };
-      if (isPatch) {
-        body.cell_ids = cellIds;
-        body.instruction = prompt;
-        delete body.prompt;
-      } else if (currentDepth === 'refine' && currentXml) {
-        body.initial_xml = currentXml;
+      if (route.endpoint === '/agent-loop') {
+        body.max_iterations = maxIter;
+        if (currentXml && currentXml.trim()) body.initial_xml = currentXml;
+        if (isScoped) body.patch_cell_ids = cellIds;
       }
-      const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}${endpoint}`, body);
+      const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}${route.endpoint}`, body);
 
       if (result && result.xml) {
         const noVisualChange = result.xml === currentXml;
         loadXmlIntoCanvas(result.xml);
         if (noVisualChange) {
-          addActivity('StateTransition', { from: endpoint, to: 'no visual change (LLM returned the same XML)' });
+          addActivity('StateTransition', { from: route.endpoint, to: 'no visual change (LLM returned the same XML)' });
         }
       }
 
       // Agent bubble summary.
-      if (isPatch) {
-        addAgentBubble('patch', `已修改选中的 ${cellIds.length} 个 cell（未选中的内容保持原样）`, {
+      const depthNote = currentDepth === 'refine' ? '深度' : '快速';
+      if (isScoped) {
+        const converged = !!result.converged;
+        addAgentBubble('patch', converged
+          ? `已修改选中的 ${cellIds.length} 个 cell（未选中内容保持原样）· ${depthNote}`
+          : `${result.iterations || 1} 轮后未完全收敛，已保留最佳结果（未选中内容保持原样）`, {
+          pendingEl: pendingBubble,
+          reasoning: (result.last_reasoning ? truncateForBubble(result.last_reasoning, 320) : undefined),
+          meta: `v:${(result.version_id || '').slice(0, 8)} · iterations:${result.iterations}`,
+        });
+      } else if (isRegen) {
+        addAgentBubble('generate', '已从头生成新图并载入画布', {
           pendingEl: pendingBubble,
           meta: `v:${(result.version_id || '').slice(0, 8)}`,
         });
-      } else if (currentDepth === 'refine') {
+      } else {
         const converged = !!result.converged;
         const note = result.last_reasoning ? truncateForBubble(result.last_reasoning, 320) : '';
         addAgentBubble('agent-loop', converged
-          ? `✓ 完成 · ${result.iterations} 轮收敛`
+          ? `✓ 完成 · ${result.iterations} 轮${depthNote}自省收敛`
           : `⚠ ${result.iterations} 轮后未收敛（已保留当前最优结果）`, {
           pendingEl: pendingBubble,
           reasoning: note || undefined,
           meta: result.last_verdict ? `verdict: ${result.last_verdict}` : undefined,
         });
-      } else {
-        addAgentBubble('generate', '已生成新图并载入画布', {
-          pendingEl: pendingBubble,
-          meta: `v:${(result.version_id || '').slice(0, 8)}`,
-        });
       }
       await loadSessionList();
     } catch (err) {
-      const label = isPatch ? 'Patch' : (currentDepth === 'refine' ? 'Refine' : 'Generate');
-      showError(`${label} failed: ${err.message}`);
-      addActivity('Error', { stage: currentDepth, message: err.message });
-      addAgentBubble('error', `${label} 失败：${err.message}`, {
+      const labelName = isScoped ? '局部修改' : (isRegen ? '生成' : '深度精修');
+      showError(`${labelName} 失败：${err.message}`);
+      addActivity('Error', { stage: labelName, message: err.message });
+      addAgentBubble('error', `${labelName} 失败：${err.message}`, {
         pendingEl: pendingBubble,
         isError: true,
       });
@@ -981,6 +1017,15 @@
     btnExportPng.addEventListener('click', exportPng);
     downloadSvgBtn.addEventListener('click', downloadSvg);
     copyXmlUrlBtn.addEventListener('click', copyXmlUrl);
+    regenBtn.addEventListener('click', async () => {
+      if (!currentSessionId || !promptEl.value.trim()) {
+        showError('先输入描述，再点「从头画」会忽略当前画布直接生成新图。');
+        promptEl.focus();
+        return;
+      }
+      if (!confirm('从头画会忽略当前画布内容生成一张全新图（历史版本仍保留）。继续？')) return;
+      await sendMessage({ forceRegen: true });
+    });
 
     promptEl.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {

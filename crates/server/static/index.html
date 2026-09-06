@@ -49,19 +49,20 @@
       <div class="composer">
         <div id="prompt-attachments" class="prompt-attachments" hidden></div>
         <label for="prompt" class="panel-label sr-only">Message</label>
-        <textarea id="prompt" rows="3" placeholder="Describe the diagram you want…  (框选节点后会作为引用附加到本条消息)"></textarea>
+        <textarea id="prompt" rows="3" placeholder="描述你想要的图，或对当前图提修改意见…（框选节点会作为引用附加到本条消息）"></textarea>
         <div id="refine-hint" class="refine-hint" hidden aria-live="polite">
           <span class="refine-hint-icon" aria-hidden="true">💡</span>
-          <span class="refine-hint-text">Refine will re-render and replace your current canvas.</span>
-          <button type="button" id="refine-hint-cta" class="refine-hint-cta">Run as Fast</button>
+          <span class="refine-hint-text">🧠 深度：多轮看图自省，模型会反复检查/修复直到自己满意（慢，每轮约 1–3 分钟）。</span>
+          <button type="button" id="refine-hint-cta" class="refine-hint-cta">改用 ⚡ 快速</button>
         </div>
         <div class="send-row">
+          <button type="button" id="regen-btn" class="regen-btn secondary" title="Generate a fresh diagram from scratch (replaces the current canvas)" hidden>↺ 从头画</button>
           <div class="thinking-toggle" role="radiogroup" aria-label="Thinking depth">
             <button type="button" class="thinking-option" data-depth="fast" role="radio" aria-checked="true">
-              <span class="thinking-icon" aria-hidden="true">⚡</span> Fast
+              <span class="thinking-icon" aria-hidden="true">⚡</span> 快速
             </button>
             <button type="button" class="thinking-option" data-depth="refine" role="radio" aria-checked="false">
-              <span class="thinking-icon" aria-hidden="true">🔄</span> Refine
+              <span class="thinking-icon" aria-hidden="true">🧠</span> 深度
             </button>
           </div>
           <button type="button" id="send-btn" class="primary-btn send-btn" disabled>
