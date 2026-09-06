@@ -1,0 +1,398 @@
+(() => {
+  const STATUS_MAP = {
+    disconnected: { cls: 'disconnected', text: 'disconnected' },
+    connecting: { cls: 'connecting', text: 'connecting' },
+    live: { cls: 'live', text: 'live' },
+    closed: { cls: 'closed', text: 'closed' },
+  };
+
+  const ACTIVITY_COLORS = {
+    llm: 'llm', render: 'render', review: 'review', patch: 'patch', state: 'state', error: 'error',
+  };
+
+  const $ = id => document.getElementById(id);
+  const sessionSelect = $('session-select');
+  const newSessionBtn = $('new-session-btn');
+  const statusEl = $('status');
+  const drawioContainer = $('drawio-container');
+  const canvasPlaceholder = $('canvas-placeholder');
+  const canvasOverlay = $('canvas-overlay');
+  const canvasOverlayText = $('canvas-overlay-text');
+  const promptEl = $('prompt');
+  const generateBtn = $('generate-btn');
+  const loopBtn = $('loop-btn');
+  const runStatus = $('run-status');
+  const runStatusText = $('run-status-text');
+  const errorBox = $('error-box');
+  const activityLog = $('activity-log');
+  const previewArea = $('preview-area');
+  const renderMeta = $('render-meta');
+  const downloadSvgBtn = $('download-svg-btn');
+  const copyXmlUrlBtn = $('copy-xml-url-btn');
+
+  let ws = null;
+  let reconnectTimer = null;
+  let reconnectAttempt = 0;
+  let currentSessionId = null;
+  let currentXml = null;
+  let isRunning = false;
+  let activityEntries = [];
+
+  async function api(method, path, body) {
+    const opts = { method, headers: {} };
+    if (body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    const res = await fetch(path, opts);
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = text; }
+    if (!res.ok) {
+      const msg = data && data.message ? data.message : `HTTP ${res.status}`;
+      throw new Error(msg);
+    }
+    return data;
+  }
+
+  function setStatus(state) {
+    const s = STATUS_MAP[state] || STATUS_MAP.disconnected;
+    statusEl.className = `status ${s.cls}`;
+    statusEl.querySelector('.status-text').textContent = s.text;
+    statusEl.setAttribute('aria-label', s.text);
+  }
+
+  function hashSession() {
+    const m = location.hash.match(/^#\/session\/(.+)$/);
+    return m ? decodeURIComponent(m[1]) : '';
+  }
+
+  function setHash(id) {
+    if (!id) { history.replaceState(null, '', location.pathname + location.search); return; }
+    const hash = `#/session/${encodeURIComponent(id)}`;
+    if (location.hash !== hash) location.hash = hash;
+  }
+
+  function showError(msg) {
+    errorBox.textContent = msg;
+    errorBox.style.display = 'block';
+  }
+
+  function clearError() {
+    errorBox.textContent = '';
+    errorBox.style.display = 'none';
+  }
+
+  function setLoading(on, text = 'working…') {
+    canvasOverlay.style.display = on ? 'flex' : 'none';
+    canvasOverlayText.textContent = text;
+  }
+
+  function setRunLoading(on, text = 'running…') {
+    isRunning = on;
+    generateBtn.disabled = on;
+    loopBtn.disabled = on;
+    runStatus.style.display = on ? 'flex' : 'none';
+    runStatusText.textContent = text;
+  }
+
+  function escapeHtml(str) {
+    return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+  }
+
+  function syntaxHighlightXml(xml) {
+    const escaped = escapeHtml(xml);
+    return escaped
+      .replace(/(&lt;\/?)([\w:]+)(.*?)(&gt;)/g, (m, open, tag, attrs, close) => {
+        const coloredAttrs = attrs.replace(/(\s+[\w:-]+)(=)(".*?")/g, '$1<span class="attr">$2</span><span class="val">$3</span>');
+        return `${open}<span class="tag">${tag}</span>${coloredAttrs}${close}`;
+      })
+      .replace(/(&gt;)([^&]+)(&lt;)/g, '$1<span class="text">$2</span>$3');
+  }
+
+  function loadXmlIntoCanvas(xml) {
+    currentXml = xml;
+    drawioContainer.innerHTML = '';
+    if (!xml || !xml.trim()) {
+      drawioContainer.style.display = 'none';
+      canvasPlaceholder.style.display = 'flex';
+      return;
+    }
+    canvasPlaceholder.style.display = 'none';
+    drawioContainer.style.display = 'block';
+
+    // TODO: replace with mxGraph embed once CDN load is reliable.
+    if (typeof window.mxGraph === 'undefined' || typeof window.mxUtils === 'undefined' || typeof window.mxCodec === 'undefined') {
+      drawioContainer.innerHTML = `<pre class="xml-fallback"><code>${syntaxHighlightXml(xml)}</code></pre>`;
+      return;
+    }
+
+    try {
+      const xmlDoc = window.mxUtils.parseXml(xml);
+      if (!xmlDoc) throw new Error('parseXml returned null');
+      const models = xmlDoc.getElementsByTagName('mxGraphModel');
+      if (models.length === 0) throw new Error('no <mxGraphModel> found');
+
+      const model = new window.mxGraphModel();
+      const codec = new window.mxCodec(xmlDoc);
+      codec.decode(models[0], model);
+
+      const graph = new window.mxGraph(drawioContainer, model);
+      graph.setEnabled(false);
+      graph.setPanning(true);
+      graph.centerZoom = true;
+      graph.refresh();
+
+      const bounds = graph.getGraphBounds();
+      const border = 20;
+      graph.view.translate.x = border - bounds.x;
+      graph.view.translate.y = border - bounds.y;
+      graph.refresh();
+    } catch (err) {
+      console.warn('mxGraph render failed, falling back to XML:', err);
+      drawioContainer.innerHTML = `<pre class="xml-fallback"><code>${syntaxHighlightXml(xml)}</code></pre>`;
+    }
+  }
+
+  async function loadSessionList() {
+    try {
+      const sessions = await api('GET', '/api/sessions');
+      const currentVal = sessionSelect.value;
+      sessionSelect.innerHTML = '<option value="">— select a session —</option>';
+      (sessions || []).forEach(s => {
+        const opt = document.createElement('option');
+        opt.value = s.id;
+        opt.textContent = s.id.slice(0, 12) + (s.versions?.length ? ` · ${s.versions.length} version${s.versions.length === 1 ? '' : 's'}` : '');
+        sessionSelect.appendChild(opt);
+      });
+      if (currentVal) sessionSelect.value = currentVal;
+    } catch (err) {
+      console.warn('failed to list sessions:', err);
+    }
+  }
+
+  async function selectSession(id) {
+    if (!id) return;
+    currentSessionId = id;
+    sessionSelect.value = id;
+    setHash(id);
+    clearError();
+    setLoading(true, 'loading session…');
+    closeWs();
+
+    try {
+      const session = await api('GET', `/api/sessions/${encodeURIComponent(id)}`);
+      loadXmlIntoCanvas(session.current_xml || '');
+      await renderPng();
+      connectWs(id);
+    } catch (err) {
+      showError(`Failed to load session: ${err.message}`);
+      setLoading(false);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createSession() {
+    try {
+      const s = await api('POST', '/api/sessions');
+      await loadSessionList();
+      await selectSession(s.session_id);
+    } catch (err) {
+      showError(`Failed to create session: ${err.message}`);
+    }
+  }
+
+  function summarizeEvent(kind, payload) {
+    switch (kind) {
+      case 'LlmCallStarted': return { stage: 'llm', text: `call started · ${payload.prompt_chars ?? '?'} chars` };
+      case 'LlmCallCompleted': return { stage: 'llm', text: `${payload.input_tokens ?? 0}+${payload.output_tokens ?? 0} tok · ${payload.finish_reason ?? 'done'}` };
+      case 'RenderStarted': return { stage: 'render', text: 'render started' };
+      case 'RenderCompleted': return { stage: 'render', text: `ok · ${((payload.bytes || 0) / 1024).toFixed(1)} KB · ${(payload.duration_ms / 1000).toFixed(1)}s` };
+      case 'Error': return { stage: 'error', text: `${payload.stage}: ${payload.message}` };
+      case 'StateTransition': return { stage: 'state', text: `${payload.from ?? '∅'} → ${payload.to}` };
+      default: return { stage: 'state', text: kind };
+    }
+  }
+
+  function addActivity(kind, payload, newest = true) {
+    const summary = summarizeEvent(kind, payload || {});
+    const li = document.createElement('li');
+    if (newest) li.className = 'newest';
+    li.innerHTML = `<span class="activity-chip ${ACTIVITY_COLORS[summary.stage] || 'state'}">${summary.stage}</span><span>${escapeHtml(summary.text)}</span>`;
+    activityLog.appendChild(li);
+    activityEntries.push(li);
+    if (activityEntries.length > 20) {
+      const old = activityEntries.shift();
+      if (old) old.remove();
+    }
+    activityLog.scrollTop = activityLog.scrollHeight;
+    setTimeout(() => li.classList.remove('newest'), 800);
+  }
+
+  function clearActivity() {
+    activityLog.innerHTML = '';
+    activityEntries = [];
+  }
+
+  function handleWsMessage(data) {
+    if (!data || typeof data !== 'object') return;
+    if (data.type === 'trajectory' && data.event) {
+      addActivity(data.event.kind, data.event);
+    } else if (data.type === 'version_created') {
+      addActivity('StateTransition', { from: null, to: `version ${data.version_id}` });
+    } else if (data.type === 'error') {
+      addActivity('Error', { stage: 'server', message: data.message || 'unknown' });
+    }
+  }
+
+  function connectWs(id) {
+    closeWs();
+    setStatus('connecting');
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${proto}//${location.host || '127.0.0.1:8080'}/api/sessions/${encodeURIComponent(id)}/events`;
+    ws = new WebSocket(url);
+    ws.addEventListener('open', () => { reconnectAttempt = 0; setStatus('live'); });
+    ws.addEventListener('message', ev => {
+      try { handleWsMessage(JSON.parse(ev.data)); }
+      catch (err) { console.warn('malformed WS message:', err); }
+    });
+    ws.addEventListener('error', () => setStatus('closed'));
+    ws.addEventListener('close', () => scheduleReconnect(id));
+  }
+
+  function closeWs() {
+    if (ws) { ws.close(); ws = null; }
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    reconnectAttempt = 0;
+  }
+
+  function scheduleReconnect(id) {
+    if (currentSessionId !== id) return;
+    const delay = Math.min(1000 * 2 ** reconnectAttempt, 30000);
+    reconnectAttempt += 1;
+    setStatus('connecting');
+    reconnectTimer = setTimeout(() => connectWs(id), delay);
+  }
+
+  async function renderPng() {
+    if (!currentSessionId) return;
+    try {
+      const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}/render`);
+      previewArea.innerHTML = `<img src="data:image/png;base64,${result.png}" alt="render preview">`;
+      renderMeta.textContent = result.bytes ? `${(result.bytes / 1024).toFixed(1)} KB · ${(result.duration_ms / 1000).toFixed(1)}s` : '';
+      downloadSvgBtn.disabled = false;
+      copyXmlUrlBtn.disabled = false;
+    } catch (err) {
+      previewArea.innerHTML = `<p class="preview-empty">⚠ render failed: ${escapeHtml(err.message)}</p>`;
+      renderMeta.textContent = '';
+    }
+  }
+
+  async function runGenerate() {
+    if (!currentSessionId) { showError('Select or create a session first.'); return; }
+    const prompt = promptEl.value.trim();
+    if (!prompt) { showError('Enter a prompt first.'); return; }
+    clearError();
+    setRunLoading(true, 'generating…');
+    setLoading(true, 'generating…');
+    try {
+      const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}/generate`, { prompt });
+      loadXmlIntoCanvas(result.xml || '');
+      await renderPng();
+      await loadSessionList();
+    } catch (err) {
+      showError(`Generate failed: ${err.message}`);
+    } finally {
+      setRunLoading(false);
+      setLoading(false);
+    }
+  }
+
+  async function runLoop() {
+    if (!currentSessionId) { showError('Select or create a session first.'); return; }
+    const prompt = promptEl.value.trim();
+    if (!prompt) { showError('Enter a prompt first.'); return; }
+    clearError();
+    clearActivity();
+    setRunLoading(true, 'agent loop running…');
+    setLoading(true, 'agent loop running…');
+    try {
+      const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}/agent-loop`, { prompt });
+      loadXmlIntoCanvas(result.xml || '');
+      await renderPng();
+      await loadSessionList();
+      if (result.converged) {
+        addActivity('StateTransition', { from: 'loop', to: `converged · ${result.iterations} iterations` });
+      } else {
+        addActivity('StateTransition', { from: 'loop', to: `finished · ${result.iterations} iterations · not converged` });
+      }
+    } catch (err) {
+      showError(`Agent loop failed: ${err.message}`);
+    } finally {
+      setRunLoading(false);
+      setLoading(false);
+    }
+  }
+
+  function downloadSvg() {
+    if (!currentXml || !currentSessionId) return;
+    const blob = new Blob([currentXml], { type: 'image/svg+xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `drawio-agent-${currentSessionId.slice(0,8)}.svg`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function copyXmlUrl() {
+    if (!currentSessionId) return;
+    try {
+      const versions = await api('GET', `/api/sessions/${encodeURIComponent(currentSessionId)}/versions`);
+      const latest = versions && versions.length ? versions[versions.length - 1].version_id : null;
+      const url = latest
+        ? `${location.origin}/api/sessions/${encodeURIComponent(currentSessionId)}/versions/${encodeURIComponent(latest)}`
+        : `${location.origin}/api/sessions/${encodeURIComponent(currentSessionId)}`;
+      await navigator.clipboard.writeText(url);
+      addActivity('state', { from: 'clipboard', to: 'XML URL copied' });
+    } catch (err) {
+      showError(`Copy failed: ${err.message}`);
+    }
+  }
+
+  async function init() {
+    await loadSessionList();
+
+    sessionSelect.addEventListener('change', () => {
+      const id = sessionSelect.value;
+      if (id) selectSession(id);
+      else { currentSessionId = null; setHash(''); }
+    });
+
+    newSessionBtn.addEventListener('click', createSession);
+    generateBtn.addEventListener('click', runGenerate);
+    loopBtn.addEventListener('click', runLoop);
+    downloadSvgBtn.addEventListener('click', downloadSvg);
+    copyXmlUrlBtn.addEventListener('click', copyXmlUrl);
+
+    window.addEventListener('hashchange', async () => {
+      const id = hashSession();
+      if (id) await selectSession(id);
+      else if (location.hash === '#/new') await createSession();
+    });
+
+    promptEl.focus();
+
+    if (location.hash === '#/new') {
+      await createSession();
+    } else {
+      const id = hashSession();
+      if (id) await selectSession(id);
+    }
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
+})();

@@ -3,65 +3,76 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Trajectory Viewer · drawio-agent</title>
-  <link rel="stylesheet" href="trajectory.css">
+  <title>Draw.io Agent</title>
+  <link rel="stylesheet" href="app.css">
+  <script src="https://www.drawio.com/embed.min.js" async onload="window.drawioEmbedLoaded = true"></script>
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <span class="logo" aria-hidden="true"></span>
-      <h1>Trajectory Viewer</h1>
+      <h1>Draw.io Agent</h1>
     </div>
-    <div class="session-controls">
-      <label for="session-input" class="sr-only">Session ID</label>
-      <input
-        id="session-input"
-        type="text"
-        placeholder="paste a session id"
-        autocomplete="off"
-        spellcheck="false"
-      />
-      <button id="connect-btn" type="button">Connect</button>
-      <div
-        id="status"
-        class="status disconnected"
-        role="status"
-        aria-label="Disconnected"
-      >
+    <div class="session-bar">
+      <label for="session-select" class="sr-only">Session</label>
+      <select id="session-select">
+        <option value="">— select a session —</option>
+      </select>
+      <button id="new-session-btn" type="button">+ new</button>
+      <div id="status" class="status disconnected" role="status" aria-label="Disconnected">
         <span class="status-dot" aria-hidden="true"></span>
         <span class="status-text">disconnected</span>
       </div>
     </div>
-    <p class="hint">
-      Need a session? <code>POST /api/sessions</code> to create one, then paste the id above.
-    </p>
   </header>
 
-  <main id="main">
-    <section id="empty-state" class="empty-state">
-      <h2>Trajectory Viewer</h2>
-      <p>Watch a drawio-agent session unfold in real time.</p>
-      <div class="empty-input">
-        <input
-          id="empty-session-input"
-          type="text"
-          placeholder="paste a session id"
-          autocomplete="off"
-          spellcheck="false"
-        />
-        <button id="empty-connect-btn" type="button">Connect</button>
+  <main class="workspace">
+    <section class="canvas-region" aria-label="Diagram canvas">
+      <div id="drawio-container" class="drawio-container"></div>
+      <div id="canvas-placeholder" class="canvas-placeholder" style="display:none">
+        <p>No diagram yet.</p>
+        <p class="sub">Describe what you want in the AI panel and hit Generate.</p>
+      </div>
+      <div id="canvas-overlay" class="canvas-overlay" style="display:none">
+        <span class="spinner" aria-hidden="true"></span>
+        <span id="canvas-overlay-text">working…</span>
       </div>
     </section>
 
-    <section id="timeline" class="timeline" aria-live="polite" aria-atomic="false"></section>
+    <aside class="ai-panel" aria-label="AI assistant">
+      <label for="prompt" class="panel-label">AI 助手</label>
+      <textarea id="prompt" rows="6" placeholder="Describe the diagram you want…"></textarea>
+      <div class="actions">
+        <button id="generate-btn" type="button">Generate</button>
+        <button id="loop-btn" type="button" class="secondary">Run Loop</button>
+      </div>
+      <div id="run-status" class="run-status" style="display:none">
+        <span class="spinner" aria-hidden="true"></span>
+        <span id="run-status-text">running…</span>
+      </div>
+      <div id="error-box" class="error-box" role="alert" style="display:none"></div>
+
+      <div class="activity-region">
+        <h2 class="panel-label">Activity</h2>
+        <ul id="activity-log" class="activity-log" aria-live="polite" aria-atomic="false"></ul>
+      </div>
+    </aside>
   </main>
 
-  <footer class="footer">
-    <span>drawio-agent v0.1.0</span>
-    <span class="footer-sep" aria-hidden="true">·</span>
-    <span id="bind-addr">127.0.0.1:8080</span>
+  <footer class="preview-bar" aria-label="Render preview">
+    <div class="preview-info">
+      <span class="preview-label">PNG preview</span>
+      <span id="render-meta" class="render-meta"></span>
+    </div>
+    <div class="preview-actions">
+      <button id="download-svg-btn" type="button" disabled>Download SVG</button>
+      <button id="copy-xml-url-btn" type="button" disabled>Copy XML URL</button>
+    </div>
+    <div id="preview-area" class="preview-area">
+      <p class="preview-empty">Render will appear here after generation.</p>
+    </div>
   </footer>
 
-  <script src="trajectory.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>

@@ -94,8 +94,8 @@ async fn static_index_html_is_served_at_root() {
     assert!(ct.starts_with("text/html"), "got content-type {ct}");
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("Trajectory Viewer"),
-        "expected index.html to contain the Trajectory Viewer marker, got: {body}"
+        body.contains("Draw.io Agent"),
+        "expected index.html to contain the Draw.io Agent marker, got: {body}"
     );
 
     let _ = shutdown.send(());
