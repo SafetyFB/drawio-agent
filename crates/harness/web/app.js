@@ -38,6 +38,11 @@ function patchGraphForBundle(graph) {
   if (typeof graph.isTableRow !== 'function') graph.isTableRow = () => false;
   if (typeof graph.isTable !== 'function') graph.isTable = () => false;
   if (typeof graph.getLinksForState !== 'function') graph.getLinksForState = () => [];
+  // drawio 的 Graph 子类才有 getStartEditingCell；基础 mxGraph 没有，
+  // 而 bundle 的 mxCellEditor.startEditing 会调用它 → 双击编辑报错。
+  if (typeof graph.getStartEditingCell !== 'function') {
+    graph.getStartEditingCell = (cell) => cell;
+  }
 }
 
 function loadXmlIntoCanvas(xml) {
@@ -86,6 +91,12 @@ function loadXmlIntoCanvas(xml) {
       setSelection(ids);
     });
 
+    // mini editor：编辑能力默认开启（拖动自实现，避免 fork 移动路径；
+    // resizable/editable 供手柄与双击文字使用）
+    graph.setCellsMovable(false);
+    graph.setCellsResizable(true);
+    graph.setCellsEditable(false); // fork 编辑器焦点/提交不可靠，自实现
+    graph.setConnectable(false);
     const b = graph.getGraphBounds();
     graph.view.translate.x = 24 - b.x;
     graph.view.translate.y = 24 - b.y;
@@ -121,6 +132,21 @@ function applyMode() {
 }
 $('mode-select').onclick = () => { canvasMode = 'select'; applyMode(); };
 $('mode-pan').onclick = () => { canvasMode = 'pan'; applyMode(); };
+$('mode-zoom-in').onclick = () => {
+  if (!currentGraph) return;
+  const rect = currentGraph.container.getBoundingClientRect();
+  zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, 1.2);
+};
+$('mode-zoom-out').onclick = () => {
+  if (!currentGraph) return;
+  const rect = currentGraph.container.getBoundingClientRect();
+  zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, 1 / 1.2);
+};
+$('mode-zoom-100').onclick = () => {
+  if (!currentGraph) return;
+  const b = currentGraph.getGraphBounds();
+  currentGraph.view.scaleAndTranslate(1, 24 - b.x, 24 - b.y);
+};
 
 /// 点内 bbox 命中检测：bundle 的 getCellAt 会漏掉白填充 cell 与嵌套组。
 /// 自顶向下遍历（后绘制者优先），按渲染态边界判定。
@@ -161,18 +187,24 @@ function clientToGraph(clientX, clientY) {
   };
 }
 
-// 关键：capture 阶段阻断 mousedown。Safari/WebKit 不会因 pointerdown 的
-// preventDefault 而抑制兼容 mousedown，mxGraph 自己的 mousedown 处理器
-// （shift 时它会再做一次 toggle）会造成双重选择/抵消。本页交互全部走
-// pointerdown，mxGraph 的鼠标路径不需要；此监听注册于页面加载，早于
-// mxGraph 的 bubble 监听，stopPropagation 可确定性阻止它。
+// 条件式 mousedown 抑制：mxGraph 的输入路径是 mousedown（bundle 注册
+// 的是 mouse 事件），而 WebKit 不会因 pointerdown preventDefault 抑制
+// 兼容 mousedown。我们消费的事件（shift 切换/拖动/框选/平移）必须阻断
+// mxGraph 的 mousedown，否则它会再处理一次（替换选择/抵消 toggle）。
+// 注册于页面加载、早于 mxGraph 的监听，目标阶段先执行。
 canvasEl.addEventListener('mousedown', (e) => {
+  if (!window.__pdHandled) return;
   e.stopPropagation();
   e.preventDefault();
 }, true);
 
 canvasEl.addEventListener('pointerdown', (e) => {
   if (e.button !== 0 || !currentGraph || busy) return;
+  window.__pdHandled = false;
+  setTimeout(() => { window.__pdHandled = false; }, 0);
+  // 文字编辑器等 HTML 输入：完全放行（不启动平移/框选/拖动）
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
 
   if (canvasMode === 'pan') {
     // 拖拽设计（v2）：拖拽期间完全不碰 mxGraph —— 把容器子节点包进
@@ -212,20 +244,28 @@ canvasEl.addEventListener('pointerdown', (e) => {
   const p = clientToGraph(e.clientX, e.clientY);
   let cell = currentGraph.getCellAt(p.x, p.y);
   if (!cell) cell = getCellAtBbox(currentGraph, p.x, p.y);
-  // select 模式
+  // select 模式：cell 交互
   if (cell) {
     if (e.shiftKey) {
-      // Shift 点选：切换该 cell 的选中状态
-      const already = currentGraph.getSelectionCells().some((c) => c === cell);
-      if (already) currentGraph.removeSelectionCell(cell);
+      // fork 的 viewer bundle 没有 shift-toggle：自行实现切换，
+      // 并阻断 mxGraph 的 mousedown 防其替换选择
+      const sel = currentGraph.getSelectionCells();
+      if (sel.some((c) => c === cell)) currentGraph.removeSelectionCell(cell);
       else currentGraph.addSelectionCell(cell);
-    } else {
-      currentGraph.setSelectionCell(cell);
+      window.__pdHandled = true;
+      e.preventDefault();
+      return;
     }
+    // 普通按下：选中（未选时）并开始我们自己的拖动
+    const sel = currentGraph.getSelectionCells();
+    if (!sel.some((c) => c === cell)) currentGraph.setSelectionCell(cell);
+    beginCellDrag(e);
+    window.__pdHandled = true;
     e.preventDefault();
     return;
   }
   // 空白处 → 开始框选（Shift 拉框 = 追加到现有选择）
+  window.__pdHandled = true;
   rubberBand = { x1: e.clientX, y1: e.clientY, x2: e.clientX, y2: e.clientY, additive: !!e.shiftKey };
   rubberBandEl = document.createElement('div');
   rubberBandEl.className = 'rubber-band';
@@ -309,6 +349,184 @@ function setSelection(ids) {
   chip.hidden = false;
   chip.textContent = `已选中 ${ids.length} 个 cell：${ids.join(', ')} —— 将随下一条消息附带`;
   $('sel-note').textContent = `（附带 ${ids.length} 个 cell 引用）`;
+}
+
+// ---------------------------------------------------------------------------
+// mini editor：拖动 cell / 缩放 / 手动改动同步
+// ---------------------------------------------------------------------------
+
+/// 拖动选中 cell（含其子元素整体同位移；edge 跟随端点，不动其几何）
+function beginCellDrag(e) {
+  const v = currentGraph.view;
+  const startX = e.clientX, startY = e.clientY;
+  let moved = 0;
+  const model = currentGraph.getModel();
+  const collect = () => {
+    const sel = currentGraph.getSelectionCells().filter((c) => c && !model.isEdge(c));
+    const set = [];
+    const seen = new Set();
+    const walk = (c) => {
+      if (!c || seen.has(c)) return;
+      seen.add(c);
+      set.push(c);
+      for (let i = 0; i < model.getChildCount(c); i++) walk(model.getChildAt(c, i));
+    };
+    for (const c of sel) walk(c);
+    return set.filter((c) => c.geometry);
+  };
+  let lastX = startX, lastY = startY;
+  const onMove = (ev) => {
+    const ddx = (ev.clientX - lastX) / v.scale;
+    const ddy = (ev.clientY - lastY) / v.scale;
+    lastX = ev.clientX; lastY = ev.clientY;
+    if (ddx === 0 && ddy === 0) return;
+    moved += Math.abs(ddx) + Math.abs(ddy);
+    for (const c of collect()) {
+      c.geometry.x += ddx;
+      c.geometry.y += ddy;
+    }
+    // 同值 scaleAndTranslate 也会触发 revalidate → 重绘
+    v.scaleAndTranslate(v.scale, v.translate.x, v.translate.y);
+  };
+  const onUp = () => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    if (moved > 2) markDirty();
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+}
+
+/// 自实现文字编辑：双击 cell → 覆盖 input（Enter/失焦提交，Esc 取消）
+function startTextEdit(cell) {
+  const st = currentGraph.view.getState(cell);
+  if (!st) return;
+  const input = document.createElement('input');
+  input.className = 'mini-editor';
+  input.value = cell.value || '';
+  const rect = currentGraph.container.getBoundingClientRect();
+  input.style.left = (st.x + 2) + 'px';
+  input.style.top = (st.y + st.height / 2 - 10) + 'px';
+  input.style.width = Math.max(60, st.width - 4) + 'px';
+  canvasEl.appendChild(input);
+  input.focus();
+  input.select();
+  let done = false; // Enter 提交后 blur 会再触发一次 commit
+  const commit = () => {
+    if (done) return;
+    done = true;
+    const v = input.value;
+    input.remove();
+    window.removeEventListener('pointerdown', outside);
+    if (v !== (cell.value || '')) {
+      currentGraph.getModel().setValue(cell, v);
+      currentGraph.view.scaleAndTranslate(
+        currentGraph.view.scale,
+        currentGraph.view.translate.x,
+        currentGraph.view.translate.y
+      ); // 重绘标签
+      markDirty();
+    }
+  };
+  const cancel = () => {
+    if (done) return;
+    done = true;
+    input.remove();
+    window.removeEventListener('pointerdown', outside);
+  };
+  const outside = (ev) => {
+    if (ev.target !== input) commit();
+  };
+  input.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); cancel(); }
+  });
+  input.addEventListener('blur', () => commit());
+  setTimeout(() => window.addEventListener('pointerdown', outside), 0);
+}
+canvasEl.addEventListener('dblclick', (e) => {
+  if (canvasMode !== 'select' || !currentGraph || busy) return;
+  const p = clientToGraph(e.clientX, e.clientY);
+  let cell = currentGraph.getCellAt(p.x, p.y);
+  if (!cell) cell = getCellAtBbox(currentGraph, p.x, p.y);
+  if (!cell) return;
+  e.stopPropagation();
+  e.preventDefault();
+  startTextEdit(cell);
+}, true);
+
+// ctrl/cmd + 滚轮缩放（围绕光标）；画布按钮缩放围绕中心
+function zoomAt(clientX, clientY, factor) {
+  const v = currentGraph.view;
+  const ns = Math.min(4, Math.max(0.25, v.scale * factor));
+  if (ns === v.scale) return;
+  const rect = currentGraph.container.getBoundingClientRect();
+  const cx = clientX - rect.left, cy = clientY - rect.top;
+  v.scaleAndTranslate(
+    ns,
+    v.translate.x + cx / v.scale - cx / ns,
+    v.translate.y + cy / v.scale - cy / ns
+  );
+}
+canvasEl.addEventListener('wheel', (e) => {
+  if (!currentGraph || busy || !(e.ctrlKey || e.metaKey)) return;
+  e.preventDefault();
+  zoomAt(e.clientX, e.clientY, Math.pow(1.1, -Math.sign(e.deltaY)));
+}, { passive: false });
+
+// ---- 手动改动 → 服务端同步（防抖批量） ----
+let currentXml = '';
+let dirty = false;
+let syncTimer = 0;
+function markDirty() {
+  dirty = true;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(syncNow, 600);
+}
+function buildCurrentMxfile() {
+  const codec = new mxCodec();
+  const node = codec.encode(currentGraph.getModel());
+  let modelXml;
+  try {
+    if (typeof XMLSerializer !== 'undefined') modelXml = new XMLSerializer().serializeToString(node);
+    else modelXml = mxUtils.getXml(node);
+  } catch (err) {
+    modelXml = mxUtils.getXml(node);
+  }
+  if (!currentXml) return null;
+  const i = currentXml.indexOf('<mxGraphModel');
+  const j = currentXml.lastIndexOf('</mxGraphModel>');
+  if (i < 0 || j < 0) return null;
+  return currentXml.slice(0, i) + modelXml + currentXml.slice(j + '></mxGraphModel>'.length);
+}
+async function syncNow() {
+  if (!dirty) return;
+  if (busy) {
+    // 任务运行中：稍后重试
+    syncTimer = setTimeout(syncNow, 2000);
+    return;
+  }
+  const xml = buildCurrentMxfile();
+  if (!xml) return;
+  dirty = false;
+  try {
+    const r = await api('/api/manual', { xml });
+    if (r.ok) {
+      currentXml = r.xml;
+      const st = await (await fetch('/api/state')).json();
+      $('cells').textContent = `${st.cells} 个元素 / ${st.lines} 行`;
+      if (!currentGraph) return;
+      // 服务端 canonicalize 可能与本地形态一致；若不一致（理论上不会）
+      // 以服务端为准刷新
+    } else {
+      log('error', '手动改动同步失败: ' + (r.error || ''));
+      dirty = true;
+      // 回退到服务端版本
+      await refreshCanvas();
+    }
+  } catch (err) {
+    dirty = true;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +649,7 @@ async function refreshCanvas(keepView) {
     return;
   }
   const xml = await resp.text();
+  currentXml = xml;
   hidePlaceholder();
   canvasEl.style.display = '';
   loadXmlIntoCanvas(xml);

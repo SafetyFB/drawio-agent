@@ -137,6 +137,7 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
     let app_state = AppState { big: state, cancel };
     let app = Router::new()
         .route("/", get(page))
+        .route("/minimal", get(minimal_page))
         .route("/app.css", get(css))
         .route("/app.js", get(js))
         .route("/vendor/viewer-static.min.js", get(viewer_bundle))
@@ -155,6 +156,7 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
         .route("/api/history", get(api_history_list))
         .route("/api/history/:idx", get(api_history_detail))
         .route("/api/context/load", post(api_context_load))
+        .route("/api/manual", post(api_manual))
         .with_state(app_state);
 
     let addr = format!("127.0.0.1:{port}");
@@ -172,6 +174,30 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
 
 async fn page() -> Html<&'static str> {
     Html(include_str!("../web/index.html"))
+}
+
+/// spike 专用：无任何自定义 JS 的极简 mxGraph 页（测试官方拖动）
+async fn minimal_page() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html><html><head><meta charset="utf-8"></head><body style="margin:0">
+<div id="c" style="position:absolute;inset:0;overflow:hidden;background:#eee;"></div>
+<script src="/vendor/viewer-static.min.js"></script>
+<script>
+const xml = '<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="boxA" value="A" vertex="1" parent="1"><mxGeometry x="40" y="40" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>';
+const doc = mxUtils.parseXml(xml);
+const model = new mxGraphModel();
+const codec = new mxCodec(doc);
+codec.decode(doc.getElementsByTagName('mxGraphModel')[0], model);
+const graph = new mxGraph(document.getElementById('c'), model);
+graph.setEnabled(true);
+graph.setPanning(false);
+graph.setCellsMovable(true);
+graph.setCellsResizable(true);
+graph.setCellsEditable(true);
+window.g = graph;
+</script>
+</body></html>"#,
+    )
 }
 async fn css() -> impl IntoResponse {
     static_text(include_str!("../web/style.css"), "text/css")
@@ -1039,4 +1065,38 @@ async fn api_sessions_delete(
         st.current = None;
     }
     Json(json!({ "ok": true, "note": format!("已删除会话 {name}（文件与历史）") }))
+}
+
+
+// ---------------------------------------------------------------------------
+// mini editor：手动改动同步（防抖批量，任务运行中拒绝）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ManualReq {
+    xml: String,
+}
+
+async fn api_manual(
+    State(st): State<Arc<Mutex<WebState>>>,
+    Json(req): Json<ManualReq>,
+) -> Json<serde_json::Value> {
+    let mut st = st.lock().await;
+    if st.running.is_some() {
+        return Json(json!({ "ok": false, "error": "任务运行中——先点「停止」或等它完成" }));
+    }
+    let Some(cur) = st.current.clone() else { return current_err() };
+    let Some(ss) = st.sessions.get_mut(&cur) else { return busy_err() };
+    let path = ss.doc.path.clone();
+    match XmlDoc::from_text_at(&req.xml, &path) {
+        Ok(d) => {
+            let cells = d.cells.len();
+            let lines = d.canonical().lines().count();
+            ss.doc = d;
+            let _ = ss.doc.save();
+            let _ = history::save_session_state(&ss.doc.path, &ss.stats);
+            Json(json!({ "ok": true, "cells": cells, "lines": lines, "xml": ss.doc.canonical() }))
+        }
+        Err(e) => Json(json!({ "ok": false, "error": format!("同步被拒绝（文件未改动）: {e}") })),
+    }
 }
