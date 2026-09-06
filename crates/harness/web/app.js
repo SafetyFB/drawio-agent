@@ -111,7 +111,7 @@ function applyMode() {
   $('mode-pan').classList.toggle('active', canvasMode === 'pan');
   if (!currentGraph) return;
   if (canvasMode === 'pan') {
-    currentGraph.setPanning(true);
+    currentGraph.setPanning(false); // bundle 的 panningHandler 不可靠，自实现
     currentGraph.setCellsSelectable(false); // 纯导航：拖动平移，不选 cell
   } else {
     currentGraph.setPanning(false);
@@ -159,13 +159,30 @@ function clientToGraph(clientX, clientY) {
 
 canvasEl.addEventListener('pointerdown', (e) => {
   if (e.button !== 0 || !currentGraph || busy) return;
+
+  if (canvasMode === 'pan') {
+    // 自实现拖拽平移：容器像素差 / scale → view.translate 增量
+    const v = currentGraph.view;
+    const startX = e.clientX, startY = e.clientY;
+    const t0 = { x: v.translate.x, y: v.translate.y };
+    const onMove = (ev) => {
+      v.translate.x = t0.x + (ev.clientX - startX) / v.scale;
+      v.translate.y = t0.y + (ev.clientY - startY) / v.scale;
+      currentGraph.refresh();
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    e.preventDefault(); // 同时抑制 mxGraph 的 mouse 兼容事件
+    return;
+  }
+
   const p = clientToGraph(e.clientX, e.clientY);
   let cell = currentGraph.getCellAt(p.x, p.y);
   if (!cell) cell = getCellAtBbox(currentGraph, p.x, p.y);
-
-  if (canvasMode === 'pan') {
-    return; // 交给 mxGraph 平移
-  }
   // select 模式
   if (cell) {
     if (e.shiftKey) {
