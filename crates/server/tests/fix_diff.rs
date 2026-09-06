@@ -369,3 +369,109 @@ async fn empty_diff_with_done_converges_as_noop() {
     }
     assert!(saw_version, "agent-loop endpoint must still store a version");
 }
+
+/// Vision-rejecting model: the first fix_diagram call fails with the exact
+/// gateway wording from the real incident (code 1210 image format error);
+/// the server must retry once WITHOUT the image and converge.
+#[derive(Clone)]
+struct VisionRejectThenAcceptLlm {
+    calls: Arc<std::sync::Mutex<Vec<usize>>>, // image_png.len() per call
+}
+
+impl VisionRejectThenAcceptLlm {
+    fn new() -> Self {
+        Self { calls: Arc::new(std::sync::Mutex::new(Vec::new())) }
+    }
+    fn image_sizes(&self) -> Vec<usize> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for VisionRejectThenAcceptLlm {
+    fn name(&self) -> &str {
+        "vision-reject"
+    }
+    async fn generate_xml(
+        &self,
+        _req: GenerateRequest,
+    ) -> Result<LlmResponse<String>, ProviderError> {
+        unimplemented!()
+    }
+    async fn generate_streaming(
+        &self,
+        _req: GenerateRequest,
+    ) -> Result<LlmStream, ProviderError> {
+        unimplemented!()
+    }
+    async fn review_visual(
+        &self,
+        _req: ReviewRequest,
+    ) -> Result<LlmResponse<ReviewResponse>, ProviderError> {
+        unimplemented!()
+    }
+    async fn fix_diagram(
+        &self,
+        req: drawio_agent_llm_client::FixRequest,
+    ) -> Result<LlmResponse<String>, ProviderError> {
+        self.calls.lock().unwrap().push(req.image_png.len());
+        if !req.image_png.is_empty() {
+            return Err(ProviderError::Provider(
+                r#"transport: http status 400: {"error":{"code":"1210","message":"图片输入格式/解析错误"}}"#
+                    .into(),
+            ));
+        }
+        // Text-only call succeeds with a no-op diff + done (converges).
+        let xml = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel></diagram></mxfile>"#;
+        let content = serde_json::json!({
+            "done": true,
+            "xml": xml,
+            "removed": [],
+            "issues": [],
+            "reasoning": "text-only fix (no visual channel)",
+        })
+        .to_string();
+        Ok(LlmResponse {
+            content,
+            usage: Usage::default(),
+            raw: Value::Null,
+            duration_ms: 0,
+            finish_reason: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn vision_rejection_falls_back_to_text_only_fix() {
+    let llm = Arc::new(VisionRejectThenAcceptLlm::new());
+    let state = state_with(llm.clone(), Arc::new(MockDriver::new()));
+    let app = router(state);
+    let sid = create_session_with_xml(app.clone(), FULL_XML).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{sid}/agent-loop"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"prompt": "polish"}))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "must not fail hard on vision rejection");
+    let body = axum::body::to_bytes(resp.into_body(), 65536)
+        .await
+        .unwrap();
+    let outcome: drawio_agent_agent::AgentOutcome = serde_json::from_slice(&body).unwrap();
+    assert!(outcome.converged(), "text-only fallback must converge: {:?}", outcome.final_phase);
+
+    let sizes = llm.image_sizes();
+    assert_eq!(sizes.len(), 2, "image attempt + text-only retry");
+    assert!(sizes[0] > 0, "first call carries the render");
+    assert_eq!(sizes[1], 0, "retry must be text-only");
+}

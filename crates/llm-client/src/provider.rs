@@ -446,8 +446,10 @@ impl LlmProvider for OpenAiCompatProvider {
         req: FixRequest,
     ) -> Result<LlmResponse<String>, ProviderError> {
         let start = Instant::now();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&req.image_png);
-        let image_url = format!("data:image/png;base64,{encoded}");
+        // An empty image_png is the text-only fallback (used when the
+        // provider rejects image input): no image part is sent and the
+        // prompt tells the model it cannot see the render.
+        let has_image = !req.image_png.is_empty();
         let user_text = fix_user_prompt(
             &req.instruction,
             req.current_xml.as_deref(),
@@ -455,15 +457,22 @@ impl LlmProvider for OpenAiCompatProvider {
             &req.issues,
             &req.checks,
             &req.memory,
+            has_image,
         );
+        let mut user_content = json!([{"type": "text", "text": user_text}]);
+        if has_image {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&req.image_png);
+            let image_url = format!("data:image/png;base64,{encoded}");
+            user_content
+                .as_array_mut()
+                .expect("array")
+                .push(json!({"type": "image_url", "image_url": {"url": image_url}}));
+        }
         let mut body = json!({
             "model": self.config.model,
             "messages": [
                 {"role": "system", "content": fix_system_prompt()},
-                {"role": "user", "content": [
-                    {"type": "text", "text": user_text},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ]},
+                {"role": "user", "content": user_content},
             ],
         });
         // The envelope ({"done", "xml", "issues"}) is required for the loop

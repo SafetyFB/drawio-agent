@@ -257,6 +257,7 @@ pub fn fix_user_prompt(
     issues: &[crate::ReviewIssue],
     checks: &[String],
     memory: &[String],
+    has_image: bool,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -271,9 +272,15 @@ pub fn fix_user_prompt(
         ));
     }
 
-    parts.push(format!(
-        "The rendered image of the current diagram is attached.\nTask: {instruction}"
-    ));
+    if has_image {
+        parts.push(format!(
+            "The rendered image of the current diagram is attached.\nTask: {instruction}"
+        ));
+    } else {
+        parts.push(format!(
+            "NOTE: the visual channel is unavailable for this call (the model/provider              rejected image input), so there is NO rendered image to look at. Base your              changes on the XML alone; do not claim visual verification.\nTask: {instruction}"
+        ));
+    }
 
     if let Some(xml) = current_xml {
         parts.push(format!("Current XML (full diagram state):\n{xml}"));

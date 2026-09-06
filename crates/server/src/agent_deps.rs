@@ -76,14 +76,46 @@ impl AgentDeps for ServerAgentDeps {
             .fix_diagram(ProviderFixRequest {
                 instruction: req.instruction.clone(),
                 current_xml: scope_xml.is_none().then(|| req.xml.clone()),
-                scope_xml,
+                scope_xml: scope_xml.clone(),
                 issues: prior_issues,
                 checks: req.checks.clone(),
                 image_png: req.image_png.clone(),
                 memory: req.memory.clone(),
             })
-            .await
-            .map_err(|e| FixError::Llm(e.to_string()))?;
+            .await;
+        // Vision rejection fallback: when the configured model/provider
+        // refuses image input (e.g. a non-vision model behind an OpenAI-
+        // compatible gateway), retry ONCE without the image so the user can
+        // still get a text-based fix instead of a hard failure. The prompt
+        // tells the model it cannot see the render.
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) if is_vision_rejection(&e) => {
+                tracing::warn!(
+                    error = %e,
+                    "vision input rejected by provider; retrying fix without image"
+                );
+                self.llm
+                    .fix_diagram(ProviderFixRequest {
+                        instruction: req.instruction.clone(),
+                        current_xml: scope_xml.is_none().then(|| req.xml.clone()),
+                        scope_xml,
+                        issues: req.prior_issues.clone(),
+                        checks: req.checks.clone(),
+                        image_png: Vec::new(), // text-only fallback
+                        memory: req.memory.clone(),
+                    })
+                    .await
+                    .map_err(|e2| {
+                        FixError::Llm(format!(
+                            "{e2} (image input was rejected and the text-only retry also failed; \
+                             check that the configured model supports images, or switch to \
+                             Generate/从头画 which never sends images)"
+                        ))
+                    })?
+            }
+            Err(e) => return Err(FixError::Llm(e.to_string())),
+        };
 
         // The assistant content is the JSON envelope; the model is told to
         // always put the full resulting state in `xml`. Parse strictly and
@@ -194,4 +226,14 @@ fn collect_visible_cells(file: &drawio_agent_xml_core::MxFile) -> Vec<drawio_age
         walk(&model.root, &mut out);
     }
     out
+}
+
+/// Best-effort detection that a provider error means "image input not
+/// accepted" (non-vision model / gateway policy), so the caller can retry
+/// without the image. Matches on common gateway wording; anything else is
+/// treated as a real transport/provider failure.
+fn is_vision_rejection(err: &drawio_agent_llm_client::ProviderError) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("image") && (msg.contains("400") || msg.contains("invalid") || msg.contains("parse") || msg.contains("format"))
+        || msg.contains("图片") || msg.contains("1210") || msg.contains("vision")
 }
