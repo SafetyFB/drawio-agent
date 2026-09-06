@@ -19,7 +19,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use crate::chat::OpenAiChat;
+use crate::chat::{Chat, OpenAiChat};
+use crate::config::{self, LlmSettings};
 use crate::engine::Harness;
 use crate::refs;
 use crate::tools::Tools;
@@ -44,7 +45,7 @@ pub async fn serve(path: PathBuf, port: u16) -> Result<(), String> {
     if let Err(e) = doc.save() {
         eprintln!("警告: 保存规范化文件失败: {e}");
     }
-    let chat = OpenAiChat::from_env().ok();
+    let chat = OpenAiChat::from_effective().ok();
     let state = Arc::new(Mutex::new(WebState {
         file: path.display().to_string(),
         doc,
@@ -63,6 +64,8 @@ pub async fn serve(path: PathBuf, port: u16) -> Result<(), String> {
         .route("/api/check", post(api_check))
         .route("/api/undo", post(api_undo))
         .route("/api/reload", post(api_reload))
+        .route("/api/config", get(api_config_get).put(api_config_put))
+        .route("/api/config/test", post(api_config_test))
         .with_state(state);
 
     let addr = format!("127.0.0.1:{port}");
@@ -129,6 +132,7 @@ async fn api_state(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::V
         "cells": st.doc.cells.len(),
         "llm_ready": st.llm_ready(),
         "render": st.tools.render,
+        "config_source": config_source_label(),
     }))
 }
 
@@ -227,6 +231,122 @@ async fn api_reload(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::
             st.doc = d;
             Json(json!({ "ok": true, "cells": st.doc.cells.len() }))
         }
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// LLM settings (config file + hot swap) — same panel semantics as the old UI
+// ---------------------------------------------------------------------------
+
+fn config_source_label() -> &'static str {
+    match config::effective_source() {
+        config::ConfigSource::File => "file",
+        config::ConfigSource::Env => "env",
+        config::ConfigSource::None => "none",
+    }
+}
+
+fn llm_view() -> serde_json::Value {
+    match config::effective_settings() {
+        Some(s) => json!({
+            "kind": "openai-compat",
+            "base_url": s.base_url,
+            "model": s.model,
+            "api_key_masked": s.api_key_masked(),
+        }),
+        None => json!({ "kind": "unconfigured", "base_url": "", "model": "", "api_key_masked": "" }),
+    }
+}
+
+fn config_file_display() -> Option<String> {
+    config::config_file_path().map(|p| p.display().to_string())
+}
+
+async fn api_config_get() -> Json<serde_json::Value> {
+    Json(json!({
+        "llm": llm_view(),
+        "config_file": config_file_display(),
+        "source": config_source_label(),
+        "configured": config::effective_settings().is_some(),
+    }))
+}
+
+/// PUT body. `api_key`: empty string / missing = keep the current key.
+#[derive(Debug, Deserialize)]
+struct ConfigPutReq {
+    base_url: String,
+    model: String,
+    #[serde(default)]
+    api_key: String,
+}
+
+async fn api_config_put(
+    State(st): State<Arc<Mutex<WebState>>>,
+    Json(req): Json<ConfigPutReq>,
+) -> Json<serde_json::Value> {
+    let base_url = req.base_url.trim().to_string();
+    let model = req.model.trim().to_string();
+    if base_url.is_empty() || model.is_empty() {
+        return Json(json!({ "ok": false, "error": "Base URL 与 Model 不能为空" }));
+    }
+    // Empty key on save = keep whatever is effective now.
+    let api_key = if req.api_key.trim().is_empty() {
+        config::effective_settings()
+            .map(|s| s.api_key)
+            .unwrap_or_default()
+    } else {
+        req.api_key.trim().to_string()
+    };
+    let settings = LlmSettings { base_url, model, api_key };
+    let Some(path) = config::config_file_path() else {
+        return Json(json!({ "ok": false, "error": "找不到 config 文件路径（HOME 未设置？）" }));
+    };
+    if let Err(e) = config::save_config_file(&path, &settings) {
+        return Json(json!({ "ok": false, "error": format!("保存失败: {e}") }));
+    }
+    // Hot swap: rebuild the live chat client from what we just saved (file
+    // wins over env once a config exists, mirroring the old server).
+    let mut st = st.lock().await;
+    st.chat = OpenAiChat::from_settings(&settings).ok();
+    Json(json!({
+        "ok": true,
+        "config_file": config_file_display(),
+        "llm": llm_view(),
+        "configured": true,
+    }))
+}
+
+async fn api_config_test(Json(req): Json<ConfigPutReq>) -> Json<serde_json::Value> {
+    let base_url = req.base_url.trim().to_string();
+    let model = req.model.trim().to_string();
+    if base_url.is_empty() || model.is_empty() {
+        return Json(json!({ "ok": false, "error": "先填 Base URL 与 Model" }));
+    }
+    let api_key = if req.api_key.trim().is_empty() {
+        config::effective_settings()
+            .map(|s| s.api_key)
+            .unwrap_or_default()
+    } else {
+        req.api_key.trim().to_string()
+    };
+    let settings = LlmSettings { base_url, model, api_key };
+    let mut chat = match OpenAiChat::from_settings(&settings) {
+        Ok(c) => c,
+        Err(e) => return Json(json!({ "ok": false, "error": e.to_string() })),
+    };
+    let start = std::time::Instant::now();
+    match chat
+        .complete(&[crate::chat::Message::user("Reply with exactly: pong")])
+        .await
+    {
+        Ok(reply) => Json(json!({
+            "ok": true,
+            "ms": start.elapsed().as_millis(),
+            "model": settings.model,
+            "reply": reply.trim(),
+        })),
         Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }
 }

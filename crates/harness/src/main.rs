@@ -46,10 +46,15 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!(
-            "用法:\n  drawio-harness <file> [one-shot 对话消息…]    本地 REPL\n  drawio-harness new <file>                      创建空图\n  drawio-harness web <file> [port]               浏览器画布 + 框选 + 聊天 (默认 8787)"
+            "用法:\n  drawio-harness <file> [one-shot 消息…]      本地 REPL\n  drawio-harness new <file>                       创建空图\n  drawio-harness web <file> [port]                浏览器画布 + 框选 + 聊天 (默认 8787)\n  drawio-harness config show|set|clear|path      查看/保存 LLM 配置 (~/.drawio-agent/config.json)"
         );
         std::process::exit(2);
     }
+    if args[0] == "config" {
+        config_cli(&args[1..]);
+        return;
+    }
+
     if args[0] == "web" {
         if args.len() < 2 {
             eprintln!("用法: drawio-harness web <file> [port]");
@@ -72,7 +77,7 @@ fn main() {
         return;
     }
 
-    let (mut path, one_shot_args) = if args[0] == "new" {
+    let (path, one_shot_args) = if args[0] == "new" {
         // drawio-harness new <file> [one-shot 消息…]
         let Some(file) = args.get(1) else {
             eprintln!("用法: drawio-harness new <file>");
@@ -112,14 +117,12 @@ fn main() {
     }
     print_doc_summary(&doc);
 
-    let chat: Option<OpenAiChat> = match OpenAiChat::from_env() {
+    let chat: Option<OpenAiChat> = match OpenAiChat::from_effective() {
         Ok(c) => Some(c),
         Err(_) => None,
     };
     if chat.is_none() {
-        println!(
-            "提示: 未检测到 DRAWIO_LLM_BASE_URL / DRAWIO_LLM_MODEL（可用 DRAWIO_LLM_API_KEY 选填），进入本地工具模式。"
-        );
+        println!("提示: LLM 未配置。配置方式: drawio-harness config set --base-url … --model …，或用 DRAWIO_LLM_BASE_URL / DRAWIO_LLM_MODEL / DRAWIO_LLM_API_KEY 环境变量。当前进入本地工具模式（/view /check /xml /sel 仍可用）。");
     }
 
     let harness = Harness::default();
@@ -263,6 +266,116 @@ fn main() {
 
         if one_shot {
             break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `drawio-harness config` subcommand
+// ---------------------------------------------------------------------------
+
+fn config_cli(args: &[String]) {
+    use drawio_harness::config;
+    let cmd = args.first().map(|s| s.as_str()).unwrap_or("show");
+    match cmd {
+        "show" => match config::effective_settings() {
+            Some(s) => {
+                let source = match config::effective_source() {
+                    config::ConfigSource::File => "配置文件",
+                    config::ConfigSource::Env => "环境变量",
+                    config::ConfigSource::None => "无",
+                };
+                println!("来源: {source}");
+                if let Some(p) = config::config_file_path() {
+                    if p.exists() {
+                        println!("文件: {}", p.display());
+                    }
+                }
+                println!("base_url: {}", s.base_url);
+                println!("model:    {}", s.model);
+                println!("api_key:  {}", s.api_key_masked());
+            }
+            None => {
+                eprintln!("未配置 LLM。保存方式: drawio-harness config set --base-url <url> --model <model> [--api-key <key>]");
+                std::process::exit(1);
+            }
+        },
+        "set" => {
+            let mut base_url = String::new();
+            let mut model = String::new();
+            let mut api_key: Option<String> = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--base-url" | "-b" => {
+                        i += 1;
+                        if let Some(v) = args.get(i) {
+                            base_url = v.clone();
+                        }
+                    }
+                    "--model" | "-m" => {
+                        i += 1;
+                        if let Some(v) = args.get(i) {
+                            model = v.clone();
+                        }
+                    }
+                    "--api-key" | "-k" => {
+                        i += 1;
+                        if let Some(v) = args.get(i) {
+                            api_key = Some(v.clone());
+                        }
+                    }
+                    other => {
+                        eprintln!("未知参数: {other}");
+                        std::process::exit(2);
+                    }
+                }
+                i += 1;
+            }
+            if base_url.is_empty() || model.is_empty() {
+                eprintln!("需要 --base-url 与 --model（--api-key 可选）");
+                std::process::exit(2);
+            }
+            let mut s = config::effective_settings().unwrap_or_default();
+            s.base_url = base_url.trim_end_matches('/').to_string();
+            s.model = model;
+            if let Some(k) = api_key {
+                s.api_key = k;
+            }
+            match config::config_file_path() {
+                Some(p) => match config::save_config_file(&p, &s) {
+                    Ok(()) => println!("已保存: {}\\nbase_url: {}\\nmodel:    {}\\napi_key:  {}", p.display(), s.base_url, s.model, s.api_key_masked()),
+                    Err(e) => {
+                        eprintln!("保存失败: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                None => {
+                    eprintln!("找不到配置文件路径");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "clear" => match config::config_file_path() {
+            Some(p) if p.exists() => {
+                std::fs::remove_file(&p).expect("删除配置文件失败");
+                println!("已删除 {}", p.display());
+            }
+            Some(p) => {
+                println!("配置文件不存在: {}", p.display());
+            }
+            None => eprintln!("找不到配置文件路径"),
+        },
+        "path" => match config::config_file_path() {
+            Some(p) => println!("{}", p.display()),
+            None => {
+                eprintln!("HOME 未设置");
+                std::process::exit(1);
+            }
+        },
+        other => {
+            eprintln!("未知子命令: {other}（可用: show set clear path）");
+            std::process::exit(2);
         }
     }
 }

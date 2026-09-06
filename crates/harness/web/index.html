@@ -13,6 +13,7 @@
   <span id="cells" class="chip dim">…</span>
   <span id="llm" class="chip dim">…</span>
   <span class="spacer"></span>
+  <button id="settings-btn" class="tool" title="LLM 设置">⚙</button>
   <button id="mode-select" class="tool active">框选</button>
   <button id="mode-pan" class="tool">平移</button>
   <button id="check" class="tool">检查</button>
@@ -20,7 +21,49 @@
   <button id="reload" class="tool">重新加载</button>
 </header>
 <div id="llm-banner" hidden>⚠ LLM 未配置 —— 画布与本地命令可用，聊天不可用。
-  设置 DRAWIO_LLM_BASE_URL / DRAWIO_LLM_MODEL（DRAWIO_LLM_API_KEY 可选）后重启。</div>
+  点右上角 ⚙ 填写并「测试连接」→「保存」即可开始使用（保存到 ~/.drawio-agent/config.json）。</div>
+
+<div id="settings-modal" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-head">
+      <h2 id="settings-title">设置 · LLM Provider</h2>
+      <button type="button" id="settings-close" class="icon-btn" aria-label="Close settings">✕</button>
+    </div>
+    <form id="settings-form" class="settings-form">
+      <div id="cfg-current" class="cfg-current">
+        <div class="cfg-current-head">
+          <span class="panel-label">当前生效配置</span>
+        </div>
+        <dl id="cfg-current-body" class="cfg-current-body"></dl>
+      </div>
+      <div id="cfg-demo-hint" class="test-result ok" hidden>
+        尚未配置 LLM Provider（未找到配置文件或环境变量）。<br>
+        填写下方 Base URL / API Key / Model 并点「测试连接」→「保存」即可开始使用。
+      </div>
+      <label class="field">
+        <span>Base URL</span>
+        <input id="cfg-base-url" type="url" placeholder="https://open.bigmodel.cn/api/paas/v4" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="field">
+        <span>API Key（留空 = 保持不变）</span>
+        <input id="cfg-api-key" type="password" placeholder="sk-…" autocomplete="new-password" spellcheck="false">
+      </label>
+      <label class="field">
+        <span>Model</span>
+        <input id="cfg-model" type="text" placeholder="glm-4.6v（多模态模型才能 view 看图）" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="field-static">渲染：本地 chromium · 配置文件：<span id="cfg-file"></span></div>
+      <div id="test-result" class="test-result" hidden></div>
+      <div class="modal-actions">
+        <button type="button" id="cfg-test-btn" class="secondary">测试连接</button>
+        <span class="spacer"></span>
+        <button type="button" id="cfg-cancel-btn" class="secondary">取消</button>
+        <button type="submit" id="cfg-save-btn" class="primary-btn">保存</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <main>
   <div id="canvas-wrap">
     <div id="canvas"></div>

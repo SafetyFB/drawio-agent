@@ -69,3 +69,45 @@ textarea:focus { outline: none; border-color: var(--accent); }
   margin: 6px 10px 0; padding: 5px 10px; border: 1px solid var(--accent);
   border-radius: 8px; font-size: 12px; color: var(--accent);
 }
+
+/* ---- settings modal ---- */
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55);
+  display: flex; align-items: center; justify-content: center; z-index: 50;
+}
+.modal {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  width: 460px; max-width: calc(100vw - 40px); max-height: 90vh; overflow-y: auto;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid var(--line);
+}
+.modal-head h2 { margin: 0; font-size: 15px; }
+.icon-btn {
+  background: none; border: none; color: var(--dim); font-size: 16px; padding: 2px 8px;
+}
+.icon-btn:hover { color: var(--fg); border: none; }
+.settings-form { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+.panel-label { color: var(--dim); font-size: 12px; }
+.cfg-current { background: #12141a; border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+.cfg-current-body { margin: 6px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 14px; }
+.cfg-current-body dt { color: var(--dim); }
+.cfg-current-body dd { margin: 0; word-break: break-all; }
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field > span { color: var(--dim); font-size: 12px; }
+.field input {
+  background: #12141a; color: var(--fg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 10px; font: inherit;
+}
+.field input:focus { outline: none; border-color: var(--accent); }
+.field-static { color: var(--dim); font-size: 12px; }
+.test-result {
+  border-radius: 8px; padding: 8px 12px; font-size: 13px; white-space: pre-wrap;
+}
+.test-result.ok { background: #12281c; color: var(--ok); border: 1px solid #1d3a28; }
+.test-result.err { background: #2a1418; color: var(--err); border: 1px solid #431f26; }
+.modal-actions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+button.secondary { background: #242836; }
+button.primary-btn { background: var(--accent); color: #fff; border: none; }

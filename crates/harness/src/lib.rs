@@ -6,6 +6,7 @@
 #![warn(rust_2018_idioms)]
 
 pub mod chat;
+pub mod config;
 pub mod engine;
 pub mod refs;
 pub mod tools;
@@ -13,6 +14,7 @@ pub mod web;
 pub mod xmlfile;
 
 pub use chat::{Chat, ChatError, Message, OpenAiChat};
+pub use config::{LlmSettings, mask_secret};
 pub use engine::{parse_envelope, Harness, TurnOutcome};
 pub use refs::{resolve_refs, ResolvedRef};
 pub use tools::Tools;

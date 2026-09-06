@@ -76,8 +76,8 @@ impl Message {
 
 #[derive(Debug, Error)]
 pub enum ChatError {
-    #[error("llm endpoint not configured: set DRAWIO_LLM_BASE_URL, DRAWIO_LLM_MODEL, DRAWIO_LLM_API_KEY")]
-    NotConfigured,
+    #[error("llm not configured: {0}")]
+    NotConfigured(String),
     #[error("http: {0}")]
     Http(String),
     #[error("api error: {0}")]
@@ -116,23 +116,30 @@ struct RespMessage {
 }
 
 impl OpenAiChat {
-    /// Read config from the environment; Err when incomplete.
-    pub fn from_env() -> Result<Self, ChatError> {
-        let base_url = std::env::var("DRAWIO_LLM_BASE_URL")
-            .map_err(|_| ChatError::NotConfigured)?;
-        let model = std::env::var("DRAWIO_LLM_MODEL")
-            .map_err(|_| ChatError::NotConfigured)?;
-        let api_key = std::env::var("DRAWIO_LLM_API_KEY")
-            .unwrap_or_default();
+    pub fn from_settings(s: &crate::config::LlmSettings) -> Result<Self, ChatError> {
+        if s.base_url.is_empty() || s.model.is_empty() {
+            return Err(ChatError::NotConfigured(
+                "base_url 与 model 不能为空".into(),
+            ));
+        }
         Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            model,
-            api_key,
+            base_url: s.base_url.trim_end_matches('/').to_string(),
+            model: s.model.clone(),
+            api_key: s.api_key.clone(),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(180))
                 .build()
                 .map_err(|e| ChatError::Http(e.to_string()))?,
         })
+    }
+
+    /// Read the effective configuration (config file first, env fallback).
+    pub fn from_effective() -> Result<Self, ChatError> {
+        crate::config::effective_settings()
+            .ok_or_else(|| {
+                ChatError::NotConfigured(crate::config::UNCONFIGURED_MSG.to_string())
+            })
+            .and_then(|s| Self::from_settings(&s))
     }
 
     pub fn endpoint(&self) -> String {

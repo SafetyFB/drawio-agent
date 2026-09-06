@@ -272,3 +272,112 @@ $('chatform').onsubmit = async (ev) => {
   await refreshCanvas();
   $('input').focus();
 })();
+
+// ---------------------------------------------------------------------------
+// Settings modal (LLM provider config + connection test)
+// ---------------------------------------------------------------------------
+
+const modal = $('settings-modal');
+const form = $('settings-form');
+const cfgBaseUrl = $('cfg-base-url');
+const cfgApiKey = $('cfg-api-key');
+const cfgModel = $('cfg-model');
+const cfgFile = $('cfg-file');
+const cfgBody = $('cfg-current-body');
+const cfgHint = $('cfg-demo-hint');
+const testResult = $('test-result');
+
+function setTestResult(kind, text) {
+  testResult.className = 'test-result ' + kind;
+  testResult.textContent = text;
+  testResult.hidden = false;
+}
+
+function renderCurrentCfg(cfg) {
+  const llm = cfg.llm || { kind: 'unconfigured', base_url: '', model: '', api_key_masked: '' };
+  cfgHint.hidden = !(llm.kind === 'unconfigured');
+  const source = llm.kind === 'unconfigured' ? '未配置' : (cfg.source === 'file' ? '配置文件' : '环境变量');
+  cfgFile.textContent = cfg.config_file || '未持久化';
+  cfgBody.innerHTML = '';
+  const rows = [
+    ['来源', source],
+    ['Base URL', llm.base_url || '—'],
+    ['Model', llm.model || '—'],
+    ['API Key', llm.api_key_masked || '—'],
+    ['配置文件', cfg.config_file || '无'],
+  ];
+  for (const [k, v] of rows) {
+    const dt = document.createElement('dt'); dt.textContent = k;
+    const dd = document.createElement('dd'); dd.textContent = v;
+    cfgBody.append(dt, dd);
+  }
+  cfgBaseUrl.value = llm.base_url || '';
+  cfgModel.value = llm.model || '';
+  cfgApiKey.value = '';
+  cfgApiKey.placeholder = llm.api_key_masked ? `留空 = 保持不变 (${llm.api_key_masked})` : 'sk-…';
+}
+
+async function openSettings() {
+  try {
+    const cfg = await (await fetch('/api/config')).json();
+    renderCurrentCfg(cfg);
+    modal.hidden = false;
+    testResult.hidden = true;
+  } catch (e) { setTestResult('err', '读取配置失败: ' + e); }
+}
+function closeSettings() { modal.hidden = true; }
+
+$('settings-btn').onclick = openSettings;
+$('settings-close').onclick = closeSettings;
+$('cfg-cancel-btn').onclick = closeSettings;
+modal.addEventListener('click', (e) => { if (e.target === modal) closeSettings(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !modal.hidden) closeSettings();
+});
+
+$('cfg-test-btn').onclick = async () => {
+  const payload = {
+    base_url: cfgBaseUrl.value.trim(),
+    model: cfgModel.value.trim(),
+    api_key: cfgApiKey.value.trim(),
+  };
+  if (!payload.base_url || !payload.model) {
+    setTestResult('err', '先填写 Base URL 与 Model');
+    return;
+  }
+  $('cfg-test-btn').disabled = true;
+  setTestResult('ok', '连接中…');
+  try {
+    const r = await api('/api/config/test', payload);
+    if (r.ok) setTestResult('ok', `✓ 连接成功（${r.ms}ms）· ${r.model}\n模型回复: ${r.reply}`);
+    else setTestResult('err', '✗ 连接失败:\n' + (r.error || ''));
+  } catch (e) { setTestResult('err', '网络错误: ' + e); }
+  $('cfg-test-btn').disabled = false;
+};
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const payload = {
+    base_url: cfgBaseUrl.value.trim(),
+    model: cfgModel.value.trim(),
+    api_key: cfgApiKey.value.trim(),
+  };
+  const btn = $('cfg-save-btn');
+  btn.disabled = true;
+  try {
+    const r = await api('/api/config', payload, 'PUT');
+    if (r.ok) {
+      const cfg = await (await fetch('/api/config')).json();
+      renderCurrentCfg(cfg);
+      setTestResult('ok', '✓ 已保存并生效');
+      // refresh header chips / banner
+      const st = await (await fetch('/api/state')).json();
+      $('llm').textContent = st.llm_ready ? 'LLM ✓' : 'LLM ✗';
+      $('llm-banner').hidden = st.llm_ready;
+      closeSettings();
+    } else {
+      setTestResult('err', '保存失败: ' + (r.error || ''));
+    }
+  } catch (err) { setTestResult('err', '网络错误: ' + err); }
+  btn.disabled = false;
+});
