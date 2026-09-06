@@ -42,7 +42,17 @@ function loadXmlIntoCanvas(xml) {
   try {
     const xmlDoc = window.mxUtils.parseXml(xml);
     const models = xmlDoc.getElementsByTagName('mxGraphModel');
-    if (!models.length) throw new Error('no <mxGraphModel> found');
+    if (!models.length) {
+      // Diagnostic instead of a bare "no <mxGraphModel>": corrupted decls or
+      // non-drawio files fail here, and the head of the xml tells the story.
+      const parserErr = xmlDoc.getElementsByTagName('parsererror');
+      const head = xml.slice(0, 200).replace(/\s+/g, ' ');
+      const root = xmlDoc.documentElement ? xmlDoc.documentElement.nodeName : '(parse failed)';
+      throw new Error(
+        `no <mxGraphModel> found (root=${root}${parserErr.length ? ', xml parse error' : ''}). ` +
+        `文件开头: ${head}。若 decl 损坏请重新加载文件（harness 会自动修复），或确认这是 drawio 文件。`
+      );
+    }
     const model = new window.mxGraphModel();
     const codec = new window.mxCodec(xmlDoc);
     codec.decode(models[0], model);

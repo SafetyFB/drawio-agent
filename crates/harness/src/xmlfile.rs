@@ -58,10 +58,10 @@ enum Node {
     CData(String),
     /// Raw comment content (no `<!--` / `-->` markers).
     Comment(String),
-    /// Raw decl content (no `<?xml` / `?>` markers).
-    Decl(String),
     /// Raw PI content (no `<?` / `?>` markers).
     Pi(String),
+    /// XML declaration — normalized on emit (drawio files are UTF-8).
+    Decl,
 }
 
 /// Parse raw XML into a node tree. All events are read up front (owned),
@@ -164,9 +164,14 @@ fn build_node(
                 String::from_utf8_lossy(c.as_ref()).into_owned(),
             )))
         }
-        Event::Decl(d) => {
+        Event::Decl(_) => {
+            // Quick-xml hands us the decl INCLUDING the `xml ` target
+            // prefix in as_ref; re-emitting it verbatim inside `<?xml …?>`
+            // would stack another `xml ` on every save cycle (observed:
+            // `<?xml xml xml xml version="1.0"?>` after four loads). The
+            // declaration is just a marker here; emit a canonical one.
             *i += 1;
-            Ok(Some(Node::Decl(String::from_utf8_lossy(d.as_ref()).into_owned())))
+            Ok(Some(Node::Decl))
         }
         Event::PI(p) => {
             *i += 1;
@@ -278,9 +283,9 @@ impl Emitter {
             Node::Text(t) => self.line(indent, &escape_text(t)),
             Node::CData(raw) => self.line(indent, &format!("<![CDATA[{raw}]]>")),
             Node::Comment(raw) => self.line(indent, &format!("<!--{raw}-->")),
-            Node::Decl(raw) => {
+            Node::Decl => {
                 if self.out.is_empty() {
-                    self.out.push_str(&format!("<?xml {raw}?>\n"));
+                    self.out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
                 }
             }
             Node::Pi(raw) => self.line(indent, &format!("<?{raw}?>")),
@@ -909,6 +914,24 @@ mod tests {
         let opens = c.matches('<').count();
         assert_eq!(c.lines().count(), opens, "one element open per line");
         assert!(n > 12, "expanded beyond one line");
+    }
+
+    #[test]
+    fn decl_never_stacks_and_corrupted_decl_is_repaired() {
+        // Valid decl stays valid and does not multiply across load-save
+        // cycles (each cycle used to add one more `xml ` prefix).
+        let c1 = canonicalize("<?xml version=\"1.0\" encoding=\"UTF-8\"?><mxfile><diagram id=\"d\"/></mxfile>").unwrap();
+        assert!(c1.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"), "{c1}");
+        let c2 = canonicalize(&c1).unwrap();
+        assert_eq!(c1, c2, "second save must not alter the decl");
+        // A file corrupted by the old bug gets repaired in one pass.
+        let bad = "<?xml xml xml xml version=\"1.0\"?><mxfile><diagram id=\"d\"/></mxfile>";
+        let fixed = canonicalize(bad).unwrap();
+        assert!(fixed.starts_with("<?xml version=\"1.0\""), "{fixed}");
+        assert!(!fixed.contains("xml xml xml"));
+        // No decl in the input -> none added (byte-shape stays predictable).
+        let none = canonicalize("<mxfile><diagram id=\"d\"/></mxfile>").unwrap();
+        assert!(!none.starts_with("<?xml"));
     }
 
     #[test]
