@@ -146,14 +146,18 @@ function getCellAtBbox(graph, x, y) {
 // 模式感知的交互：pan = 纯导航；select = 点选 cell / 空白处拉框。
 // 容器级 pointerdown（旧实现的 e.target!==canvas 检查永远命中 SVG，框选
 // 因此从不启动）。
-/// client 坐标 → 图坐标：view.scale / view.translate 必须参与换算。
-/// mxUtils.convertPoint 只减去容器偏移，不含 translate——用它检测会全空。
+/// client 坐标 → 命中检测坐标。
+/// 重要：这个 fork 把 view.translate 直接烤进 state（state.x = 模型坐标
+/// + translate = 容器坐标），getCellAt/getCellAtBbox/hitTestCells 全部
+/// 用容器坐标对 state 比较——因此这里**不能**减 translate（那是经典
+/// mxGraph 的公式；照搬会造成点击偏移 translate 的量，花朵这类
+/// x≈340 的图在加载时 translate≈-316，直接偏出 300+px）。
 function clientToGraph(clientX, clientY) {
   const rect = currentGraph.container.getBoundingClientRect();
   const v = currentGraph.view;
   return {
-    x: (clientX - rect.left) / v.scale - v.translate.x,
-    y: (clientY - rect.top) / v.scale - v.translate.y,
+    x: (clientX - rect.left) / v.scale,
+    y: (clientY - rect.top) / v.scale,
   };
 }
 
