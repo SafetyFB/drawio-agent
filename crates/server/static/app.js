@@ -125,7 +125,7 @@
     const hasSession = !!currentSessionId;
     const hasPrompt = !!promptEl.value.trim();
     const hasXml = !!(currentXml && currentXml.trim());
-    return hasSession && hasPrompt && !isRunning && (currentDepth === 'fast' || hasXml);
+    return hasSession && hasPrompt && !isRunning;
   }
 
   function updateSendButton() {
@@ -151,10 +151,14 @@
   }
 
   function updateRefineHint() {
+    // Refine is now self-contained: it auto-generates a baseline if the
+    // session has no diagram, and refines if there is one. The hint now
+    // warns only when the user is about to *replace* an existing canvas,
+    // so they know their current work will be re-rendered.
     const hasSession = !!currentSessionId;
     const hasPrompt = !!promptEl.value.trim();
     const hasXml = !!(currentXml && currentXml.trim());
-    const shouldShow = hasSession && hasPrompt && currentDepth === 'refine' && !hasXml && !isRunning;
+    const shouldShow = hasSession && hasPrompt && currentDepth === 'refine' && hasXml && !isRunning;
     if (shouldShow) {
       refineHint.hidden = false;
       requestAnimationFrame(() => refineHint.classList.add('visible'));

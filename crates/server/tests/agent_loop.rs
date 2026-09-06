@@ -156,11 +156,14 @@ async fn agent_loop_returns_404_for_unknown_session() {
 }
 
 #[tokio::test]
-async fn agent_loop_returns_400_when_session_has_no_xml() {
+async fn agent_loop_on_empty_session_succeeds() {
+    // Refine is now self-contained: the loop's first step generates a
+    // baseline if the session has no current XML. The previous behavior
+    // was to 400 with 'run /generate first'; that's gone.
     let state = state_with(Arc::new(StubLlm::new()), Arc::new(MockDriver::new()));
     let app = router(state);
 
-    // Empty session (no initial_xml)
+    // Empty session (no initial_xml).
     let resp = app
         .clone()
         .oneshot(
@@ -183,6 +186,7 @@ async fn agent_loop_returns_400_when_session_has_no_xml() {
 
     // Now try the agent-loop without an XML in the request body.
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -196,7 +200,7 @@ async fn agent_loop_returns_400_when_session_has_no_xml() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -379,7 +383,11 @@ async fn agent_loop_rejects_request_without_prompt() {
 }
 
 #[tokio::test]
-async fn agent_loop_400_message_is_actionable() {
+async fn agent_loop_empty_session_auto_generates_baseline() {
+    // Refine is now self-contained: when the session has no current XML,
+    // the loop's first step generates a baseline (via the runner's existing
+    // initial_xml=None handling) instead of 400ing. The user doesn't have
+    // to do a separate /generate first.
     let state = state_with(Arc::new(StubLlm::new()), Arc::new(MockDriver::new()));
     let app = router(state);
 
@@ -405,6 +413,7 @@ async fn agent_loop_400_message_is_actionable() {
     let sid = parsed.session_id.as_str().to_string();
 
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -418,18 +427,44 @@ async fn agent_loop_400_message_is_actionable() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(resp.into_body(), 8192)
+    // Must succeed — Refine is now self-contained.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 65_536)
         .await
         .unwrap();
-    let text = String::from_utf8(body.to_vec()).unwrap();
+    let outcome: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    // The runner returned an AgentOutcome with a non-empty final_xml
+    // (StubLlm's MOCK_DIAGRAM, since the codegen step ran on the empty session).
+    let final_xml = outcome["final_xml"]
+        .as_str()
+        .expect("final_xml must be a string");
     assert!(
-        text.contains("run /generate first"),
-        "message must tell the user what to do: {text}"
+        !final_xml.is_empty() && final_xml.contains("<mxfile"),
+        "loop should have produced a diagram from scratch, got: {final_xml:?}"
     );
+
+    // The session should now have a stored current_xml.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/sessions/{sid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 65_536)
+        .await
+        .unwrap();
+    let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let stored = session["current_xml"]
+        .as_str()
+        .expect("current_xml must be present");
     assert!(
-        text.contains(&sid),
-        "message must include the session id: {text}"
+        !stored.is_empty(),
+        "session should have a stored diagram after the loop, got: {stored:?}"
     );
 }
 
