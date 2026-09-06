@@ -633,9 +633,27 @@ async fn api_chat_stream(
             }
             let _ = tx2.try_send(format!("{line}\n").into_bytes());
         });
-        let outcome = harness
-            .run(chat, tools, doc, &req.text, &ctx, &opts, stats, &Some(progress))
-            .await;
+
+        // 客户端断开监视器：接收端掉线（页面刷新/关闭）即中止引擎并释放
+        // 大锁。Sender::is_closed 与发送无关，模型长时间思考时同样即时。
+        let tx3 = tx.clone();
+        let monitor = async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if tx3.is_closed() {
+                    return;
+                }
+            }
+        };
+        let run_fut = async {
+            harness
+                .run(chat, tools, doc, &req.text, &ctx, &opts, stats, &Some(progress))
+                .await
+        };
+        let outcome = tokio::select! {
+            _ = monitor => Err("客户端已断开（页面刷新/关闭），任务已停止。".to_string()),
+            r = run_fut => r,
+        };
         let (reply, error, tool_calls) = match &outcome {
             Ok(o) => (o.reply.clone(), None, o.tool_calls),
             Err(e) => (String::new(), Some(e.clone()), 0),
@@ -654,31 +672,33 @@ async fn api_chat_stream(
             error,
         };
         let _ = history::append(&history::history_path(&doc.path), &rec);
-        match outcome {
-            Ok(o) => {
-                let _ = tx
-                    .send(
-                        format!(
-                            "{}\n",
-                            json!({
-                                "type": "done",
-                                "tool_calls": o.tool_calls,
-                                "session": json!({
-                                    "in": stats.usage.input_tokens,
-                                    "out": stats.usage.output_tokens,
-                                    "cost_yuan": stats.cost_yuan,
-                                    "budget_yuan": budget_yuan,
-                                }),
-                            })
+        if !tx.is_closed() {
+            match outcome {
+                Ok(o) => {
+                    let _ = tx
+                        .send(
+                            format!(
+                                "{}\n",
+                                json!({
+                                    "type": "done",
+                                    "tool_calls": o.tool_calls,
+                                    "session": json!({
+                                        "in": stats.usage.input_tokens,
+                                        "out": stats.usage.output_tokens,
+                                        "cost_yuan": stats.cost_yuan,
+                                        "budget_yuan": budget_yuan,
+                                    }),
+                                })
+                            )
+                            .into_bytes(),
                         )
-                        .into_bytes(),
-                    )
-                    .await;
-            }
-            Err(e) => {
-                let _ = tx
-                    .send(format!("{}\n", json!({ "type": "error", "error": e })).into_bytes())
-                    .await;
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(format!("{}\n", json!({ "type": "error", "error": e })).into_bytes())
+                        .await;
+                }
             }
         }
         // Clear this job's abort handle, then release the big lock and

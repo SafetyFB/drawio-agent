@@ -308,7 +308,12 @@ function restoreView() {
 
 async function refreshCanvas(keepView) {
   if (keepView) rememberView();
-  const resp = await fetch('/api/file');
+  let resp;
+  try {
+    resp = await fetch('/api/file');
+  } catch (e) {
+    throw e;
+  }
   if (resp.status === 404) {
     setPlaceholder('welcome');
     return;
@@ -459,15 +464,20 @@ $('chatform').onsubmit = async (ev) => {
       }
     }
   } catch (e) {
-    log('error', '网络错误: ' + (e && e.message ? e.message : e));
+    if (!(e && e.name === 'AbortError') && !(e && e.message === 'Load failed')) {
+      log('error', '网络错误: ' + (e && e.message ? e.message : e));
+    }
   } finally {
     busy = false;
     $('send').textContent = '发送';
     $('send').classList.remove('danger');
-    await refreshCanvas();
-    const st = await (await fetch('/api/state')).json();
-    $('cells').textContent = `${st.cells} 个元素 / ${st.lines} 行`;
-    if (st.session) renderUsage(st.session);
+    // 页面刷新/关闭会中断这些 fetch——兜底吞掉，不再产生未处理 rejection
+    try {
+      await refreshCanvas();
+      const st = await (await fetch('/api/state')).json();
+      $('cells').textContent = `${st.cells} 个元素 / ${st.lines} 行`;
+      if (st.session) renderUsage(st.session);
+    } catch (e2) { /* page going away */ }
   }
 };
 
@@ -476,17 +486,22 @@ $('chatform').onsubmit = async (ev) => {
 // ---------------------------------------------------------------------------
 
 (async () => {
-  await loadState();
-  const data = await loadSessions();
-  const list = data.sessions || [];
-  const cur = list.find((x) => x.current);
-  if (cur) {
-    await refreshCanvas();
-  } else if (list.length) {
-    await switchSession(list[0].name, false);
-  } else {
+  try {
+    await loadState();
+    const data = await loadSessions();
+    const list = data.sessions || [];
+    const cur = list.find((x) => x.current);
+    if (cur) {
+      await refreshCanvas();
+    } else if (list.length) {
+      await switchSession(list[0].name, false);
+    } else {
+      setPlaceholder('welcome');
+      $('usage').textContent = '–';
+    }
+  } catch (e) {
     setPlaceholder('welcome');
-    $('usage').textContent = '–';
+    $('placeholder-msg').textContent = '连接服务器失败：' + (e && e.message ? e.message : e);
   }
   $('input').focus();
 })();
