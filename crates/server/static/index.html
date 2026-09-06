@@ -28,6 +28,10 @@
 
   <main class="workspace">
     <section class="canvas-region" aria-label="Diagram canvas">
+      <div class="canvas-toolbar" role="toolbar" aria-label="Canvas tools">
+        <button type="button" id="canvas-tool-pan" class="canvas-tool active" title="Pan mode (drag to move the canvas)" aria-pressed="true">✋</button>
+        <button type="button" id="canvas-tool-select" class="canvas-tool active" title="Select mode (click cells to select)" aria-pressed="true">⊕</button>
+      </div>
       <div id="drawio-container" class="drawio-container"></div>
       <div id="canvas-placeholder" class="canvas-placeholder" style="display:none">
         <p>No diagram yet.</p>

@@ -741,20 +741,33 @@ async fn events(
         // with no events yet must simply wait for the first emit — returning
         // early here would close the socket immediately on an empty session.
         let mut rx = state.events.get_or_create(&session_id).await.subscribe();
+        // Heartbeat ping every 25s: browsers and intermediate proxies close
+        // quiet WebSockets, which made the client status flicker between
+        // "live" and "connecting" on idle sessions. A periodic ping keeps
+        // the connection alive and costs nothing when events are flowing.
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(25));
+        heartbeat.tick().await; // first tick fires immediately; skip it
         // Forward events until the client disconnects or the channel closes.
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    let json = match serde_json::to_string(&event) {
-                        Ok(j) => j,
-                        Err(_) => continue,
-                    };
-                    if socket.send(Message::Text(json)).await.is_err() {
+            tokio::select! {
+                evt = rx.recv() => match evt {
+                    Ok(event) => {
+                        let json = match serde_json::to_string(&event) {
+                            Ok(j) => j,
+                            Err(_) => continue,
+                        };
+                        if socket.send(Message::Text(json)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = heartbeat.tick() => {
+                    if socket.send(Message::Ping(vec![])).await.is_err() {
                         break;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     })

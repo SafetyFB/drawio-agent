@@ -33,6 +33,8 @@
   const selectionClear = $('selection-clear');
   const selectionInstruction = $('selection-instruction');
   const selectionModifyBtn = $('selection-modify-btn');
+  const canvasToolPan = $('canvas-tool-pan');
+  const canvasToolSelect = $('canvas-tool-select');
 
   let ws = null;
   let reconnectTimer = null;
@@ -43,6 +45,10 @@
   let activityEntries = [];
   let currentSelection = [];
   let currentGraph = null;
+  // Track pan/select modes in JS: the old mxGraph bundle has setPanning but
+  // no isPanning(), so we can't read the current state back from the graph.
+  let panEnabled = true;
+  let selectEnabled = true;
 
   async function api(method, path, body) {
     const opts = { method, headers: {} };
@@ -215,8 +221,37 @@
       // The vendored mxGraph bundle predates Graph.prototype.setCellsConnectable;
       // guard it so the canvas doesn't fall back to XML on an older bundle.
       if (typeof graph.setCellsConnectable === 'function') graph.setCellsConnectable(false);
+      graph.setCellsSelectable(true);  // explicit: keep cell selection enabled
       graph.centerZoom = true;
       graph.refresh();
+
+      // Safari/macOS trackpad: mxClient.IS_TOUCH is true on Safari (ontouchstart
+      // exists), so the old mxGraph bundle routes interaction through its touch
+      // path, which is buggy here — two-finger drag pans horizontally only and
+      // taps don't select. touch-action:none stops the browser from hijacking
+      // two-finger drag into page scroll; the single-touch bridge routes taps
+      // through the working mouse path so cells become selectable.
+      graph.container.style.touchAction = 'none';
+      if ('ontouchstart' in window) {
+        graph.container.addEventListener('touchstart', (e) => {
+          if (e.touches.length === 1) {
+            const t = e.touches[0];
+            const me = new MouseEvent('mousedown', {
+              clientX: t.clientX, clientY: t.clientY,
+              bubbles: true, cancelable: true, view: window, button: 0,
+            });
+            graph.container.dispatchEvent(me);
+          }
+        }, { passive: false });
+      }
+
+      // Keep the Pan/Select toolbar in sync with the fresh graph.
+      panEnabled = true;
+      selectEnabled = true;
+      canvasToolPan.classList.add('active');
+      canvasToolSelect.classList.add('active');
+      canvasToolPan.setAttribute('aria-pressed', 'true');
+      canvasToolSelect.setAttribute('aria-pressed', 'true');
 
       graph.getSelectionModel().addListener(window.mxEvent.SELECTION_CHANGED, () => {
         const selected = graph.getSelectionCells();
@@ -342,7 +377,10 @@
       catch (err) { console.warn('malformed WS message:', err); }
     });
     ws.addEventListener('error', () => setStatus('closed'));
-    ws.addEventListener('close', () => scheduleReconnect(id));
+    ws.addEventListener('close', ev => {
+      console.warn(`[drawio] WS closed: code=${ev.code} reason=${ev.reason || '(none)'}`);
+      scheduleReconnect(id);
+    });
   }
 
   function closeWs() {
@@ -373,6 +411,15 @@
       for (let i = 0; i < binary.length; i += 1) {
         bytes[i] = binary.charCodeAt(i);
       }
+
+      // The mock renderer returns a 1×1 white placeholder (69 bytes). Don't
+      // hand the user a blank PNG — tell them how to get a real render.
+      if (bytes.length < 500) {
+        showError(`The server returned a ${bytes.length}-byte placeholder PNG — it is running with the mock renderer. Set DRAWIO_AGENT_RENDERER=chromium for real renders.`);
+        return;
+      }
+      clearError();
+
       const blob = new Blob([bytes], { type: 'image/png' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -580,6 +627,21 @@
         e.preventDefault();
         patchSelected();
       }
+    });
+
+    canvasToolPan.addEventListener('click', () => {
+      if (!currentGraph) return;
+      panEnabled = !panEnabled;
+      currentGraph.setPanning(panEnabled);
+      canvasToolPan.classList.toggle('active', panEnabled);
+      canvasToolPan.setAttribute('aria-pressed', String(panEnabled));
+    });
+    canvasToolSelect.addEventListener('click', () => {
+      if (!currentGraph) return;
+      selectEnabled = !selectEnabled;
+      currentGraph.setCellsSelectable(selectEnabled);
+      canvasToolSelect.classList.toggle('active', selectEnabled);
+      canvasToolSelect.setAttribute('aria-pressed', String(selectEnabled));
     });
 
     window.addEventListener('hashchange', async () => {
