@@ -56,6 +56,14 @@ fn main() {
             std::process::exit(2);
         }
         let path = PathBuf::from(&args[1]);
+        if !path.exists() {
+            eprintln!(
+                "文件不存在: {}。\n  先创建空图: cargo run -p drawio-harness -- new {}",
+                path.display(),
+                path.display()
+            );
+            std::process::exit(2);
+        }
         let port = args.get(2).and_then(|p| p.parse().ok()).unwrap_or(8787);
         if let Err(e) = rt.block_on(drawio_harness::web::serve(path, port)) {
             eprintln!("{e}");
