@@ -2,11 +2,14 @@
 //! serve the embedded static index.html, expose /health and /api,
 //! and shut down cleanly via a oneshot signal.
 
+use std::sync::Arc;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
+use drawio_agent_renderer::MockDriver;
 use drawio_agent_server::{
-    build_app_state, run_server, LlmProviderKind, RendererKind, ServerConfig,
+    build_app_state_with_renderer, run_server, shutdown_signal, LlmSettings, ServerConfig,
 };
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -23,12 +26,18 @@ async fn spawn_server(
     let addr = listener.local_addr().unwrap();
     let base = format!("http://{addr}");
 
-    let state = build_app_state(&ServerConfig {
-        bind_addr: addr,
-        llm_provider: LlmProviderKind::Mock,
-        renderer: RendererKind::Mock,
-        static_dir: Some(static_dir.clone()),
-    })
+    let state = build_app_state_with_renderer(
+        &ServerConfig {
+            bind_addr: addr,
+            static_dir: Some(static_dir.clone()),
+            config_path: None,
+            llm: Some(LlmSettings {
+                kind: drawio_agent_server::LlmKind::Mock,
+                ..Default::default()
+            }),
+        },
+        Some(Arc::new(MockDriver::new())),
+    )
     .await
     .unwrap();
 

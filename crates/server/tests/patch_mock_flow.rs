@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use drawio_agent_server::{
-    build_app_state, build_router, LlmProviderKind, RendererKind, ServerConfig,
-};
+use drawio_agent_llm_client::LlmProvider;
+use drawio_agent_renderer::MockDriver;
+use drawio_agent_server::{build_app_state_with_renderer, build_router, LlmSettings, ServerConfig};
 use tower::ServiceExt;
 
 const CELL_XML: &str = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="2" value="A" vertex="1" parent="1"><mxGeometry x="100" y="100" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
@@ -21,11 +21,18 @@ const CELL_XML: &str = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id
 async fn mock_state() -> Arc<drawio_agent_server::AppState> {
     let config = ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
-        llm_provider: LlmProviderKind::Mock,
-        renderer: RendererKind::Mock,
         static_dir: None,
+        config_path: None,
+        llm: Some(LlmSettings {
+            kind: drawio_agent_server::LlmKind::Mock,
+            ..Default::default()
+        }),
     };
-    build_app_state(&config).await.map(Arc::new).unwrap()
+    let _: Arc<dyn LlmProvider> = Arc::new(drawio_agent_server::StubLlm);
+    build_app_state_with_renderer(&config, Some(Arc::new(MockDriver::new())))
+        .await
+        .map(Arc::new)
+        .unwrap()
 }
 
 fn app(state: Arc<drawio_agent_server::AppState>) -> axum::Router {

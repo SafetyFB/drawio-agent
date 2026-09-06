@@ -6,15 +6,15 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use drawio_agent_llm_client::{
-    HttpTransport, LlmProvider, OpenAiCompatProvider, ProviderConfig, Usage,
+use drawio_agent_llm_client::{HttpTransport, LlmProvider, Usage};
+use drawio_agent_renderer::{HeadlessChromiumDriver, RenderDriver};
+use crate::{
+    build_provider, build_router, config_file_path, effective_settings, mask_secret,
+    AppState, EventBus, RuntimeLlm, SessionStore,
 };
-use drawio_agent_renderer::{HeadlessChromiumDriver, MockDriver, RenderDriver};
-use crate::{build_router, AppState, EventBus, SessionStore};
 use drawio_agent_trajectory::TrajectoryStore;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -28,90 +28,29 @@ pub enum ConfigError {
     Env(#[from] std::env::VarError),
 }
 
-/// Static configuration loaded from environment at startup. Defaults are
-/// chosen so `cargo run` against the repo Just Works with no env vars
-/// (mock LLM, MockDriver renderer, embedded static dir).
+/// Static configuration: bind address, static dir and the path of the
+/// persistent settings file (if any). The LLM provider is resolved at
+/// startup from the settings file → env vars → mock stub, and can be
+/// changed at runtime through the settings UI (`PUT /api/config`).
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind_addr: SocketAddr,
-    pub llm_provider: LlmProviderKind,
-    pub renderer: RendererKind,
     pub static_dir: Option<PathBuf>,
-}
-
-/// Which renderer backend to use.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum RendererKind {
-    /// Canned PNG bytes; deterministic, no browser required.
-    #[default]
-    Mock,
-    /// Real headless Chromium via CDP.
-    Chromium,
-}
-
-impl std::str::FromStr for RendererKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "mock" => Ok(Self::Mock),
-            "chromium" => Ok(Self::Chromium),
-            other => Err(format!("unknown renderer kind: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum LlmProviderKind {
-    Mock,
-    OpenAiCompat {
-        base_url: String,
-        api_key: String,
-        model: String,
-    },
+    pub config_path: Option<std::path::PathBuf>,
+    /// Explicit LLM settings override (tests inject the mock here so they
+    /// never depend on the ambient env). `None` = resolve from config file
+    /// → env → mock.
+    pub llm: Option<crate::llm_config::LlmSettings>,
 }
 
 impl ServerConfig {
-    /// Load from environment. Defaults: 127.0.0.1:8080, Mock LLM,
-    /// `<crate manifest>/static`.
+    /// Load bind addr/static dir from environment. Defaults chosen so
+    /// `cargo run` Just Works: 127.0.0.1:8080, `<manifest>/static`.
     pub fn from_env() -> Result<Self, ConfigError> {
         let bind_addr = std::env::var("DRAWIO_AGENT_BIND")
             .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
             .parse::<SocketAddr>()
             .map_err(|e| ConfigError::BindAddr(e.to_string()))?;
-
-        let llm_provider = match std::env::var("DRAWIO_AGENT_LLM_PROVIDER").as_deref() {
-            Ok("mock") | Err(_) => LlmProviderKind::Mock,
-            Ok("openai_compat") | Ok("openai-compat") => LlmProviderKind::OpenAiCompat {
-                base_url: std::env::var("DRAWIO_AGENT_LLM_BASE_URL")?,
-                api_key: std::env::var("DRAWIO_AGENT_LLM_API_KEY")?,
-                model: std::env::var("DRAWIO_AGENT_LLM_MODEL")?,
-            },
-            Ok(other) => {
-                // Both spelling variants are accepted above; anything else is a
-                // real mistake. Print to stderr as well as tracing: the binary
-                // has no tracing subscriber, so a silent fallback to the mock
-                // LLM previously produced zero-usage trajectories with no
-                // explanation.
-                eprintln!(
-                    "WARNING: unknown DRAWIO_AGENT_LLM_PROVIDER={other} \
-                     (expected 'mock' | 'openai_compat' | 'openai-compat'); \
-                     falling back to the mock LLM"
-                );
-                tracing::warn!(provider = %other, "unknown DRAWIO_AGENT_LLM_PROVIDER, falling back to Mock");
-                LlmProviderKind::Mock
-            }
-        };
-
-        // Renderer: $DRAWIO_AGENT_RENDERER (mock|chromium), default mock.
-        let renderer = match std::env::var("DRAWIO_AGENT_RENDERER") {
-            Ok(s) => s.parse::<RendererKind>().unwrap_or_else(|e| {
-                warn!(renderer = %s, "unknown DRAWIO_AGENT_RENDERER ({e}), falling back to Mock");
-                RendererKind::Mock
-            }),
-            Err(_) => RendererKind::Mock,
-        };
 
         // Static dir: $DRAWIO_AGENT_STATIC_DIR or <manifest>/static.
         let static_dir = match std::env::var("DRAWIO_AGENT_STATIC_DIR") {
@@ -131,81 +70,67 @@ impl ServerConfig {
 
         Ok(Self {
             bind_addr,
-            llm_provider,
-            renderer,
             static_dir,
+            config_path: config_file_path(),
+            llm: None,
         })
     }
 }
 
-/// Build the [`AppState`] from a [`ServerConfig`]. The LLM provider is
-/// the OpenAI-compat implementation when configured, otherwise a
-/// no-op stub that returns `<mxfile/>` for any prompt (useful for
-/// local smoke-testing without API keys).
+/// Build the [`AppState`] from a [`ServerConfig`].
 ///
-/// The renderer is [`HeadlessChromiumDriver`] when configured; launch
-/// failures fall back to [`MockDriver`] so the server still starts.
+/// - LLM provider: resolved from the persistent settings file (if any),
+///   then env vars, then the mock stub; wrapped in a hot-swappable
+///   [`RuntimeLlm`] so the settings UI can change it at runtime.
+/// - Renderer: ALWAYS the bundled headless Chromium shell (mocks exist
+///   only in tests). A launch failure is fatal — silent "blank PNG"
+///   sessions are worse than a clear startup error.
 pub async fn build_app_state(
     config: &ServerConfig,
 ) -> Result<AppState, Box<dyn std::error::Error + Send + Sync>> {
-    let llm: Arc<dyn LlmProvider> = match &config.llm_provider {
-        LlmProviderKind::Mock => {
-            info!(target: "llm", provider = "mock", "using stub LLM");
-            Arc::new(StubLlm)
-        }
-        LlmProviderKind::OpenAiCompat {
-            base_url,
-            api_key,
-            model,
-        } => {
-            // Log the effective endpoint on every start (key masked) so a
-            // misconfigured provider/model is visible in the first log line
-            // instead of surfacing as cryptic upstream errors later.
-            let masked = if api_key.len() > 8 {
-                format!("{}…{}", &api_key[..4], &api_key[api_key.len() - 4..])
-            } else {
-                "***".to_string()
-            };
-            info!(
-                target: "llm",
-                provider = "openai-compat",
-                %base_url,
-                %model,
-                api_key = %masked,
-                "llm provider configured"
-            );
-            let transport: Arc<dyn HttpTransport> = Arc::new(ReqwestHttpTransport);
-            Arc::new(OpenAiCompatProvider::new(
-                transport,
-                ProviderConfig {
-                    base_url: base_url.clone(),
-                    api_key: api_key.clone(),
-                    model: model.clone(),
-                    request_timeout_ms: 60_000,
-                    max_retries: 0,
-                },
-            ))
+    build_app_state_with_renderer(config, None).await
+}
+
+/// [`build_app_state`] with an explicit renderer (tests inject the mock;
+/// the running server always uses the bundled headless Chromium shell).
+pub async fn build_app_state_with_renderer(
+    config: &ServerConfig,
+    renderer_override: Option<Arc<dyn RenderDriver>>,
+) -> Result<AppState, Box<dyn std::error::Error + Send + Sync>> {
+    let settings = match &config.llm {
+        Some(s) => s.clone(),
+        None => effective_settings(config.config_path.as_deref()),
+    };
+    let masked = mask_secret(&settings.api_key);
+    info!(
+        target: "llm",
+        kind = %settings.kind,
+        base_url = %settings.base_url,
+        model = %settings.model,
+        api_key = %masked,
+        "llm provider configured (change it anytime via the settings UI)"
+    );
+    let provider = build_provider(&settings);
+    let llm = Arc::new(RuntimeLlm::new(provider));
+
+    let renderer: Arc<dyn RenderDriver> = match renderer_override {
+        Some(r) => r,
+        None => {
+            info!(target: "renderer", "launching headless chromium (bundled chrome-headless-shell)");
+            let driver = HeadlessChromiumDriver::launch().await?;
+            info!(target: "renderer", "headless chromium launched");
+            Arc::new(driver) as Arc<dyn RenderDriver>
         }
     };
-    let renderer: Arc<dyn RenderDriver> = match config.renderer {
-        RendererKind::Mock => Arc::new(MockDriver::new()),
-        RendererKind::Chromium => match HeadlessChromiumDriver::launch().await {
-            Ok(d) => {
-                info!(target: "renderer", "headless chromium launched");
-                Arc::new(d) as Arc<dyn RenderDriver>
-            }
-            Err(e) => {
-                warn!(target: "renderer", "chromium launch failed ({e}); falling back to mock");
-                Arc::new(MockDriver::new())
-            }
-        },
-    };
+
     Ok(AppState {
         sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::new())),
         llm,
         renderer,
         events: EventBus::new(),
         trajectory: TrajectoryStore::new(),
+        llm_settings: std::sync::Arc::new(std::sync::RwLock::new(settings)),
+        config_path: config.config_path.clone(),
     })
 }
 

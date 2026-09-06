@@ -23,8 +23,47 @@
         <span class="status-dot" aria-hidden="true"></span>
         <span class="status-text">disconnected</span>
       </div>
+      <button id="settings-btn" type="button" class="icon-btn" title="Settings (LLM provider)" aria-label="Settings">⚙</button>
     </div>
   </header>
+
+  <div id="settings-modal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <div class="modal-head">
+        <h2 id="settings-title">设置 · LLM Provider</h2>
+        <button type="button" id="settings-close" class="icon-btn" aria-label="Close settings">✕</button>
+      </div>
+      <form id="settings-form" class="settings-form">
+        <label class="field">
+          <span>Provider</span>
+          <select id="cfg-kind">
+            <option value="openai-compat">OpenAI-compatible API</option>
+            <option value="mock">Mock（离线占位）</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Base URL</span>
+          <input id="cfg-base-url" type="url" placeholder="https://open.bigmodel.cn/api/paas/v4" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field">
+          <span>API Key（留空 = 保持不变）</span>
+          <input id="cfg-api-key" type="password" placeholder="sk-…" autocomplete="new-password" spellcheck="false">
+        </label>
+        <label class="field">
+          <span>Model</span>
+          <input id="cfg-model" type="text" placeholder="glm-4.6v" autocomplete="off" spellcheck="false">
+        </label>
+        <div class="field-static">渲染：bundled Chromium（固定） · <span id="cfg-file"></span></div>
+        <div id="test-result" class="test-result" hidden></div>
+        <div class="modal-actions">
+          <button type="button" id="cfg-test-btn" class="secondary">测试连接</button>
+          <span class="spacer"></span>
+          <button type="button" id="cfg-cancel-btn" class="secondary">取消</button>
+          <button type="submit" id="cfg-save-btn" class="primary-btn">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
 
   <main class="workspace">
     <section class="canvas-region" aria-label="Diagram canvas">

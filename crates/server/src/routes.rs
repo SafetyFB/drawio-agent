@@ -9,6 +9,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use axum::extract::ws::{Message, WebSocketUpgrade};
+use drawio_agent_llm_client::{HttpTransport, LlmProvider};
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -83,6 +84,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/agent-loop", post(run_agent_loop))
         .route("/api/sessions/:id/events", get(events))
         .route("/api/sessions/:id/trajectory", get(get_trajectory))
+        .route("/api/config", get(get_config).put(put_config))
+        .route("/api/config/test", post(test_llm_config))
         .with_state(Arc::new(state))
 }
 
@@ -759,7 +762,7 @@ async fn run_agent_loop(
     });
 
     let deps = ServerAgentDeps {
-        llm: state.llm.clone(),
+        llm: state.llm.clone() as Arc<dyn LlmProvider>,
         renderer: state.renderer.clone(),
     };
 
@@ -845,6 +848,175 @@ async fn run_agent_loop(
         .await;
 
     Ok(Json(outcome))
+}
+
+// ---------------------------------------------------------------------------
+// Runtime configuration (settings UI)
+// ---------------------------------------------------------------------------
+
+/// LLM block of GET/PUT /api/config.
+#[derive(Debug, Clone, Serialize)]
+pub struct LlmConfigView {
+    pub kind: crate::llm_config::LlmKind,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub model: String,
+    /// Masked key for display only; never the real secret.
+    #[serde(default)]
+    pub api_key_masked: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigResponse {
+    pub llm: LlmConfigView,
+    /// The renderer is fixed to the bundled headless Chromium shell.
+    pub renderer: String,
+    pub config_file: Option<String>,
+}
+
+impl ConfigResponse {
+    fn from_state(state: &AppState) -> Self {
+        let settings = state
+            .llm_settings
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        Self {
+            llm: LlmConfigView {
+                kind: settings.kind,
+                base_url: settings.base_url,
+                model: settings.model,
+                api_key_masked: crate::llm_config::mask_secret(&settings.api_key),
+            },
+            renderer: "chromium".to_string(),
+            config_file: state
+                .config_path
+                .as_ref()
+                .map(|p| p.display().to_string()),
+        }
+    }
+}
+
+async fn get_config(State(state): State<Arc<AppState>>) -> Json<ConfigResponse> {
+    Json(ConfigResponse::from_state(&state))
+}
+
+/// Validate + merge an incoming settings block with the current one
+/// (an empty api_key keeps the existing secret), then hot-swap the
+/// provider and persist to the config file.
+async fn put_config(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<crate::llm_config::LlmSettings>,
+) -> Result<Json<ConfigResponse>, ServerError> {
+    let mut merged = body;
+    if matches!(merged.kind, crate::llm_config::LlmKind::OpenAiCompat) {
+        if merged.base_url.trim().is_empty() || merged.model.trim().is_empty() {
+            return Err(ServerError::BadRequest(
+                "openai-compat needs both base_url and model".into(),
+            ));
+        }
+        merged.base_url = merged.base_url.trim().to_string();
+        merged.model = merged.model.trim().to_string();
+        merged.api_key = merged.api_key.trim().to_string();
+        if merged.api_key.is_empty() {
+            let current = state
+                .llm_settings
+                .read()
+                .map(|g| g.api_key.clone())
+                .unwrap_or_default();
+            merged.api_key = current; // keep the existing secret
+        }
+    } else {
+        merged.base_url.clear();
+        merged.model.clear();
+        merged.api_key.clear();
+    }
+
+    let provider = crate::llm_config::build_provider(&merged);
+    state.llm.swap(provider).await;
+    *state
+        .llm_settings
+        .write()
+        .map_err(|_| ServerError::Internal("llm settings lock poisoned".into()))? = merged.clone();
+
+    // Persist so a restart keeps the UI setting (env vars no longer win).
+    let persist_at = state
+        .config_path
+        .clone()
+        .or_else(crate::llm_config::config_file_path);
+    if let Some(path) = persist_at {
+        if let Err(e) = crate::llm_config::save_config_file(&path, &merged) {
+            tracing::warn!(path = %path.display(), error = %e, "failed to persist config; keeping in-memory settings");
+        }
+    }
+
+    tracing::info!(kind = %merged.kind, base_url = %merged.base_url, model = %merged.model, "llm settings updated via UI");
+    Ok(Json(ConfigResponse::from_state(&state)))
+}
+
+/// Connection test: fire a minimal text request against the supplied
+/// settings (empty api_key falls back to the stored key). Never touches
+/// the live provider — the user can test before saving.
+async fn test_llm_config(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<crate::llm_config::LlmSettings>,
+) -> Json<serde_json::Value> {
+    use std::time::Instant;
+
+    let mut settings = body;
+    if settings.api_key.is_empty() {
+        settings.api_key = state
+            .llm_settings
+            .read()
+            .map(|g| g.api_key.clone())
+            .unwrap_or_default();
+    }
+    if !matches!(settings.kind, crate::llm_config::LlmKind::OpenAiCompat) {
+        return Json(serde_json::json!({"ok": true, "detail": "mock provider (no network)"}));
+    }
+    if settings.base_url.trim().is_empty() || settings.model.trim().is_empty() {
+        return Json(serde_json::json!({"ok": false, "error": "base_url and model are required"}));
+    }
+
+    let url = format!(
+        "{}/chat/completions",
+        settings.base_url.trim_end_matches('/')
+    );
+    let auth = format!("Bearer {}", settings.api_key);
+    let body_json = serde_json::json!({
+        "model": settings.model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 5,
+    });
+    let started = Instant::now();
+    let transport = crate::run::ReqwestHttpTransport;
+    match transport
+        .post_json(
+            &url,
+            &[("Authorization", auth.as_str()), ("Content-Type", "application/json")],
+            &body_json,
+        )
+        .await
+    {
+        Ok(resp) if (200..300).contains(&resp.status) => {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            Json(serde_json::json!({
+                "ok": true,
+                "latency_ms": latency_ms,
+                "model": settings.model,
+                "detail": format!("connected · {}ms", latency_ms),
+            }))
+        }
+        Ok(resp) => Json(serde_json::json!({
+            "ok": false,
+            "error": format!("HTTP {}: {}", resp.status, resp.body),
+        })),
+        Err(e) => Json(serde_json::json!({
+            "ok": false,
+            "error": e.to_string(),
+        })),
+    }
 }
 
 // ---------------------------------------------------------------------------

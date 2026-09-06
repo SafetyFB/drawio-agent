@@ -29,6 +29,19 @@
   const chatThread = $('chat-thread');
   const promptAttachments = $('prompt-attachments');
   const regenBtn = $('regen-btn');
+  const settingsBtn = $('settings-btn');
+  const settingsModal = $('settings-modal');
+  const settingsForm = $('settings-form');
+  const settingsClose = $('settings-close');
+  const settingsCancel = $('settings-cancel');
+  const cfgKind = $('cfg-kind');
+  const cfgBaseUrl = $('cfg-base-url');
+  const cfgApiKey = $('cfg-api-key');
+  const cfgModel = $('cfg-model');
+  const cfgFile = $('cfg-file');
+  const cfgTestBtn = $('cfg-test-btn');
+  const cfgSaveBtn = $('cfg-save-btn');
+  const testResult = $('test-result');
   const btnExportPng = $('export-png-btn');
   const downloadSvgBtn = $('download-svg-btn');
   const copyXmlUrlBtn = $('copy-xml-url-btn');
@@ -1079,6 +1092,116 @@
       await sendMessage({ forceRegen: true });
     });
 
+    // -------------------------------------------------------------------
+    // Settings modal (LLM provider config + connection test)
+    // -------------------------------------------------------------------
+    function cfgPayload() {
+      return {
+        kind: cfgKind.value,
+        base_url: cfgBaseUrl.value.trim(),
+        api_key: cfgApiKey.value.trim(),
+        model: cfgModel.value.trim(),
+      };
+    }
+
+    function showTestResult(cls, html) {
+      testResult.className = `test-result ${cls}`;
+      testResult.innerHTML = html;
+      testResult.hidden = false;
+    }
+
+    async function openSettings() {
+      clearTestResult();
+      try {
+        const cfg = await api('GET', '/api/config');
+        cfgKind.value = cfg.llm.kind;
+        cfgBaseUrl.value = cfg.llm.base_url || '';
+        cfgModel.value = cfg.llm.model || '';
+        cfgApiKey.value = '';
+        cfgApiKey.placeholder = cfg.llm.api_key_masked || 'sk-…';
+        cfgFile.textContent = cfg.config_file ? `配置文件：${cfg.config_file}` : '未持久化（仅本次运行）';
+        settingsModal.hidden = false;
+        cfgKind.focus();
+      } catch (err) {
+        showError(`读取设置失败：${err.message}`);
+      }
+    }
+
+    function clearTestResult() {
+      testResult.hidden = true;
+      testResult.className = 'test-result';
+      testResult.innerHTML = '';
+    }
+
+    function closeSettings() {
+      settingsModal.hidden = true;
+      clearTestResult();
+    }
+
+    settingsBtn.addEventListener('click', openSettings);
+    settingsClose.addEventListener('click', closeSettings);
+    settingsCancel.addEventListener('click', closeSettings);
+    settingsModal.addEventListener('click', (e) => {
+      if (e.target === settingsModal) closeSettings();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !settingsModal.hidden) closeSettings();
+    });
+
+    cfgTestBtn.addEventListener('click', async () => {
+      const payload = cfgPayload();
+      showTestResult('pending', '<span class="spinner"></span> 连接测试中…');
+      cfgTestBtn.disabled = true;
+      try {
+        const res = await api('POST', '/api/config/test', payload);
+        if (res.ok) {
+          const extra = res.latency_ms != null ? ` · ${res.latency_ms}ms` : '';
+          showTestResult('ok', `✓ ${escapeHtml(res.detail || 'connected')}${extra}`);
+        } else {
+          showTestResult('fail', `✗ ${escapeHtml(res.error || 'connection failed')}`);
+        }
+      } catch (err) {
+        showTestResult('fail', `✗ ${escapeHtml(err.message)}`);
+      } finally {
+        cfgTestBtn.disabled = false;
+      }
+    });
+
+    settingsForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const payload = cfgPayload();
+      if (payload.kind === 'openai-compat' && (!payload.base_url || !payload.model)) {
+        showTestResult('fail', '✗ base URL 与 model 必填');
+        return;
+      }
+      cfgSaveBtn.disabled = true;
+      try {
+        await api('PUT', '/api/config', payload);
+        closeSettings();
+        clearError();
+        // Reflect the new provider in the top bar / status for clarity.
+        const saved = await api('GET', '/api/config');
+        const label = saved.llm.kind === 'mock'
+          ? 'mock'
+          : `${saved.llm.model} · ${saved.llm.base_url.replace(/^https?:\/\//, '').replace(/\/$/, '')}`;
+        const providerBadge = $('provider-badge');
+        if (!providerBadge) {
+          const b = document.createElement('span');
+          b.id = 'provider-badge';
+          b.className = 'provider-badge';
+          b.title = 'Current LLM provider (settings ⚙)';
+          b.textContent = label;
+          settingsBtn.insertAdjacentElement('beforebegin', b);
+        } else {
+          providerBadge.textContent = label;
+        }
+      } catch (err) {
+        showTestResult('fail', `✗ 保存失败：${escapeHtml(err.message)}`);
+      } finally {
+        cfgSaveBtn.disabled = false;
+      }
+    });
+
     promptEl.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -1146,6 +1269,22 @@
     updateRefineHint();
   }
 
+  async function loadProviderBadge() {
+    try {
+      const cfg = await api('GET', '/api/config');
+      const label = cfg.llm.kind === 'mock'
+        ? 'mock'
+        : `${cfg.llm.model} · ${(cfg.llm.base_url || '').replace(/^https?:\/\//, '').replace(/\/$/, '')}`;
+      const b = document.createElement('span');
+      b.id = 'provider-badge';
+      b.className = 'provider-badge';
+      b.title = 'Current LLM provider (settings ⚙)';
+      b.textContent = label;
+      settingsBtn.insertAdjacentElement('beforebegin', b);
+    } catch (err) { /* badge is cosmetic */ }
+  }
+
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
+  loadProviderBadge();
 })();

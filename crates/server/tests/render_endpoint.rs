@@ -66,10 +66,14 @@ fn state_with_renderer(renderer: Arc<dyn RenderDriver>) -> Arc<AppState> {
         sessions: Arc::new(tokio::sync::RwLock::new(
             drawio_agent_server::SessionStore::new(),
         )),
-        llm: Arc::new(StubLlm),
+        llm: Arc::new(drawio_agent_server::RuntimeLlm::new(Arc::new(StubLlm))),
         renderer,
         events: drawio_agent_server::EventBus::new(),
         trajectory: drawio_agent_trajectory::TrajectoryStore::new(),
+        llm_settings: std::sync::Arc::new(std::sync::RwLock::new(
+            drawio_agent_server::LlmSettings::default(),
+        )),
+        config_path: None,
     })
 }
 

@@ -7,19 +7,26 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use drawio_agent_renderer::MockDriver;
 use drawio_agent_server::{
-    build_app_state, build_router, LlmProviderKind, RendererKind, ServerConfig,
+    build_app_state_with_renderer, build_router, LlmSettings, ServerConfig,
 };
 use tower::ServiceExt;
 
 async fn mock_state() -> Arc<drawio_agent_server::AppState> {
     let config = ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
-        llm_provider: LlmProviderKind::Mock,
-        renderer: RendererKind::Mock,
         static_dir: None,
+        config_path: None,
+        llm: Some(LlmSettings {
+            kind: drawio_agent_server::LlmKind::Mock,
+            ..Default::default()
+        }),
     };
-    build_app_state(&config).await.map(Arc::new).unwrap()
+    build_app_state_with_renderer(&config, Some(Arc::new(MockDriver::new())))
+        .await
+        .map(Arc::new)
+        .unwrap()
 }
 
 /// Recursively collect every cell (root + descendants).

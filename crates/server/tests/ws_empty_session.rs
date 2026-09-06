@@ -3,10 +3,14 @@
 //! Bug B repro: a freshly-created session (POST /api/sessions, no events
 //! ever emitted) used to close the WS connection immediately.
 
+use std::sync::Arc;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use drawio_agent_server::{build_app_state, run_server, LlmProviderKind, RendererKind, ServerConfig};
+use drawio_agent_renderer::MockDriver;
+use drawio_agent_server::{
+    build_app_state_with_renderer, run_server, LlmSettings, ServerConfig,
+};
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -20,12 +24,18 @@ async fn spawn_server() -> String {
     let manifest = std::env::var("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
-    let state = build_app_state(&ServerConfig {
-        bind_addr: addr,
-        llm_provider: LlmProviderKind::Mock,
-        renderer: RendererKind::Mock,
-        static_dir: Some(manifest.join("static")),
-    })
+    let state = build_app_state_with_renderer(
+        &ServerConfig {
+            bind_addr: addr,
+            static_dir: Some(manifest.join("static")),
+            config_path: None,
+            llm: Some(LlmSettings {
+                kind: drawio_agent_server::LlmKind::Mock,
+                ..Default::default()
+            }),
+        },
+        Some(Arc::new(MockDriver::new())),
+    )
     .await
     .unwrap();
 

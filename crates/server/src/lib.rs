@@ -17,15 +17,20 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 pub mod agent_deps;
+pub mod llm_config;
 pub mod routes;
 pub mod run;
 pub mod state;
 
 pub use agent_deps::ServerAgentDeps;
 pub use routes::router;
+pub use llm_config::{
+    build_provider, config_file_path, effective_settings, load_config_file, mask_secret,
+    save_config_file, ConfigFile, LlmKind, LlmSettings, RuntimeLlm,
+};
 pub use run::{
-    build_app_state, run_server, shutdown_signal, ConfigError, LlmProviderKind,
-    RendererKind, ReqwestHttpTransport, ServerConfig, StubLlm,
+    build_app_state, build_app_state_with_renderer, run_server, shutdown_signal,
+    ConfigError, ReqwestHttpTransport, ServerConfig, StubLlm,
 };
 pub use state::{
     ConversationEntry, EventBus, SessionData, SessionId, SessionMeta, SessionStore,
@@ -51,10 +56,15 @@ pub enum ServerError {
 #[derive(Clone)]
 pub struct AppState {
     pub sessions: Arc<RwLock<SessionStore>>,
-    pub llm: Arc<dyn LlmProvider>,
+    /// Hot-swappable LLM provider (settings UI swaps it at runtime).
+    pub llm: Arc<RuntimeLlm>,
     pub renderer: Arc<dyn RenderDriver>,
     pub events: EventBus,
     pub trajectory: drawio_agent_trajectory::TrajectoryStore,
+    /// Effective LLM settings (source of truth for GET /api/config).
+    pub llm_settings: std::sync::Arc<std::sync::RwLock<LlmSettings>>,
+    /// Where the settings UI persists to (None = env/default only).
+    pub config_path: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -69,10 +79,12 @@ impl AppState {
     pub fn with_mock_renderer(llm: Arc<dyn LlmProvider>) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(SessionStore::new())),
-            llm,
+            llm: Arc::new(RuntimeLlm::new(llm)),
             renderer: Arc::new(MockDriver::new()),
             events: EventBus::new(),
             trajectory: drawio_agent_trajectory::TrajectoryStore::new(),
+            llm_settings: std::sync::Arc::new(std::sync::RwLock::new(LlmSettings::default())),
+            config_path: None,
         }
     }
 }

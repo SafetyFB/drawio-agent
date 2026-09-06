@@ -135,10 +135,14 @@ impl LlmProvider for DiffLlm {
 fn state_with(llm: Arc<dyn LlmProvider>, renderer: Arc<dyn RenderDriver>) -> Arc<AppState> {
     Arc::new(AppState {
         sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::new())),
-        llm,
+        llm: Arc::new(drawio_agent_server::RuntimeLlm::new(llm)),
         renderer,
         events: EventBus::new(),
         trajectory: drawio_agent_trajectory::TrajectoryStore::new(),
+        llm_settings: std::sync::Arc::new(std::sync::RwLock::new(
+            drawio_agent_server::LlmSettings::default(),
+        )),
+        config_path: None,
     })
 }
 
