@@ -443,6 +443,11 @@ async function api(path, body, method) {
 
 async function loadState() {
   const st = await (await fetch('/api/state')).json();
+  if (st.build) {
+    const b = $('build');
+    if (b) b.textContent = st.build;
+    console.log('[drawio-harness] build:', st.build);
+  }
   const cells = $('cells');
   if (cells) cells.textContent = st.cells != null ? `${st.cells} 个元素 / ${st.lines} 行` : '–';
   $('llm').textContent = st.llm_ready ? 'LLM ✓' : 'LLM ✗';
@@ -572,6 +577,32 @@ $('chatform').onsubmit = async (ev) => {
     } catch (e2) { /* page going away */ }
   }
 };
+
+// ---------------------------------------------------------------------------
+// 诊断 HUD（?debug=1）：光标处坐标系统 + 命中 cell，用于定位偏移类问题
+// ---------------------------------------------------------------------------
+
+function setupDebugHud() {
+  if (!location.search.includes('debug=1')) return;
+  const hud = document.createElement('div');
+  hud.id = 'debug-hud';
+  hud.style.cssText = 'position:fixed;top:70px;right:360px;z-index:99;background:rgba(0,0,0,.85);color:#8f8;font:11px/1.5 monospace;padding:8px 10px;border-radius:8px;white-space:pre;';
+  document.body.appendChild(hud);
+  const upd = (e) => {
+    if (!currentGraph) return;
+    const v = currentGraph.view;
+    const rect = currentGraph.container.getBoundingClientRect();
+    const gx = (e.clientX - rect.left) / v.scale - v.translate.x;
+    const gy = (e.clientY - rect.top) / v.scale - v.translate.y;
+    let hit = currentGraph.getCellAt(gx, gy);
+    const bbox = !hit ? getCellAtBbox(currentGraph, gx, gy) : null;
+    const sel = currentGraph.getSelectionCells().map((c) => c.id).join(',');
+    hud.textContent = `client  (${e.clientX.toFixed(1)}, ${e.clientY.toFixed(1)})\ncontainer(${(e.clientX - rect.left).toFixed(1)}, ${(e.clientY - rect.top).toFixed(1)})\ngraph   (${gx.toFixed(1)}, ${gy.toFixed(1)})\ntranslate(${v.translate.x.toFixed(1)}, ${v.translate.y.toFixed(1)}) scale=${v.scale}\ngetCellAt=${hit ? hit.id : 'null'} bbox=${bbox ? bbox.id : 'null'}\nselection=[${sel}]`;
+  };
+  currentGraph ? currentGraph.container.addEventListener('pointermove', upd) : null;
+  document.addEventListener('pointermove', upd);
+}
+setupDebugHud();
 
 // ---------------------------------------------------------------------------
 // Boot

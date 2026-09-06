@@ -215,6 +215,11 @@ fn static_bytes(bytes: Vec<u8>, ct: &'static str) -> Response {
 }
 
 
+/// 构建标识：版本 + git 短哈希（诊断用——前端可见，旧二进制一眼识别）。
+pub fn build_id() -> String {
+    format!("{} ({})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"))
+}
+
 /// Grab the current session's doc+stats or a JSON 400 (no session yet).
 fn current_err() -> Json<serde_json::Value> {
     Json(json!({ "ok": false, "error": "还没有打开的会话：先创建一个（新建会话 = 新建 .drawio 文件）" }))
@@ -229,6 +234,7 @@ async fn api_state(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::V
             "file": st.dir.join(&run).display().to_string(),
             "current": run,
             "busy": true,
+            "build": build_id(),
             "lines": snap.lines,
             "cells": snap.cells,
             "llm_ready": st.llm_ready(),
@@ -245,13 +251,14 @@ async fn api_state(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::V
     let Some(cur) = st.current.as_ref() else {
         return Json(json!({ "file": null, "lines": 0, "cells": 0, "llm_ready": st.llm_ready(),
             "render": st.tools.render, "config_source": config_source_label(), "current": null,
-            "session": null }));
+            "session": null, "build": build_id() }));
     };
     let Some(ss) = st.sessions.get(cur) else { return current_err() };
     Json(json!({
         "file": ss.doc.path.display().to_string(),
         "current": cur,
         "busy": false,
+        "build": build_id(),
         "lines": ss.doc.canonical().lines().count(),
         "cells": ss.doc.cells.len(),
         "llm_ready": st.llm_ready(),
