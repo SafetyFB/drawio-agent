@@ -626,8 +626,9 @@ form.addEventListener('submit', async (e) => {
 const histLog = $('histlog');
 let histOpen = false;
 
-async function openHistory() {
-  histOpen = !histOpen;
+async function openHistory(force) {
+  if (typeof force === 'boolean') histOpen = force;
+  else histOpen = !histOpen;
   histLog.hidden = !histOpen;
   $('hist-btn').classList.toggle('active', histOpen);
   if (!histOpen) return;
@@ -635,6 +636,14 @@ async function openHistory() {
   try { data = await (await fetch('/api/history')).json(); }
   catch (e) { log('error', '历史读取失败: ' + e); return; }
   histLog.innerHTML = '';
+  // 作用域标注：历史属于「当前会话（文件）」这条时间线
+  const scope = document.createElement('div');
+  scope.className = 'hist-meta';
+  scope.style.margin = '4px 2px 6px';
+  const cur = picker.value ? picker.value : '(未选择会话)';
+  scope.innerHTML = `时间线 · 当前会话：<b>${escapeHtml(cur)}</b><br>
+    <span style="font-size:11px">会话 = 文件（横向切换工作区）；这里 = 本文件内的任务轨迹与版本回滚。</span>`;
+  histLog.appendChild(scope);
   if (!data.records || !data.records.length) {
     const d = document.createElement('div');
     d.className = 'dim';
@@ -693,7 +702,20 @@ async function openHistory() {
         a.download = `drawio-ctx-${r.idx}.json`;
         a.click();
       };
-      acts.append(restore, dl);
+      const fork = document.createElement('button');
+      fork.textContent = '从此版本新建会话';
+      fork.title = '把该历史快照另存为一个新会话（新文件），不动当前会话';
+      fork.onclick = async (e) => {
+        e.stopPropagation();
+        const base = (picker.value || 'diagram').replace(/\.drawio$/i, '');
+        const name = `${base}-v${r.idx + 1}`;
+        const r2 = await api('/api/sessions', { name, xml: rec.xml });
+        if (r2.ok) {
+          log('ok', `✓ 已从历史快照创建新会话 ${r2.name}`);
+          await switchSession(r2.name, true);
+        } else log('error', '创建失败: ' + (r2.error || ''));
+      };
+      acts.append(restore, fork, dl);
       detail.appendChild(acts);
     };
     histLog.appendChild(item);
