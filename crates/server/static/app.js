@@ -40,9 +40,11 @@
 
   async function api(method, path, body) {
     const opts = { method, headers: {} };
-    if (body !== undefined) {
+    // Always set Content-Type for non-GET so the server's Json extractor
+    // accepts the request (empty body is OK as long as the header is set).
+    if (method !== 'GET' && method !== 'HEAD') {
       opts.headers['Content-Type'] = 'application/json';
-      opts.body = JSON.stringify(body);
+      opts.body = body !== undefined ? JSON.stringify(body) : '{}';
     }
     const res = await fetch(path, opts);
     const text = await res.text();

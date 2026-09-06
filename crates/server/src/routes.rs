@@ -95,8 +95,9 @@ async fn health() -> impl IntoResponse {
 
 async fn create_session(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<CreateSessionRequest>,
+    body: Option<Json<CreateSessionRequest>>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ServerError> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
     let id = state.sessions.write().await.create().await;
     if let Some(xml) = req.initial_xml {
         let _ = state

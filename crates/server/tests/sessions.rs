@@ -108,6 +108,52 @@ async fn create_session_returns_session_id() {
 }
 
 #[tokio::test]
+async fn create_session_accepts_empty_body_without_content_type() {
+    // Regression: the end-user UI's `+ new` button calls POST /api/sessions
+    // with no body and no Content-Type header. Must return 201, not 415.
+    let app = router(test_state());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), 4096)
+        .await
+        .unwrap();
+    let parsed: CreateSessionResponse = serde_json::from_slice(&body).unwrap();
+    assert!(!parsed.session_id.as_str().is_empty());
+}
+
+#[tokio::test]
+async fn create_session_accepts_empty_json_object() {
+    // Same regression with an explicit empty JSON body — Content-Type
+    // present, body is "{}".
+    let app = router(test_state());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
 async fn create_then_get_returns_same_session() {
     let app = router(test_state());
 
