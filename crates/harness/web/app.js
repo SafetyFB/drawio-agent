@@ -228,6 +228,7 @@ async function loadState() {
   $('cells').textContent = `${st.cells} 个元素 / ${st.lines} 行`;
   $('llm').textContent = st.llm_ready ? 'LLM ✓' : 'LLM ✗';
   $('llm-banner').hidden = st.llm_ready;
+  if (st.session) renderUsage(st.session);
 }
 
 $('check').onclick = async () => {
@@ -264,9 +265,10 @@ $('chatform').onsubmit = async (ev) => {
     if (r.error) {
       log('error', '对话出错：' + r.error);
     } else {
-      log('tool-note', `（工具调用 ${r.tool_calls} 次）`);
+      log('tool-note', `（工具调用 ${r.tool_calls} 次 · 本轮 ${r.usage ? r.usage.in + ' in / ' + r.usage.out + ' out tokens' : ''}${r.cost_yuan > 0 ? ' · ' + fmtCost(r.cost_yuan) : ''}）`);
       log('assistant', r.reply);
     }
+    if (r.session) renderUsage(r.session);
   } catch (e) {
     log('error', '网络错误：' + e);
   }
@@ -300,6 +302,24 @@ const cfgFile = $('cfg-file');
 const cfgBody = $('cfg-current-body');
 const cfgHint = $('cfg-demo-hint');
 const testResult = $('test-result');
+const cfgCtxLen = $('cfg-context-length');
+const cfgThinking = $('cfg-thinking');
+const cfgPriceIn = $('cfg-price-in');
+const cfgPriceOut = $('cfg-price-out');
+const cfgBudget = $('cfg-budget');
+
+function fmtCost(v) { return '¥' + (v == null ? '?' : v.toFixed(4)); }
+
+function renderUsage(session) {
+  const chip = $('usage');
+  if (!session) { chip.textContent = '–'; return; }
+  const t = (session.in || 0) + (session.out || 0);
+  const b = session.budget_yuan;
+  const txt = `本次会话 ${t} tokens (in ${session.in || 0} / out ${session.out || 0}) · 花费 ${fmtCost(session.cost_yuan)}` +
+    (b != null ? ` / 预算 ${'¥' + b.toFixed(2)}` : '');
+  chip.textContent = txt;
+  chip.classList.toggle('warn', b != null && session.cost_yuan >= b);
+}
 
 function setTestResult(kind, text) {
   testResult.className = 'test-result ' + kind;
@@ -329,6 +349,11 @@ function renderCurrentCfg(cfg) {
   cfgModel.value = llm.model || '';
   cfgApiKey.value = '';
   cfgApiKey.placeholder = llm.api_key_masked ? `留空 = 保持不变 (${llm.api_key_masked})` : 'sk-…';
+  cfgCtxLen.value = llm.context_length != null ? llm.context_length : '';
+  cfgThinking.value = llm.thinking === 'no-think' ? 'no-think' : 'default';
+  cfgPriceIn.value = (llm.price_input_per_m || 0);
+  cfgPriceOut.value = (llm.price_output_per_m || 0);
+  cfgBudget.value = llm.budget_yuan != null ? llm.budget_yuan : '';
 }
 
 async function openSettings() {
@@ -348,6 +373,26 @@ modal.addEventListener('click', (e) => { if (e.target === modal) closeSettings()
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !modal.hidden) closeSettings();
 });
+
+$('cfg-preset-btn').onclick = () => {
+  const model = cfgModel.value.trim().toLowerCase();
+  const presets = {
+    'glm-4.6': [5, 15], 'glm-4.5': [5, 15], 'glm-4-flash': [0, 0],
+    'glm-4v': [0.1, 0.1], 'deepseek-chat': [2, 8], 'deepseek-reasoner': [4, 16],
+    'gpt-4o': [17, 68], 'gpt-4o-mini': [1.1, 4.4],
+  };
+  let picked = null;
+  for (const [k, v] of Object.entries(presets)) {
+    if (model.includes(k)) { picked = v; break; }
+  }
+  if (picked) {
+    cfgPriceIn.value = picked[0];
+    cfgPriceOut.value = picked[1];
+    setTestResult('ok', `已按 ${cfgModel.value.trim()} 填入价格（¥${picked[0]}/${picked[1]} 每百万 tokens，2025 官方公开价，以账单为准可改）`);
+  } else {
+    setTestResult('err', `没有 ${cfgModel.value.trim() || '(空)'} 的预设价格，请手动填写（可参考: glm-4.6 5/15、deepseek-chat 2/8、gpt-4o-mini 1.1/4.4）`);
+  }
+};
 
 $('cfg-test-btn').onclick = async () => {
   const payload = {
@@ -369,13 +414,24 @@ $('cfg-test-btn').onclick = async () => {
   $('cfg-test-btn').disabled = false;
 };
 
-form.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const payload = {
+function configPayload() {
+  const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+  const opt = (v) => { const n = parseFloat(v); return Number.isFinite(n) && v !== '' && n > 0 ? n : null; };
+  return {
     base_url: cfgBaseUrl.value.trim(),
     model: cfgModel.value.trim(),
     api_key: cfgApiKey.value.trim(),
+    context_length: opt(cfgCtxLen.value),
+    thinking: cfgThinking.value === 'no-think' ? 'no-think' : 'default',
+    price_input_per_m: num(cfgPriceIn.value),
+    price_output_per_m: num(cfgPriceOut.value),
+    budget_yuan: opt(cfgBudget.value),
   };
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const payload = configPayload();
   const btn = $('cfg-save-btn');
   btn.disabled = true;
   try {

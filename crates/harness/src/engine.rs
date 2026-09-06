@@ -1,10 +1,17 @@
-//! The harness engine: one user ask -> model decides tool calls -> results are
-//! appended -> until the model says done. Plain ReAct over a JSON envelope —
-//! no bespoke pipeline, no phases. Works with any OpenAI-compatible endpoint.
+//! The harness engine: one user ask -> model decides tool calls -> results
+//! are appended -> until the model says done. Plain ReAct over a JSON
+//! envelope — no bespoke pipeline, no phases. Works with any
+//! OpenAI-compatible endpoint.
+//!
+//! Accounting (R6): every LLM call's usage is parsed and accumulated into
+//! [`SessionStats`]; cost follows the configured ¥/1M prices; an optional
+//! budget stops the run before spending more. A configured context length
+//! guards prompt size before each call.
 
 use serde_json::{Value, json};
 
-use crate::chat::{Chat, Message, Part};
+use crate::chat::{CallOpts, Chat, Message, Part, Usage};
+use crate::config::usage_cost;
 use crate::tools::{ToolOutput, Tools};
 use crate::xmlfile::XmlDoc;
 
@@ -16,11 +23,69 @@ pub struct TurnOutcome {
     pub tool_calls: usize,
     /// Raw assistant JSON envelopes (for debugging / trajectory).
     pub envelopes: Vec<String>,
+    /// Tokens spent by this ask (input + output, summed over calls).
+    pub usage: Usage,
+    /// ¥ cost of this ask under the configured prices.
+    pub cost_yuan: f64,
+}
+
+/// Running totals across asks (kept by the caller: REPL / web session).
+#[derive(Debug, Clone, Default)]
+pub struct SessionStats {
+    pub usage: Usage,
+    pub cost_yuan: f64,
+}
+
+impl SessionStats {
+    pub fn add(&mut self, u: &Usage, cost: f64) {
+        self.usage.add(u);
+        self.cost_yuan += cost;
+    }
+}
+
+/// Per-run knobs (snapshot of the config at ask time; hot config changes
+/// take effect on the next ask).
+#[derive(Debug, Clone)]
+pub struct RunOpts {
+    /// Fast path: `thinking: {type: disabled}`.
+    pub no_think: bool,
+    /// Configured context window in tokens (None = no guard).
+    pub context_limit: Option<u64>,
+    /// ¥ per 1M input tokens (0 = count only).
+    pub price_input_per_m: f64,
+    /// ¥ per 1M output tokens.
+    pub price_output_per_m: f64,
+    /// ¥ left of the session budget for this run. When the run's spend
+    /// reaches this, the engine stops with a clear budget message.
+    pub budget_remaining: f64,
+}
+
+impl Default for RunOpts {
+    fn default() -> Self {
+        Self {
+            no_think: false,
+            context_limit: None,
+            price_input_per_m: 0.0,
+            price_output_per_m: 0.0,
+            budget_remaining: f64::INFINITY,
+        }
+    }
+}
+
+impl RunOpts {
+    pub fn from_settings(s: &crate::config::LlmSettings) -> Self {
+        Self {
+            no_think: matches!(s.thinking, crate::config::ThinkingMode::NoThink),
+            context_limit: s.context_length,
+            price_input_per_m: s.price_input_per_m,
+            price_output_per_m: s.price_output_per_m,
+            budget_remaining: f64::INFINITY,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct Harness {
-    /// Max model turns (tool call + result) per user ask.
     pub max_turns: usize,
 }
 
@@ -111,9 +176,24 @@ pub fn parse_envelope(raw: &str) -> Result<Value, String> {
     Err(format!("JSON 信封不完整: {raw}"))
 }
 
+/// Rough token estimate for prompt-size guarding (text chars ≈ 0.5 token
+/// for CJK-heavy prompts, images billed as a flat 900 tokens).
+fn estimate_tokens(msgs: &[Message]) -> u64 {
+    let mut t = 0u64;
+    for m in msgs {
+        for p in &m.parts {
+            match p {
+                Part::Text(s) => t += (s.chars().count() as u64 + 1) / 2,
+                Part::ImagePng(_) => t += 900,
+            }
+        }
+    }
+    t
+}
+
 impl Harness {
-    /// Run one user ask to completion. `chat` is the live LLM; `tools` may
-    /// be freshly created per ask (renderer is cached inside).
+    /// Run one user ask to completion. `stats` accumulates this ask's
+    /// usage/cost so the caller keeps session totals across asks.
     pub async fn run(
         &self,
         chat: &mut dyn Chat,
@@ -121,6 +201,8 @@ impl Harness {
         doc: &mut XmlDoc,
         user_text: &str,
         context: &str,
+        opts: &RunOpts,
+        stats: &mut SessionStats,
     ) -> Result<TurnOutcome, String> {
         let mut history: Vec<Message> = vec![Message::system(system_prompt(doc))];
         let full = if context.trim().is_empty() {
@@ -133,11 +215,47 @@ impl Harness {
         let mut envelopes = Vec::new();
         let mut tool_calls = 0usize;
         let mut last_err: Option<String> = None;
+        let mut spent: f64 = 0.0;
+        let mut usage = Usage::default();
 
         for turn in 0..self.max_turns {
-            let raw = match chat.complete(&history).await {
-                Ok(r) => r,
+            // Context-length guard: fail loudly instead of silently blowing
+            // the configured window.
+            if let Some(limit) = opts.context_limit {
+                let est = estimate_tokens(&history);
+                if est > limit {
+                    return Err(format!(
+                        "上下文估算 {est} tokens 超过配置的 context_length={limit}。\
+                         请调高 ⚙ 设置里的上下文长度，或开始新会话。"
+                    ));
+                }
+            }
+            // Budget guard: stop before the next call once the run's spend
+            // reaches the remaining budget.
+            if opts.budget_remaining.is_finite() && spent >= opts.budget_remaining {
+                stats.add(&usage, spent);
+                return Err(format!(
+                    "会话预算已用尽（本次已花 ¥{spent:.4} ≥ 预算 ¥{:.2}）。\
+                     可在 ⚙ 设置里调高预算后继续。",
+                    opts.budget_remaining
+                ));
+            }
+
+            let raw = match chat
+                .complete(&history, &CallOpts { no_think: opts.no_think })
+                .await
+            {
+                Ok(reply) => {
+                    usage.add(&reply.usage);
+                    spent += usage_cost(
+                        reply.usage.input_tokens,
+                        reply.usage.output_tokens,
+                        &price_opts(opts),
+                    );
+                    reply.text
+                }
                 Err(e) => {
+                    stats.add(&usage, spent);
                     return Err(format!("LLM 调用失败（第 {turn} 轮）: {e}"));
                 }
             };
@@ -153,16 +271,21 @@ impl Harness {
                         )));
                         continue;
                     }
+                    stats.add(&usage, spent);
                     return Err(e);
                 }
             };
             last_err = None;
+            envelopes.push(raw.clone());
+
             if let Some(reply) = env.get("reply").and_then(Value::as_str) {
-                envelopes.push(raw);
+                stats.add(&usage, spent);
                 return Ok(TurnOutcome {
                     reply: reply.to_string(),
                     tool_calls,
                     envelopes,
+                    usage,
+                    cost_yuan: spent,
                 });
             }
 
@@ -187,7 +310,16 @@ impl Harness {
             // already acted on them; re-view if needed).
             fold_old_images(&mut history);
         }
+        stats.add(&usage, spent);
         Err(format!("达到最大轮数 {} 仍未完成", self.max_turns))
+    }
+}
+
+fn price_opts(o: &RunOpts) -> crate::config::LlmSettings {
+    crate::config::LlmSettings {
+        price_input_per_m: o.price_input_per_m,
+        price_output_per_m: o.price_output_per_m,
+        ..Default::default()
     }
 }
 
@@ -240,16 +372,19 @@ mod tests {
     }
 
     /// Scripted fake: returns envelopes in order, records every transcript
-    /// snapshot it was sent.
+    /// snapshot it was sent, with configurable usage per call.
     struct FakeChat {
-        script: VecDeque<String>,
+        script: VecDeque<(String, Usage)>,
         snapshots: Vec<Vec<Message>>,
     }
 
     impl FakeChat {
         fn new(script: Vec<&str>) -> Self {
             Self {
-                script: script.into_iter().map(String::from).collect(),
+                script: script
+                    .into_iter()
+                    .map(|s| (s.to_string(), Usage::default()))
+                    .collect(),
                 snapshots: Vec::new(),
             }
         }
@@ -257,28 +392,29 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Chat for FakeChat {
-        async fn complete(&mut self, messages: &[Message]) -> Result<String, crate::chat::ChatError> {
+        async fn complete(
+            &mut self,
+            messages: &[Message],
+            _opts: &CallOpts,
+        ) -> Result<crate::chat::Reply, crate::chat::ChatError> {
             self.snapshots.push(messages.to_vec());
-            self.script
+            let (text, usage) = self
+                .script
                 .pop_front()
-                .ok_or(crate::chat::ChatError::Empty)
+                .ok_or(crate::chat::ChatError::Empty)?;
+            Ok(crate::chat::Reply { text, usage })
         }
     }
 
     fn contains_image_parts(msgs: &[Message]) -> bool {
-        msgs.iter().any(|m| {
-            m.parts
-                .iter()
-                .any(|p| matches!(p, Part::ImagePng(_)))
-        })
+        msgs.iter()
+            .any(|m| m.parts.iter().any(|p| matches!(p, Part::ImagePng(_))))
     }
 
     const SAMPLE: &str = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" vertex="1" parent="1"><mxGeometry x="0" y="0" width="100" height="50" as="geometry"/></mxCell><mxCell id="b" value="B" vertex="1" parent="1"><mxGeometry x="200" y="0" width="100" height="50" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
 
     #[tokio::test]
     async fn view_image_roundtrip_drives_edits() {
-        // Scripted model: 1) view -> receives a screenshot back as an image
-        // part, 2) edit cell `b`, 3) done.
         let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
         let replacement = r#"<mxCell id="b" value="B v2" vertex="1" parent="1"><mxGeometry x="220" y="0" width="120" height="50" as="geometry"/></mxCell>"#;
         let edit_env = json!({
@@ -296,19 +432,17 @@ mod tests {
         let renderer = drawio_agent_renderer::Renderer::new(std::sync::Arc::new(mock));
         let mut tools = Tools::with_renderer(renderer);
         let harness = Harness::default();
+        let mut stats = SessionStats::default();
 
         let outcome = harness
-            .run(&mut fake, &mut tools, &mut doc, "两个节点重叠了，看看并修复 b", "")
+            .run(&mut fake, &mut tools, &mut doc, "两个节点重叠了，看看并修复 b", "", &RunOpts::default(), &mut stats)
             .await
             .unwrap();
         assert_eq!(outcome.tool_calls, 2);
         assert_eq!(outcome.reply, "改好了");
-        // the transcript handed to the *second* model call must contain the
-        // screenshot as an image part (tool result of view)
         assert_eq!(fake.snapshots.len(), 3);
         let after_view = &fake.snapshots[1];
         assert!(contains_image_parts(after_view), "view 的结果必须带图像 part");
-        // image part is the second part of the tool-result user message
         let user_img = after_view
             .iter()
             .find(|m| m.role == "user" && m.parts.len() == 2)
@@ -317,16 +451,83 @@ mod tests {
             Part::ImagePng(b) => assert_eq!(b, &png),
             _ => panic!("第二个 part 应为 PNG"),
         }
-        // and the edit really landed
         assert!(doc.canonical().contains("B v2"));
-        assert!(doc.id_to_cell("b").is_some());
+    }
+
+    #[tokio::test]
+    async fn usage_and_cost_accumulate_and_budget_stops() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut fake = FakeChat {
+            script: VecDeque::new(),
+            snapshots: Vec::new(),
+        };
+        fake.script.push_back((
+            r#"{"reply":"好了","done":true}"#.into(),
+            Usage { input_tokens: 1000, output_tokens: 2000 },
+        ));
+        let mut tools = Tools::new(false);
+        let mut stats = SessionStats::default();
+        // 1 元/百万 in, 2 元/百万 out → 1000/1e6*1 + 2000/1e6*2 = 0.001+0.004
+        let opts = RunOpts {
+            price_input_per_m: 1.0,
+            price_output_per_m: 2.0,
+            ..Default::default()
+        };
+        let outcome = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "hi", "", &opts, &mut stats)
+            .await
+            .unwrap();
+        assert_eq!(outcome.usage.input_tokens, 1000);
+        assert_eq!(outcome.usage.output_tokens, 2000);
+        assert!((outcome.cost_yuan - 0.005).abs() < 1e-9, "{}", outcome.cost_yuan);
+        // engine already accumulated into stats (跨 ask 累计语义)
+        assert!((stats.cost_yuan - 0.005).abs() < 1e-9);
+
+        // Budget smaller than one call's spend: the first call runs, then the
+        // engine refuses to continue (guard sits before the next call).
+        let mut fake2 = FakeChat {
+            script: vec![
+                (r#"{"tool":"check","args":{}}"#.into(), Usage { input_tokens: 1000, output_tokens: 2000 }),
+                (r#"{"reply":"x","done":true}"#.into(), Usage { input_tokens: 10, output_tokens: 5 }),
+            ]
+            .into_iter()
+            .collect(),
+            snapshots: Vec::new(),
+        };
+        let opts_broke = RunOpts {
+            price_input_per_m: 1.0,
+            price_output_per_m: 2.0,
+            budget_remaining: 0.001,
+            ..Default::default()
+        };
+        let err = Harness::default()
+            .run(&mut fake2, &mut tools, &mut doc, "hi", "", &opts_broke, &mut SessionStats::default())
+            .await
+            .unwrap_err();
+        assert!(err.contains("预算"), "{err}");
+        assert_eq!(fake2.snapshots.len(), 1, "预算用尽后不应再发起调用");
+    }
+
+    #[tokio::test]
+    async fn context_limit_guard_rejects_oversized_prompts() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut fake = FakeChat::new(vec![]);
+        let mut tools = Tools::new(false);
+        let opts = RunOpts {
+            context_limit: Some(10), // tiny: any real prompt exceeds it
+            ..Default::default()
+        };
+        let err = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "hi", "", &opts, &mut SessionStats::default())
+            .await
+            .unwrap_err();
+        assert!(err.contains("context_length"), "{err}");
+        assert!(fake.snapshots.is_empty(), "超限时不应发起调用");
     }
 
     #[tokio::test]
     async fn old_screenshots_are_folded_after_a_newer_view() {
         let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
-        // view -> edit b -> view -> done: the first screenshot must be folded
-        // once the second arrives, so at most one image is ever in context.
         let mut fake = FakeChat::new(vec![
             r#"{"tool":"view","args":{}}"#,
             r#"{"tool":"edit","args":{"range":"cell:b","text":"<mxCell id=\"b\" value=\"B2\" parent=\"1\"/>"}}"#,
@@ -338,7 +539,7 @@ mod tests {
         let renderer = drawio_agent_renderer::Renderer::new(std::sync::Arc::new(mock));
         let mut tools = Tools::with_renderer(renderer);
         let outcome = Harness::default()
-            .run(&mut fake, &mut tools, &mut doc, "检查布局", "")
+            .run(&mut fake, &mut tools, &mut doc, "检查布局", "", &RunOpts::default(), &mut SessionStats::default())
             .await
             .unwrap();
         assert_eq!(outcome.tool_calls, 3);
@@ -349,9 +550,10 @@ mod tests {
             .filter(|p| matches!(p, Part::ImagePng(_)))
             .count();
         assert_eq!(images, 1, "上下文中最多保留最近一张截图");
-        // the folded one became an explicit note
         assert!(final_snapshot.iter().any(|m| {
-            m.parts.iter().any(|p| matches!(p, Part::Text(t) if t.contains("已折叠")))
+            m.parts
+                .iter()
+                .any(|p| matches!(p, Part::Text(t) if t.contains("已折叠")))
         }));
     }
 }

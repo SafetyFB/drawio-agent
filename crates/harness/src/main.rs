@@ -127,6 +127,7 @@ fn main() {
 
     let harness = Harness::default();
     let mut tools = Tools::new(true);
+    let mut session_usage = drawio_harness::SessionStats::default();
     let mut pending_ctx: String = String::new();
     let mut chat = chat.map(|c| Box::new(c) as Box<dyn Chat>);
 
@@ -249,13 +250,48 @@ fn main() {
                     } else {
                         ctx
                     };
-                    match rt.block_on(harness.run(c.as_mut(), &mut tools, &mut doc, &line, &ctx)) {
+                    let cfg = drawio_harness::config::effective_settings().unwrap_or_default();
+                    let budget = cfg.budget_yuan;
+                    let opts = {
+                        let mut o = drawio_harness::RunOpts::from_settings(&cfg);
+                        if let Some(b) = budget {
+                            o.budget_remaining = (b - session_usage.cost_yuan).max(0.0);
+                        }
+                        o
+                    };
+                    match rt.block_on(harness.run(
+                        c.as_mut(),
+                        &mut tools,
+                        &mut doc,
+                        &line,
+                        &ctx,
+                        &opts,
+                        &mut session_usage,
+                    )) {
                         Ok(outcome) => {
                             if !outcome.reply.is_empty() {
                                 println!("── {}\n", outcome.reply);
                             }
                             if outcome.tool_calls > 0 {
                                 println!("（本轮工具调用 {} 次）", outcome.tool_calls);
+                            }
+                            let spent = outcome.cost_yuan;
+                            println!(
+                                "用量: {} in + {} out tokens{}",
+                                outcome.usage.input_tokens,
+                                outcome.usage.output_tokens,
+                                if spent > 0.0 {
+                                    format!(" ≈ ¥{spent:.4}")
+                                } else {
+                                    String::new()
+                                }
+                            );
+                            if let Some(b) = budget {
+                                println!(
+                                    "会话累计: ¥{:.4} / ¥{b:.2}{}",
+                                    session_usage.cost_yuan,
+                                    if session_usage.cost_yuan >= b { "（已达预算上限）" } else { "" }
+                                );
                             }
                         }
                         Err(e) => eprintln!("对话出错: {e}"),
@@ -294,6 +330,10 @@ fn config_cli(args: &[String]) {
                 println!("base_url: {}", s.base_url);
                 println!("model:    {}", s.model);
                 println!("api_key:  {}", s.api_key_masked());
+                println!("context_length: {:?}", s.context_length);
+                println!("thinking: {:?}", s.thinking);
+                println!("price:    ¥{}/百万 in, ¥{}/百万 out", s.price_input_per_m, s.price_output_per_m);
+                println!("budget:   {:?}", s.budget_yuan);
             }
             None => {
                 eprintln!("未配置 LLM。保存方式: drawio-harness config set --base-url <url> --model <model> [--api-key <key>]");
@@ -304,6 +344,11 @@ fn config_cli(args: &[String]) {
             let mut base_url = String::new();
             let mut model = String::new();
             let mut api_key: Option<String> = None;
+            let mut context_length: Option<u64> = None;
+            let mut no_think = false;
+            let mut price_in: Option<f64> = None;
+            let mut price_out: Option<f64> = None;
+            let mut budget: Option<Option<f64>> = None; // Some(None) = 清除
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -325,6 +370,34 @@ fn config_cli(args: &[String]) {
                             api_key = Some(v.clone());
                         }
                     }
+                    "--context-length" => {
+                        i += 1;
+                        if let Some(v) = args.get(i) {
+                            context_length = v.parse().ok();
+                        }
+                    }
+                    "--no-think" => no_think = true,
+                    "--think-default" => no_think = false,
+                    "--price-in" => {
+                        i += 1;
+                        if let Some(v) = args.get(i) {
+                            price_in = v.parse().ok();
+                        }
+                    }
+                    "--price-out" => {
+                        i += 1;
+                        if let Some(v) = args.get(i) {
+                            price_out = v.parse().ok();
+                        }
+                    }
+                    "--budget" => {
+                        i += 1;
+                        match args.get(i).map(|s| s.as_str()) {
+                            Some("none") | Some("") => budget = Some(None),
+                            Some(v) => budget = Some(v.parse().ok()),
+                            None => {}
+                        }
+                    }
                     other => {
                         eprintln!("未知参数: {other}");
                         std::process::exit(2);
@@ -333,7 +406,7 @@ fn config_cli(args: &[String]) {
                 i += 1;
             }
             if base_url.is_empty() || model.is_empty() {
-                eprintln!("需要 --base-url 与 --model（--api-key 可选）");
+                eprintln!("需要 --base-url 与 --model。可选: --api-key --context-length --no-think|--think-default --price-in --price-out --budget <元|none>");
                 std::process::exit(2);
             }
             let mut s = config::effective_settings().unwrap_or_default();
@@ -341,6 +414,23 @@ fn config_cli(args: &[String]) {
             s.model = model;
             if let Some(k) = api_key {
                 s.api_key = k;
+            }
+            if context_length.is_some() {
+                s.context_length = context_length;
+            }
+            if no_think {
+                s.thinking = drawio_harness::ThinkingMode::NoThink;
+            } else if args.iter().any(|a| a == "--think-default") {
+                s.thinking = drawio_harness::ThinkingMode::Default;
+            }
+            if let Some(v) = price_in {
+                s.price_input_per_m = v;
+            }
+            if let Some(v) = price_out {
+                s.price_output_per_m = v;
+            }
+            if let Some(v) = budget {
+                s.budget_yuan = v;
             }
             match config::config_file_path() {
                 Some(p) => match config::save_config_file(&p, &s) {

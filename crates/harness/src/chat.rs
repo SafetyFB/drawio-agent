@@ -86,10 +86,41 @@ pub enum ChatError {
     Empty,
 }
 
+/// Token usage reported by the API (OpenAI `usage` block).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl Usage {
+    pub fn total(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+    pub fn add(&mut self, other: &Usage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+    }
+}
+
+/// Per-call options (thinking mode).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CallOpts {
+    /// `thinking: {"type": "disabled"}` — GLM 4.6+ fast path.
+    pub no_think: bool,
+}
+
+/// Result of one chat completion: the assistant text plus usage.
+#[derive(Debug, Clone)]
+pub struct Reply {
+    pub text: String,
+    pub usage: Usage,
+}
+
 /// Sends chat-completion requests; mocked in tests via the trait.
 #[async_trait::async_trait]
 pub trait Chat: Send {
-    async fn complete(&mut self, messages: &[Message]) -> Result<String, ChatError>;
+    async fn complete(&mut self, messages: &[Message], opts: &CallOpts) -> Result<Reply, ChatError>;
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +134,8 @@ pub struct OpenAiChat {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +146,14 @@ struct Choice {
 #[derive(Debug, Deserialize)]
 struct RespMessage {
     content: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct WireUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
 }
 
 impl OpenAiChat {
@@ -149,7 +190,7 @@ impl OpenAiChat {
 
 #[async_trait::async_trait]
 impl Chat for OpenAiChat {
-    async fn complete(&mut self, messages: &[Message]) -> Result<String, ChatError> {
+    async fn complete(&mut self, messages: &[Message], opts: &CallOpts) -> Result<Reply, ChatError> {
         let mut body = serde_json::Map::new();
         body.insert("model".into(), serde_json::json!(self.model));
         let msgs: Vec<serde_json::Value> = messages
@@ -161,6 +202,9 @@ impl Chat for OpenAiChat {
             "temperature".into(),
             serde_json::json!(0.7),
         );
+        if opts.no_think {
+            body.insert("thinking".into(), serde_json::json!({"type": "disabled"}));
+        }
 
         let mut req = self
             .client
@@ -184,13 +228,21 @@ impl Chat for OpenAiChat {
         }
         let parsed: ChatResponse = serde_json::from_str(&text)
             .map_err(|e| ChatError::Api(format!("bad response shape: {e}: {}", truncate(&text, 400))))?;
-        parsed
+        let usage = parsed.usage.unwrap_or_default();
+        let text = parsed
             .choices
             .into_iter()
             .next()
             .and_then(|c| c.message.content)
             .filter(|c| !c.trim().is_empty())
-            .ok_or(ChatError::Empty)
+            .ok_or(ChatError::Empty)?;
+        Ok(Reply {
+            text,
+            usage: Usage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+            },
+        })
     }
 }
 

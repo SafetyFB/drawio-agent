@@ -113,3 +113,11 @@ textarea:focus { outline: none; border-color: var(--accent); }
 .modal-actions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
 button.secondary { background: #242836; }
 button.primary-btn { background: var(--accent); color: #fff; border: none; }
+
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+select.field, .field select {
+  background: #12141a; color: var(--fg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 10px; font: inherit;
+}
+#usage { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#usage.warn { border-color: var(--warn); color: var(--warn); }

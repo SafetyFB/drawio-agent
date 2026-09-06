@@ -13,9 +13,9 @@ pub mod tools;
 pub mod web;
 pub mod xmlfile;
 
-pub use chat::{Chat, ChatError, Message, OpenAiChat};
-pub use config::{LlmSettings, mask_secret};
-pub use engine::{parse_envelope, Harness, TurnOutcome};
+pub use chat::{CallOpts, Chat, ChatError, Message, OpenAiChat, Reply, Usage};
+pub use config::{LlmSettings, ThinkingMode, mask_secret, preset_prices, usage_cost};
+pub use engine::{parse_envelope, Harness, RunOpts, SessionStats, TurnOutcome};
 pub use refs::{resolve_refs, ResolvedRef};
 pub use tools::Tools;
 pub use xmlfile::{CellSpan, CheckReport, EditReport, XmlDoc, XmlError};

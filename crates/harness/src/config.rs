@@ -21,8 +21,21 @@ pub enum ConfigError {
     Json(#[from] serde_json::Error),
 }
 
+/// Thinking mode for LLM calls. `Default` leaves the model's own setting
+/// alone; `NoThink` requests `thinking: {"type": "disabled"}` (GLM 4.6+).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThinkingMode {
+    #[default]
+    Default,
+    NoThink,
+}
+
 /// The user-facing LLM settings (what the UI edits and what persists).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// Old config files (base_url/api_key/model only) keep loading: every new
+/// field has a serde default.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct LlmSettings {
     #[serde(default)]
     pub base_url: String,
@@ -30,6 +43,53 @@ pub struct LlmSettings {
     pub api_key: String,
     #[serde(default)]
     pub model: String,
+    /// Context window in tokens. Used to guard prompt size before a call.
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    /// Fast path: disable provider-internal reasoning.
+    #[serde(default)]
+    pub thinking: ThinkingMode,
+    /// Price in ¥ per 1M input tokens (0 = 未计价，只统计 token)。
+    #[serde(default)]
+    pub price_input_per_m: f64,
+    /// Price in ¥ per 1M output tokens.
+    #[serde(default)]
+    pub price_output_per_m: f64,
+    /// Optional session spend cap in ¥; the agent stops when reached.
+    #[serde(default)]
+    pub budget_yuan: Option<f64>,
+}
+
+/// Well-known model prices (¥/1M tokens, 2025 官方公开价，仅作填表便利;
+/// 实际以账单为准，可手动修改). Preset only when the user asks.
+pub fn preset_prices(model: &str) -> Option<(f64, f64)> {
+    let m = model.to_lowercase();
+    let p = if m.contains("glm-4.6") || m.contains("glm-4.5") {
+        (5.0, 15.0)
+    } else if m.contains("glm-4-flash") {
+        (0.0, 0.0)
+    } else if m.contains("glm-4") || m.contains("glm-4v") {
+        (0.1, 0.1)
+    } else if m.contains("deepseek-chat") {
+        (2.0, 8.0)
+    } else if m.contains("deepseek-reasoner") {
+        (4.0, 16.0)
+    } else if m.contains("gpt-4o") {
+        (17.0, 68.0)
+    } else if m.contains("gpt-4o-mini") {
+        (1.1, 4.4)
+    } else if m.contains("qwen") && m.contains("vl") {
+        (2.0, 6.0)
+    } else {
+        return None;
+    };
+    Some(p)
+}
+
+/// ¥ cost of a usage at the given settings (0 price = 0 cost, token 照常统计).
+pub fn usage_cost(input_tokens: u64, output_tokens: u64, s: &LlmSettings) -> f64 {
+    input_tokens as f64 / 1e6 * s.price_input_per_m
+        + output_tokens as f64 / 1e6 * s.price_output_per_m
 }
 
 /// On-disk shape: `{ "llm": { "kind": "openai-compat", ... } }`. The old
@@ -105,6 +165,7 @@ pub fn effective_settings() -> Option<LlmSettings> {
                 base_url,
                 model,
                 api_key: std::env::var("DRAWIO_LLM_API_KEY").unwrap_or_default(),
+                ..Default::default()
             })
         }
         _ => None,
@@ -160,6 +221,7 @@ mod tests {
             base_url: "https://x.example/v1".into(),
             model: "m-1".into(),
             api_key: "abcdefgh-12345678".into(),
+            ..Default::default()
         };
         save_config_file(&p, &s).unwrap();
         let loaded = load_config_file(&p).unwrap();
@@ -205,6 +267,7 @@ mod tests {
                 base_url: "https://file/v1".into(),
                 model: "file-model".into(),
                 api_key: "".into(),
+                ..Default::default()
             },
         )
         .unwrap();

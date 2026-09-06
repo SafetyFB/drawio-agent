@@ -32,6 +32,10 @@ pub struct WebState {
     pub doc: XmlDoc,
     pub chat: Option<OpenAiChat>,
     pub tools: Tools,
+    /// Session totals across asks (usage + ¥ under current prices).
+    pub usage: crate::engine::SessionStats,
+    /// ¥ session budget from the config at the last ask.
+    pub budget_yuan: Option<f64>,
 }
 
 impl WebState {
@@ -51,6 +55,8 @@ pub async fn serve(path: PathBuf, port: u16) -> Result<(), String> {
         doc,
         chat,
         tools: Tools::new(true),
+        usage: crate::engine::SessionStats::default(),
+        budget_yuan: None,
     }));
 
     let app = Router::new()
@@ -133,6 +139,12 @@ async fn api_state(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::V
         "llm_ready": st.llm_ready(),
         "render": st.tools.render,
         "config_source": config_source_label(),
+        "session": json!({
+            "in": st.usage.usage.input_tokens,
+            "out": st.usage.usage.output_tokens,
+            "cost_yuan": st.usage.cost_yuan,
+            "budget_yuan": st.budget_yuan,
+        }),
     }))
 }
 
@@ -185,18 +197,44 @@ async fn api_chat(
         }
     };
 
+    // Snapshot config knobs per ask: hot config changes apply next ask.
+    let cfg = config::effective_settings().unwrap_or_default();
+    let budget_yuan = cfg.budget_yuan;
+    let opts = {
+        let mut o = crate::engine::RunOpts::from_settings(&cfg);
+        if let Some(b) = budget_yuan {
+            o.budget_remaining = (b - st.usage.cost_yuan).max(0.0);
+        }
+        o
+    };
     let harness = Harness::default();
-    let WebState { doc, chat, tools, .. } = &mut *st;
+    let WebState { doc, chat, tools, usage, .. } = &mut *st;
     let chat = chat.as_mut().expect("checked above");
-    match harness.run(chat, tools, doc, &req.text, &ctx).await {
+    match harness.run(chat, tools, doc, &req.text, &ctx, &opts, usage).await {
         Ok(outcome) => Json(json!({
             "reply": outcome.reply,
             "tool_calls": outcome.tool_calls,
             "cells": doc.cells.len(),
             "selected_refs": if ctx.is_empty() { 0 } else { ctx.lines().count() },
+            "usage": json!({ "in": outcome.usage.input_tokens, "out": outcome.usage.output_tokens }),
+            "cost_yuan": outcome.cost_yuan,
+            "session": json!({
+                "in": usage.usage.input_tokens,
+                "out": usage.usage.output_tokens,
+                "cost_yuan": usage.cost_yuan,
+                "budget_yuan": budget_yuan,
+            }),
             "error": null,
         })),
-        Err(e) => Json(json!({ "reply": null, "tool_calls": 0, "error": e })),
+        Err(e) => Json(json!({
+            "reply": null, "tool_calls": 0, "error": e,
+            "session": json!({
+                "in": usage.usage.input_tokens,
+                "out": usage.usage.output_tokens,
+                "cost_yuan": usage.cost_yuan,
+                "budget_yuan": budget_yuan,
+            }),
+        })),
     }
 }
 
@@ -255,8 +293,15 @@ fn llm_view() -> serde_json::Value {
             "base_url": s.base_url,
             "model": s.model,
             "api_key_masked": s.api_key_masked(),
+            "context_length": s.context_length,
+            "thinking": s.thinking,
+            "price_input_per_m": s.price_input_per_m,
+            "price_output_per_m": s.price_output_per_m,
+            "budget_yuan": s.budget_yuan,
         }),
-        None => json!({ "kind": "unconfigured", "base_url": "", "model": "", "api_key_masked": "" }),
+        None => json!({ "kind": "unconfigured", "base_url": "", "model": "", "api_key_masked": "",
+            "context_length": null, "thinking": "default",
+            "price_input_per_m": 0.0, "price_output_per_m": 0.0, "budget_yuan": null }),
     }
 }
 
@@ -280,6 +325,16 @@ struct ConfigPutReq {
     model: String,
     #[serde(default)]
     api_key: String,
+    #[serde(default)]
+    context_length: Option<u64>,
+    #[serde(default)]
+    thinking: Option<config::ThinkingMode>,
+    #[serde(default)]
+    price_input_per_m: Option<f64>,
+    #[serde(default)]
+    price_output_per_m: Option<f64>,
+    #[serde(default)]
+    budget_yuan: Option<f64>,
 }
 
 async fn api_config_put(
@@ -299,7 +354,18 @@ async fn api_config_put(
     } else {
         req.api_key.trim().to_string()
     };
-    let settings = LlmSettings { base_url, model, api_key };
+    // Full-form semantics: every field is sent by the UI (null/absent =
+    // cleared to default), except the API key which is merged on blank.
+    let settings = LlmSettings {
+        base_url,
+        model,
+        api_key,
+        context_length: req.context_length,
+        thinking: req.thinking.unwrap_or_default(),
+        price_input_per_m: req.price_input_per_m.unwrap_or(0.0),
+        price_output_per_m: req.price_output_per_m.unwrap_or(0.0),
+        budget_yuan: req.budget_yuan,
+    };
     let Some(path) = config::config_file_path() else {
         return Json(json!({ "ok": false, "error": "找不到 config 文件路径（HOME 未设置？）" }));
     };
@@ -310,6 +376,7 @@ async fn api_config_put(
     // wins over env once a config exists, mirroring the old server).
     let mut st = st.lock().await;
     st.chat = OpenAiChat::from_settings(&settings).ok();
+    st.budget_yuan = settings.budget_yuan;
     Json(json!({
         "ok": true,
         "config_file": config_file_display(),
@@ -331,21 +398,25 @@ async fn api_config_test(Json(req): Json<ConfigPutReq>) -> Json<serde_json::Valu
     } else {
         req.api_key.trim().to_string()
     };
-    let settings = LlmSettings { base_url, model, api_key };
+    let settings = LlmSettings { base_url, model, api_key, ..Default::default() };
     let mut chat = match OpenAiChat::from_settings(&settings) {
         Ok(c) => c,
         Err(e) => return Json(json!({ "ok": false, "error": e.to_string() })),
     };
     let start = std::time::Instant::now();
     match chat
-        .complete(&[crate::chat::Message::user("Reply with exactly: pong")])
+        .complete(
+            &[crate::chat::Message::user("Reply with exactly: pong")],
+            &crate::chat::CallOpts::default(),
+        )
         .await
     {
         Ok(reply) => Json(json!({
             "ok": true,
             "ms": start.elapsed().as_millis(),
             "model": settings.model,
-            "reply": reply.trim(),
+            "reply": reply.text.trim(),
+            "usage": json!({ "in": reply.usage.input_tokens, "out": reply.usage.output_tokens }),
         })),
         Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }
