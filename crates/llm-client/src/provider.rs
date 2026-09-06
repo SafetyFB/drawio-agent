@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::prompt::{
-    codegen_system_prompt, codegen_user_prompt, patch_system_prompt, review_system_prompt,
+    codegen_system_prompt, codegen_user_prompt, fix_system_prompt, fix_user_prompt,
+    patch_system_prompt, review_system_prompt,
 };
 use crate::transport::{HttpTransport, TransportError};
 use crate::Usage;
@@ -67,6 +68,89 @@ pub struct ReviewRequest {
     pub image_png: Vec<u8>,
     pub xml: String,
     pub checks: Vec<String>,
+}
+
+/// Input for the single-call multimodal fix step (v2 loop): the provider
+/// builds a system+user message pair where the user message carries the
+/// text parts built by [`crate::fix_user_prompt`] plus the rendered image.
+///
+/// `scope_xml` marks a Plan-B call: the model sees ONLY the subgraph and
+/// must return a document containing just those cells (the server merges
+/// them back). `current_xml` is the full applied state; when a scope is
+/// given it is deliberately NOT sent (the model must not rewrite the full
+/// diagram).
+#[derive(Debug, Clone)]
+pub struct FixRequest {
+    /// User instruction for this round (base ask + loop feedback notes).
+    pub instruction: String,
+    /// Full current XML. `None` when `scope_xml` is `Some` (Plan-B).
+    pub current_xml: Option<String>,
+    /// Plan-B subgraph: the ONLY cells the model may modify.
+    pub scope_xml: Option<String>,
+    /// Self-reported issues from the previous round (stateless bridge
+    /// between rounds until conversation memory lands in R2).
+    pub issues: Vec<ReviewIssue>,
+    /// Optional reviewer focus checks.
+    pub checks: Vec<String>,
+    /// Latest rendered PNG the model must visually review.
+    pub image_png: Vec<u8>,
+}
+
+/// Parsed JSON envelope returned by the fix step:
+/// `{"done", "xml", "issues", "reasoning"}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FixEnvelope {
+    /// `true` when the model fixed everything it can (or nothing needs
+    /// fixing). Missing on the wire defaults to `true`.
+    #[serde(default = "default_done")]
+    pub done: bool,
+    /// The resulting document: full mxfile, or scope-only when the request
+    /// carried a `scope_xml`.
+    pub xml: String,
+    /// Items the model could not resolve / wants re-verified visually.
+    #[serde(default)]
+    pub issues: Vec<ReviewIssue>,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+}
+
+fn default_done() -> bool {
+    true
+}
+
+/// Parse the assistant's fix response into a [`FixEnvelope`]. Strict about
+/// the fields the loop actually gates on (`xml`, `done`); missing `issues`
+/// and `reasoning` are tolerated.
+pub fn parse_fix_envelope(content: &str) -> Result<FixEnvelope, String> {
+    let parsed: Value = serde_json::from_str(content).map_err(|e| {
+        format!("fix response is not a JSON object ({e}); expected envelope \
+                 {{\"done\": bool, \"xml\": \"<mxfile>…\"}}")
+    })?;
+    let xml = parsed
+        .get("xml")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            "fix response missing string 'xml' field; expected envelope \
+             {\"done\": bool, \"xml\": \"<mxfile>…\"}".to_string()
+        })?;
+    let done = parsed.get("done").and_then(Value::as_bool).unwrap_or(true);
+    let issues: Vec<ReviewIssue> = parsed
+        .get("issues")
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()
+        .map_err(|e| format!("fix response 'issues' is malformed: {e}"))?
+        .unwrap_or_default();
+    let reasoning = parsed
+        .get("reasoning")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(FixEnvelope {
+        done,
+        xml,
+        issues,
+        reasoning,
+    })
 }
 
 /// A typed response from an LLM call.
@@ -124,6 +208,22 @@ pub trait LlmProvider: Send + Sync {
         &self,
         req: ReviewRequest,
     ) -> Result<LlmResponse<ReviewResponse>, ProviderError>;
+    /// Single-call multimodal self-review-and-fix (v2 loop). The model sees
+    /// the latest render and edits the XML in one call; the assistant
+    /// content is the raw JSON envelope (parse with
+    /// [`parse_fix_envelope`]).
+    ///
+    /// Default: unsupported. Providers without this capability fail fast so
+    /// callers can fall back to the split generate/review pipeline.
+    async fn fix_diagram(
+        &self,
+        req: FixRequest,
+    ) -> Result<LlmResponse<String>, ProviderError> {
+        let _ = req;
+        Err(ProviderError::Provider(
+            "fix_diagram: multimodal single-call fix not supported by this provider".into(),
+        ))
+    }
 }
 
 /// An OpenAI-compatible provider speaking the `/chat/completions` protocol.
@@ -316,6 +416,49 @@ impl LlmProvider for OpenAiCompatProvider {
             finish_reason,
         })
     }
+
+    async fn fix_diagram(
+        &self,
+        req: FixRequest,
+    ) -> Result<LlmResponse<String>, ProviderError> {
+        let start = Instant::now();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&req.image_png);
+        let image_url = format!("data:image/png;base64,{encoded}");
+        let user_text = fix_user_prompt(
+            &req.instruction,
+            req.current_xml.as_deref(),
+            req.scope_xml.as_deref(),
+            &req.issues,
+            &req.checks,
+        );
+        let mut body = json!({
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": fix_system_prompt()},
+                {"role": "user", "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ]},
+            ],
+        });
+        // The envelope ({"done", "xml", "issues"}) is required for the loop
+        // to gate convergence, so always request structured JSON output.
+        body["response_format"] = json!({"type": "json_object"});
+        let raw = self.post(&body).await?;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        let content = parse_content(&raw)?;
+        let usage = parse_usage(&raw)?;
+        let finish_reason = parse_finish_reason(&raw);
+
+        Ok(LlmResponse {
+            content,
+            usage,
+            raw,
+            duration_ms,
+            finish_reason,
+        })
+    }
 }
 
 /// Extract `choices[0].message.content` as a string.
@@ -494,6 +637,58 @@ mod tests {
         assert!(
             err.to_string().contains("usage"),
             "error should name the missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_fix_envelope_requires_xml_and_reads_done() {
+        let env = parse_fix_envelope(
+            r#"{"done": false, "xml": "<mxfile/>", "issues": [], "reasoning": "wip"}"#,
+        )
+        .unwrap();
+        assert!(!env.done);
+        assert_eq!(env.xml, "<mxfile/>");
+        assert!(env.issues.is_empty());
+        assert_eq!(env.reasoning.as_deref(), Some("wip"));
+    }
+
+    #[test]
+    fn parse_fix_envelope_defaults_done_to_true_and_tolerates_missing_fields() {
+        let env = parse_fix_envelope(r#"{"xml": "<mxfile/>"}"#).unwrap();
+        assert!(env.done, "missing done should default to true");
+        assert!(env.issues.is_empty());
+        assert!(env.reasoning.is_none());
+    }
+
+    #[test]
+    fn parse_fix_envelope_reads_self_reported_issues() {
+        let env = parse_fix_envelope(
+            r#"{"done": false,
+                "xml": "<mxfile/>",
+                "issues": [{"kind": "overlap", "severity": "high",
+                             "cell_ids": ["2", "3"], "description": "A overlaps B"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(env.issues.len(), 1);
+        assert_eq!(env.issues[0].kind, "overlap");
+        assert_eq!(env.issues[0].cell_ids, vec!["2", "3"]);
+    }
+
+    #[test]
+    fn parse_fix_envelope_errors_when_xml_missing() {
+        let err = parse_fix_envelope(r#"{"done": true}"#).unwrap_err();
+        assert!(
+            err.contains("xml"),
+            "error should name the missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_fix_envelope_errors_on_non_json_content() {
+        let err = parse_fix_envelope("<mxfile>bare xml, no envelope</mxfile>").unwrap_err();
+        assert!(
+            err.contains("JSON"),
+            "bare XML must be rejected with a JSON hint: {err}"
         );
     }
 }

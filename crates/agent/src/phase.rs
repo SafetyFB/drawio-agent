@@ -7,18 +7,20 @@ use serde::{Deserialize, Serialize};
 pub enum LoopPhase {
     /// Initial state before any action has run.
     Pending,
-    /// Codegen call to produce (or update) the diagram XML.
+    /// Codegen call to produce the initial diagram XML (only when the
+    /// caller supplied no starting XML).
     Generate,
     /// Renderer producing a PNG from the current XML.
     Render,
-    /// VLM visual review of the current PNG.
-    Review,
-    /// Patch: re-run codegen scoped to the cells flagged by the reviewer.
-    Patch,
-    /// Review returned verdict "pass" — loop converged.
+    /// The v2 single-call fix round: the LLM sees the latest render and
+    /// self-reviews + edits the XML in ONE multimodal call (review is no
+    /// longer a separate phase).
+    Fix,
+    /// A fix round returned `done=true` (and its output was acceptable) —
+    /// loop converged.
     Done,
-    /// `max_iterations` reached without converging; final_xml is the best
-    /// attempt.
+    /// `max_iterations` reached without a `done=true` round; final_xml is
+    /// the best attempt.
     Failed,
 }
 
@@ -29,8 +31,7 @@ impl LoopPhase {
             Self::Pending => "pending",
             Self::Generate => "generate",
             Self::Render => "render",
-            Self::Review => "review",
-            Self::Patch => "patch",
+            Self::Fix => "fix",
             Self::Done => "done",
             Self::Failed => "failed",
         }

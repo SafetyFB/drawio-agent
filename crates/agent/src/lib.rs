@@ -1,8 +1,14 @@
-//! Agent Loop: Generate → Render → Review → Patch state machine.
+//! Agent Loop: Generate (baseline) → Render → Fix state machine (v2).
 //!
-//! This crate orchestrates the four dependent capabilities (LLM codegen,
-//! renderer, visual reviewer, patcher) into a single loop that drives a
-//! session from initial prompt to verified-correct diagram.
+//! This crate orchestrates the capabilities (LLM codegen, renderer,
+//! single-call multimodal fix) into a single loop that drives a session
+//! from initial prompt to a model-confirmed diagram.
+//!
+//! v2 semantics: the separate Review phase is gone. Each round renders the
+//! current XML and makes ONE multimodal call — the model sees the latest
+//! render, self-reviews it, and edits the XML in the same response
+//! (`{done, xml, issues}` envelope). Convergence is the model's `done`
+//! flag plus deps-side validation (parse / no-op / scope merge).
 
 #![deny(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
@@ -16,7 +22,7 @@ pub mod deps;
 pub mod runner;
 pub mod phase;
 
-pub use deps::AgentDeps;
+pub use deps::{AgentDeps, FixError, FixOutcome, FixRequest};
 pub use runner::run;
 pub use phase::{LoopPhase, LoopState};
 
@@ -28,16 +34,21 @@ pub type ProgressCb = Arc<dyn Fn(drawio_agent_trajectory::TrajectoryEvent) + Sen
 /// Configuration for a single Agent Loop run.
 #[derive(Clone)]
 pub struct AgentLoop {
-    /// Initial prompt for the codegen step. Required when `initial_xml`
-    /// is `None`; ignored otherwise.
+    /// The user's ask. Kept stable across rounds and sent to the model
+    /// every round, so a stateless model never loses the objective.
     pub prompt: String,
     /// Optional starting XML (skips the initial Generate phase when Some).
     pub initial_xml: Option<String>,
-    /// Maximum render-review-patch iterations. Default 5.
+    /// Maximum fix rounds (render + single multimodal call each).
+    /// Default 5.
     pub max_iterations: u32,
-    /// Cells to focus on during Patch (e.g. specific node IDs).
+    /// Cells the user explicitly targeted (canvas selection). Non-empty
+    /// switches every fix round into Plan-B scope mode: the model only
+    /// sees/edits these cells. When empty, scoping falls back to the
+    /// self-reported issue cells of the previous round.
     pub patch_cell_ids: Vec<String>,
-    /// Optional reviewer checks. Default: empty (VLM decides what to look for).
+    /// Optional reviewer focus checks, forwarded to every fix round.
+    /// Default: empty (the model decides what to look for).
     pub review_checks: Vec<String>,
     /// Optional live-progress callback. Invoked (synchronously, in record
     /// order) for every trajectory event the loop records, before the run
@@ -96,17 +107,18 @@ pub struct AgentOutcome {
     /// via `final_xml`.
     #[serde(rename = "xml")]
     pub final_xml: String,
-    /// How many full Generate-Render-Review iterations ran.
+    /// How many fix rounds ran.
     pub iterations: u32,
-    /// `true` when the final phase is `Done` (verdict was "pass").
-    /// Serialized as a field (not just a method) so the JS client can
-    /// branch on it without re-deriving from `final_phase`.
+    /// `true` when the final phase is `Done` (the last fix round reported
+    /// `done=true`). Serialized as a field (not just a method) so the JS
+    /// client can branch on it without re-deriving from `final_phase`.
     pub converged: bool,
     /// Final phase at termination (Done or Failed).
     pub final_phase: LoopPhase,
-    /// Verdict of the most recent review (None if review never ran).
+    /// Verdict of the most recent fix round ("pass" for done, "issues"
+    /// otherwise; None if no fix round ever ran).
     pub last_verdict: Option<String>,
-    /// Count of review issues in the last review.
+    /// Count of issues reported in the last fix round.
     pub last_issue_count: u32,
     /// All trajectory events recorded during the run.
     pub trajectory: Vec<drawio_agent_trajectory::Event>,

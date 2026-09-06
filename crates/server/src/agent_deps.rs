@@ -1,12 +1,13 @@
 //! Adapter wiring the server's shared `LlmProvider` + `RenderDriver` into
-//! the Agent Loop's `AgentDeps` trait.
+//! the Agent Loop's `AgentDeps` trait (v2 single-context loop).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use drawio_agent_agent::AgentDeps;
+use drawio_agent_agent::{AgentDeps, FixError, FixOutcome, FixRequest};
 use drawio_agent_llm_client::{
-    GenerateRequest, LlmProvider, LlmResponse, ReviewRequest, ReviewResponse,
+    parse_fix_envelope, FixRequest as ProviderFixRequest, GenerateRequest, LlmProvider,
+    LlmResponse, ReviewIssue,
 };
 use drawio_agent_renderer::{RenderDriver, RenderError, RenderOptions};
 
@@ -32,111 +33,129 @@ impl AgentDeps for ServerAgentDeps {
         self.renderer.render(xml, &RenderOptions::default()).await
     }
 
-    async fn review(&self, xml: &str, png: &[u8]) -> Result<ReviewResponse, String> {
-        self.llm
-            .review_visual(ReviewRequest {
-                image_png: png.to_vec(),
-                xml: xml.to_string(),
-                checks: vec![],
-            })
-            .await
-            .map(|r| r.content)
-            .map_err(|e| e.to_string())
-    }
-
-    async fn patch(
-        &self,
-        xml: &str,
-        cell_ids: &[String],
-        instructions: &str,
-    ) -> Result<LlmResponse<String>, String> {
-        // Plan B: extract the subgraph for the targeted cells and send ONLY
-        // that as the LLM's scope (never the full diagram), then apply the
-        // returned subgraph back onto the full model. Falls back to the old
-        // full-context call when the XML can't be parsed or no cells are
-        // targeted (nothing to scope by).
-        let mut file = match drawio_agent_xml_core::MxFile::parse(xml.as_bytes()) {
-            Ok(f) => f,
-            Err(_e) => {
-                return self
-                    .llm
-                    .generate_xml(GenerateRequest {
-                        user_prompt: format!("Patch: {instructions}"),
-                        current_xml: Some(xml.to_string()),
-                        scope: Some(xml.to_string()),
-                        feedback: None,
-                        json_mode: false,
-                    })
-                    .await
-                    .map_err(|e| e.to_string());
-            }
+    async fn fix(&self, req: &FixRequest) -> Result<FixOutcome, FixError> {
+        // Plan-B scoping: when cells are targeted, the model sees ONLY the
+        // subgraph (never the full diagram) and its scope-only result is
+        // merged back cell-by-cell; untouched cells stay byte-identical.
+        let full_parse = drawio_agent_xml_core::MxFile::parse(req.xml.as_bytes());
+        let mut full_file = match full_parse {
+            Ok(f) => Some(f),
+            // Unparseable current state (shouldn't happen — the state was
+            // validated on the way in) — fall back to a plain full-document
+            // fix and let the loop's own validation catch problems.
+            Err(_) => None,
         };
-        let cell_id_refs: Vec<&str> = cell_ids.iter().map(|s| s.as_str()).collect();
+
+        let cell_id_refs: Vec<&str> = req.cell_ids.iter().map(|s| s.as_str()).collect();
         let (scope_xml, subgraph) = if cell_id_refs.is_empty() {
             (None, None)
         } else {
+            let file = full_file
+                .as_mut()
+                .ok_or_else(|| FixError::Llm("current XML unparseable; cannot scope fix".into()))?;
             let model = file
                 .diagrams
                 .first_mut()
-                .ok_or_else(|| "no diagram in current XML".to_string())?
-                .model
-                .as_mut()
-                .ok_or_else(|| "no model in current XML".to_string())?;
+                .and_then(|d| d.model.as_mut())
+                .ok_or_else(|| FixError::Llm("no diagram/model in current XML".into()))?;
             let sub = model.extract_subgraph(&cell_id_refs);
+            // A targeted fix with unknown cells would silently no-op — be
+            // loud instead so the runner feeds it back.
+            let missing: Vec<&str> = sub.missing.iter().map(|s| s.as_str()).collect();
+            if !missing.is_empty() {
+                return Err(FixError::Rejected(format!(
+                    "scope cells not found in current diagram: {}",
+                    missing.join(", ")
+                )));
+            }
             let scope = drawio_agent_xml_core::serialize_subgraph(&sub)
-                .map_err(|e| format!("subgraph serialize: {e}"))?;
+                .map_err(|e| FixError::Llm(format!("subgraph serialize: {e}")))?;
             (Some(scope), Some(sub))
         };
 
-        let req = match &scope_xml {
-            Some(scope) => GenerateRequest {
-                user_prompt: format!("Patch: {instructions}"),
-                current_xml: None,
-                scope: Some(scope.clone()),
-                feedback: None,
-                json_mode: false,
-            },
-            None => GenerateRequest {
-                user_prompt: format!("Patch: {instructions}"),
-                current_xml: Some(xml.to_string()),
-                scope: Some(xml.to_string()),
-                feedback: None,
-                json_mode: false,
-            },
-        };
-
-        let mut resp = self
+        let prior_issues: Vec<ReviewIssue> = req.prior_issues.clone();
+        let resp = self
             .llm
-            .generate_xml(req)
+            .fix_diagram(ProviderFixRequest {
+                instruction: req.instruction.clone(),
+                current_xml: scope_xml.is_none().then(|| req.xml.clone()),
+                scope_xml,
+                issues: prior_issues,
+                checks: req.checks.clone(),
+                image_png: req.image_png.clone(),
+            })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| FixError::Llm(e.to_string()))?;
 
-        // Plan B: stitch the LLM's patched subgraph back into the full model
-        // so the returned XML is the complete updated diagram (the runner
-        // stores it as the session's new current XML).
-        if subgraph.is_some() {
-            let patched = drawio_agent_xml_core::MxFile::parse(resp.content.as_bytes())
-                .map_err(|e| format!("parse LLM patch response: {e}"))?;
-            let patched_subgraph = patched
+        // The assistant content is the JSON envelope; the model is told to
+        // always put the full resulting state in `xml`. Parse strictly and
+        // classify anything unusable as Rejected so the loop can retry with
+        // the reason instead of dying.
+        let envelope = parse_fix_envelope(&resp.content).map_err(FixError::Rejected)?;
+
+        let new_full_xml: String = if subgraph.is_some() {
+            // Scope mode: the returned document should contain (at least)
+            // the targeted cells; merge them onto the untouched original.
+            let patched = drawio_agent_xml_core::MxFile::parse(envelope.xml.as_bytes())
+                .map_err(|e| FixError::Rejected(format!("fix output is not valid mxfile: {e}")))?;
+            let patched_model = patched
                 .diagrams
                 .first()
-                .ok_or_else(|| "no diagram in LLM response".to_string())?
-                .model
-                .as_ref()
-                .ok_or_else(|| "no model in LLM response".to_string())?
-                .extract_subgraph(&cell_id_refs);
+                .and_then(|d| d.model.as_ref())
+                .ok_or_else(|| {
+                    FixError::Rejected("fix output has no diagram/model".into())
+                })?;
+            let patched_subgraph = patched_model.extract_subgraph(&cell_id_refs);
+            if !patched_subgraph.missing.is_empty() {
+                return Err(FixError::Rejected(format!(
+                    "fix output dropped targeted cells: {}",
+                    patched_subgraph.missing.join(", ")
+                )));
+            }
+            let file = full_file
+                .as_mut()
+                .ok_or_else(|| FixError::Llm("original file lost".into()))?;
             let model = file
                 .diagrams
                 .first_mut()
-                .ok_or_else(|| "no diagram".to_string())?
-                .model
-                .as_mut()
-                .ok_or_else(|| "no model".to_string())?;
+                .and_then(|d| d.model.as_mut())
+                .ok_or_else(|| FixError::Llm("no model in original".into()))?;
             model.apply_subgraph(&patched_subgraph);
-            resp.content = file
+            file.to_xml()
+                .map_err(|e| FixError::Llm(format!("serialize merged XML: {e}")))?
+        } else {
+            // Full-document mode: the model returns the whole diagram. It
+            // must at least parse; round-trip through the canonical
+            // serializer so the no-op comparison below is formatting-blind.
+            let parsed = drawio_agent_xml_core::MxFile::parse(envelope.xml.as_bytes())
+                .map_err(|e| FixError::Rejected(format!("fix output is not valid mxfile: {e}")))?;
+            parsed
                 .to_xml()
-                .map_err(|e| format!("serialize updated XML: {e}"))?;
-        }
-        Ok(resp)
+                .map_err(|e| FixError::Llm(format!("serialize fix output: {e}")))?
+        };
+
+        // No-op detection on canonical forms: both sides pass through
+        // parse → to_xml so pure whitespace/formatting drift does not count
+        // as a change (and does not burn a version).
+        let canonical_prev = canonicalize(&req.xml);
+        let changed = canonical_prev.as_deref() != Some(new_full_xml.as_str());
+
+        Ok(FixOutcome {
+            done: envelope.done,
+            issues: envelope.issues,
+            reasoning: envelope.reasoning,
+            xml: new_full_xml,
+            changed,
+            usage: resp.usage,
+            duration_ms: resp.duration_ms,
+            finish_reason: resp.finish_reason,
+        })
     }
+}
+
+/// Parse-and-reserialize an XML document to its canonical form, or `None`
+/// when it doesn't parse (raw comparison then falls back to byte equality).
+fn canonicalize(xml: &str) -> Option<String> {
+    let file = drawio_agent_xml_core::MxFile::parse(xml.as_bytes()).ok()?;
+    file.to_xml().ok()
 }

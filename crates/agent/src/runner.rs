@@ -1,14 +1,23 @@
-//! Core Agent Loop state machine.
+//! Core Agent Loop state machine (v2 single-context loop).
+//!
+//! Per round: Render the current XML → ONE multimodal fix call (the LLM
+//! sees the latest render and self-reviews + edits in a single call,
+//! returning a `{done, xml, issues}` envelope) → validate → apply → repeat
+//! until `done=true`, `max_iterations` is hit, or a dependency fails.
+//!
+//! The separate Review pass of v1 is gone: convergence is gated on the
+//! model's own `done` flag plus deps-side validation (parse / no-op /
+//! scope merge). Issues the model reports with `done=false` are carried
+//! into the next round's request as the stateless bridge between rounds.
 
-use drawio_agent_llm_client::{
-    GenerateRequest, LlmResponse, ReviewIssue, ReviewResponse,
-};
+use drawio_agent_llm_client::ReviewIssue;
 use drawio_agent_trajectory::{TrajectoryEvent, TrajectoryStore};
 use tracing::{info, warn};
 
-use crate::deps::AgentDeps;
+use crate::deps::FixError;
+use crate::deps::FixRequest;
 use crate::phase::{LoopPhase, LoopState};
-use crate::{AgentLoop, AgentOutcome, LoopError, ProgressCb};
+use crate::{AgentDeps, AgentLoop, AgentOutcome, LoopError, ProgressCb};
 
 /// Record a trajectory event into the loop's local store AND forward it
 /// to the configured live-progress callback (if any). The callback runs
@@ -21,9 +30,24 @@ async fn record_progress(store: &TrajectoryStore, cb: &Option<ProgressCb>, event
     }
 }
 
-/// Run the Agent Loop against the given dependency implementations until
-/// the reviewer reports verdict "pass", `max_iterations` is hit, or a
-/// dependency call fails.
+/// Build the user-facing instruction for a fix round: the caller's ask
+/// (kept stable across rounds so the model never loses the objective) plus
+/// any auto-generated feedback notes from the previous round (rejected
+/// output, no-op-without-done, …).
+fn build_instruction(base: &str, notes: &[String]) -> String {
+    if notes.is_empty() {
+        base.to_string()
+    } else {
+        let mut out = base.to_string();
+        out.push_str("\n\n系统反馈（上一轮）:\n- ");
+        out.push_str(&notes.join("\n- "));
+        out
+    }
+}
+
+/// Run the Agent Loop against the given dependency implementations until a
+/// fix round reports `done`, `max_iterations` is hit, or a dependency call
+/// fails.
 ///
 /// Records a [`TrajectoryEvent`] for every state transition and embeds
 /// them all in the returned [`AgentOutcome`].
@@ -43,7 +67,7 @@ pub async fn run<D: AgentDeps + ?Sized>(
     // stable id/seq/timestamp; the final list is embedded in the outcome.
     let store = TrajectoryStore::new();
 
-    // Step 0: initial XML — either caller-provided or generate once. The
+    // Step 0: baseline XML — either caller-provided or generate once. The
     // initial Generate phase only runs (and only records trajectory
     // events) when the caller did not supply a starting XML.
     state.phase = LoopPhase::Generate;
@@ -57,7 +81,7 @@ pub async fn run<D: AgentDeps + ?Sized>(
             )
             .await;
             match deps
-                .generate(GenerateRequest {
+                .generate(drawio_agent_llm_client::GenerateRequest {
                     user_prompt: config.prompt.clone(),
                     current_xml: None,
                     scope: None,
@@ -95,18 +119,17 @@ pub async fn run<D: AgentDeps + ?Sized>(
         }
     };
 
-    // Iteration loop: Render → Review → (Patch if issues).
-    loop {
+    // Fix rounds: Render → single multimodal fix call → apply/validate.
+    // Self-reported issues from a `done=false` round are carried into the
+    // next round's scope + prompt.
+    let mut pending_issues: Vec<ReviewIssue> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+
+    while state.iteration < max {
         state.iteration += 1;
-        info!(iteration = state.iteration, "agent loop iteration start");
+        info!(iteration = state.iteration, "agent loop round start");
 
-        if state.iteration > max {
-            warn!(max, "agent loop giving up after max iterations");
-            state.phase = LoopPhase::Failed;
-            return Ok(final_outcome(config, state, store.list("agent").await, false));
-        }
-
-        // Render.
+        // Render the current state (the model's visual input).
         state.phase = LoopPhase::Render;
         let xml = match state.current_xml.as_deref() {
             Some(x) => x,
@@ -120,118 +143,113 @@ pub async fn run<D: AgentDeps + ?Sized>(
             make_event(state.phase, xml.len(), false),
         )
         .await;
+        let render_started = std::time::Instant::now();
         let _png = match deps.render(xml).await {
             Ok(p) => {
                 record_progress(
                     &store,
                     &config.progress_cb,
-                    complete_event_bytes(state.phase, p.len()),
+                    complete_event_bytes(
+                        state.phase,
+                        p.len(),
+                        render_started.elapsed().as_millis() as u64,
+                    ),
                 )
                 .await;
                 p
             }
             Err(e) => {
                 let lp = state.phase;
-                record_progress(
-                    &store,
-                    &config.progress_cb,
-                    error_event(state.phase, &e.to_string()),
-                )
-                .await;
-                return Err(LoopError::Render {
-                    phase: lp,
-                    message: e.to_string(),
-                });
-            }
-        };
-
-        // Review.
-        state.phase = LoopPhase::Review;
-        record_progress(
-            &store,
-            &config.progress_cb,
-            make_event(state.phase, config.review_checks.len(), false),
-        )
-        .await;
-        let review = match deps.review(xml, &_png).await {
-            Ok(r) => r,
-            Err(message) => {
-                let lp = state.phase;
+                let message = e.to_string();
                 record_progress(
                     &store,
                     &config.progress_cb,
                     error_event(state.phase, &message),
                 )
                 .await;
-                return Err(LoopError::Llm { phase: lp, message });
+                return Err(LoopError::Render {
+                    phase: lp,
+                    message,
+                });
             }
         };
-        record_progress(
-            &store,
-            &config.progress_cb,
-            complete_event(
-                state.phase,
-                review_estimate_input(&review),
-                review_estimate_output(&review),
-                0,
-                None,
-            ),
-        )
-        .await;
-        state.last_verdict = Some(review.verdict.clone());
-        state.last_issue_count = review.issues.len() as u32;
 
-        if review.verdict.eq_ignore_ascii_case("pass") {
-            state.phase = LoopPhase::Done;
-            info!(iteration = state.iteration, "agent loop converged");
-            return Ok(final_outcome(config, state, store.list("agent").await, true));
-        }
-
-        if state.iteration >= max {
-            state.phase = LoopPhase::Failed;
-            return Ok(final_outcome(config, state, store.list("agent").await, false));
-        }
-
-        // Patch: rebuild the LLM call with feedback scoped to issue cells.
-        state.phase = LoopPhase::Patch;
-        let cell_ids: Vec<String> = if config.patch_cell_ids.is_empty() {
-            review.issues.iter().flat_map(|i| i.cell_ids.clone()).collect()
+        // Single multimodal fix call (self-review + edit in one).
+        state.phase = LoopPhase::Fix;
+        let scope_cells: Vec<String> = if config.patch_cell_ids.is_empty() {
+            pending_issues
+                .iter()
+                .flat_map(|i| i.cell_ids.clone())
+                .collect()
         } else {
             config.patch_cell_ids.clone()
         };
-        let instructions = format!(
-            "Fix the {} issue(s) flagged by the visual reviewer.",
-            review.issues.len()
-        );
-        // The recorded `prompt_chars` is the LLM's user-message size, not
-        // the cell-ids count. Use the instructions text length as a
-        // reasonable proxy; cell_ids.len() is wrong because it can be 0
-        // when the vision review returned issues without cell_ids (the
-        // Phase 37 Q2 gap) — which made the trajectory show "0 chars"
-        // even though the LLM was called with a real prompt.
+        let instruction = build_instruction(&config.prompt, &notes);
         record_progress(
             &store,
             &config.progress_cb,
-            make_event(state.phase, instructions.chars().count(), true),
+            make_event(state.phase, instruction.chars().count(), true),
         )
         .await;
-        match deps.patch(xml, &cell_ids, &instructions).await {
-            Ok(r) => {
+        let fix_req = FixRequest {
+            xml: xml.to_string(),
+            image_png: _png,
+            instruction,
+            cell_ids: scope_cells,
+            prior_issues: pending_issues.clone(),
+            checks: config.review_checks.clone(),
+        };
+        match deps.fix(&fix_req).await {
+            Ok(out) => {
                 record_progress(
                     &store,
                     &config.progress_cb,
                     complete_event(
                         state.phase,
-                        r.usage.input_tokens,
-                        r.usage.output_tokens,
-                        r.duration_ms,
-                        r.finish_reason.clone(),
+                        out.usage.input_tokens,
+                        out.usage.output_tokens,
+                        out.duration_ms,
+                        out.finish_reason.clone(),
                     ),
                 )
                 .await;
-                state.current_xml = Some(r.content);
+                state.last_verdict = Some(if out.done { "pass" } else { "issues" }.into());
+                state.last_issue_count = out.issues.len() as u32;
+                if out.changed {
+                    state.current_xml = Some(out.xml.clone());
+                }
+                if out.done {
+                    state.phase = LoopPhase::Done;
+                    info!(iteration = state.iteration, "agent loop converged");
+                    return Ok(final_outcome(state, store.list("agent").await, true));
+                }
+                // done=false: carry the model's remaining items to the next
+                // round. If it reported nothing, remind it of the contract.
+                pending_issues = out.issues;
+                notes.clear();
+                if pending_issues.is_empty() {
+                    notes.push(
+                        "上一轮返回 done=false 但未列出待办 issues：若无剩余问题请输出 \
+                         done=true；若仍有问题请逐条列出 kind/severity/cell_ids/description。"
+                            .into(),
+                    );
+                } else if out.reasoning.as_deref().is_some_and(|r| !r.is_empty()) {
+                    info!(iteration = state.iteration, reasoning = %out.reasoning.unwrap_or_default(), "fix round not done");
+                }
             }
-            Err(message) => {
+            Err(FixError::Rejected(reason)) => {
+                // Unusable output: record it, tell the model why, retry.
+                record_progress(
+                    &store,
+                    &config.progress_cb,
+                    error_event(state.phase, &reason),
+                )
+                .await;
+                warn!(iteration = state.iteration, %reason, "fix output rejected; will retry");
+                notes.clear();
+                notes.push(format!("你上一轮的输出被拒绝，原因：{reason}。请修正后重试。"));
+            }
+            Err(FixError::Llm(message)) => {
                 let lp = state.phase;
                 record_progress(
                     &store,
@@ -243,6 +261,10 @@ pub async fn run<D: AgentDeps + ?Sized>(
             }
         }
     }
+
+    warn!(max, "agent loop giving up after max iterations");
+    state.phase = LoopPhase::Failed;
+    Ok(final_outcome(state, store.list("agent").await, false))
 }
 
 // ---------------------------------------------------------------------------
@@ -252,15 +274,11 @@ pub async fn run<D: AgentDeps + ?Sized>(
 /// Build a trajectory event marking the START of a phase.
 fn make_event(phase: LoopPhase, payload_size: usize, json_mode: bool) -> TrajectoryEvent {
     match phase {
-        LoopPhase::Generate | LoopPhase::Patch => TrajectoryEvent::LlmCallStarted {
+        LoopPhase::Generate | LoopPhase::Fix => TrajectoryEvent::LlmCallStarted {
             prompt_chars: payload_size,
             json_mode,
         },
         LoopPhase::Render => TrajectoryEvent::RenderStarted { scale: 1.0 },
-        LoopPhase::Review => TrajectoryEvent::LlmCallStarted {
-            prompt_chars: payload_size,
-            json_mode: false,
-        },
         LoopPhase::Done | LoopPhase::Failed | LoopPhase::Pending => {
             TrajectoryEvent::StateTransition {
                 from: None,
@@ -279,14 +297,12 @@ fn complete_event(
     finish_reason: Option<String>,
 ) -> TrajectoryEvent {
     match phase {
-        LoopPhase::Generate | LoopPhase::Patch | LoopPhase::Review => {
-            TrajectoryEvent::LlmCallCompleted {
-                input_tokens,
-                output_tokens,
-                duration_ms,
-                finish_reason,
-            }
-        }
+        LoopPhase::Generate | LoopPhase::Fix => TrajectoryEvent::LlmCallCompleted {
+            input_tokens,
+            output_tokens,
+            duration_ms,
+            finish_reason,
+        },
         LoopPhase::Render => TrajectoryEvent::RenderCompleted {
             bytes: 0,
             duration_ms: 0,
@@ -300,13 +316,13 @@ fn complete_event(
     }
 }
 
-fn complete_event_bytes(phase: LoopPhase, bytes: usize) -> TrajectoryEvent {
+fn complete_event_bytes(phase: LoopPhase, bytes: usize, duration_ms: u64) -> TrajectoryEvent {
     match phase {
         LoopPhase::Render => TrajectoryEvent::RenderCompleted {
             bytes,
-            duration_ms: 0,
+            duration_ms,
         },
-        _ => complete_event(phase, 0, 0, 0, None),
+        _ => complete_event(phase, 0, 0, duration_ms, None),
     }
 }
 
@@ -318,7 +334,6 @@ fn error_event(phase: LoopPhase, message: &str) -> TrajectoryEvent {
 }
 
 fn final_outcome(
-    _config: AgentLoop,
     state: LoopState,
     trajectory: Vec<drawio_agent_trajectory::Event>,
     converged: bool,
@@ -338,19 +353,3 @@ fn final_outcome(
         trajectory,
     }
 }
-
-fn review_estimate_input(_r: &ReviewResponse) -> u64 {
-    // The Agent Loop doesn't have direct access to VLM token counts via
-    // the deps trait; we surface zero so callers don't get bogus totals.
-    // The review LLM call's own trajectory events (Started/Completed) are
-    // emitted by the LLM provider directly in production wiring.
-    0
-}
-
-fn review_estimate_output(r: &ReviewResponse) -> u64 {
-    let _ = r;
-    0
-}
-
-#[doc(hidden)]
-pub fn _suppress_unused(_r: &LlmResponse<String>, _i: &ReviewIssue) {}

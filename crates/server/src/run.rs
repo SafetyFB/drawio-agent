@@ -348,6 +348,35 @@ impl LlmProvider for StubLlm {
             finish_reason: None,
         })
     }
+
+    async fn fix_diagram(
+        &self,
+        req: drawio_agent_llm_client::FixRequest,
+    ) -> Result<
+        drawio_agent_llm_client::LlmResponse<String>,
+        drawio_agent_llm_client::ProviderError,
+    > {
+        // Mock single-call fix: echo the current state back with done=true.
+        // The loop then converges on the first round (no change needed).
+        let xml = req
+            .current_xml
+            .or(req.scope_xml)
+            .unwrap_or_else(|| MOCK_DIAGRAM.to_string());
+        let content = serde_json::json!({
+            "done": true,
+            "xml": xml,
+            "issues": [],
+            "reasoning": "mock provider: nothing to fix",
+        })
+        .to_string();
+        Ok(drawio_agent_llm_client::LlmResponse {
+            content,
+            usage: Usage::default(),
+            raw: serde_json::Value::Null,
+            duration_ms: 0,
+            finish_reason: None,
+        })
+    }
 }
 
 /// Thin [`HttpTransport`] wrapper around reqwest for the OpenAI-compat

@@ -35,7 +35,9 @@ const FULL_XML: &str = r#"<mxfile host="app.diagrams.net">
 </mxfile>"#;
 
 // ---------------------------------------------------------------------------
-// Stub LLM (returns pass on first review after a patch)
+// Stub LLM for the v2 loop: first fix makes a change but reports done=false
+// (wants a visual re-verification round); the second fix reports done=true
+// with no further change → loop converges after 2 iterations.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -53,8 +55,7 @@ impl StubLlm {
 impl LlmProvider for StubLlm {
     fn name(&self) -> &str { "stub" }
     async fn generate_xml(&self, _req: GenerateRequest) -> Result<LlmResponse<String>, ProviderError> {
-        // First call returns the original XML; after patch() runs once,
-        // it returns an "improved" XML. Either way the loop just uses it.
+        // Baseline generation (empty-session flow).
         Ok(LlmResponse {
             content: FULL_XML.to_string(),
             usage: Usage { input_tokens: 50, output_tokens: 20 },
@@ -64,29 +65,31 @@ impl LlmProvider for StubLlm {
         })
     }
     async fn generate_streaming(&self, _req: GenerateRequest) -> Result<LlmStream, ProviderError> { unimplemented!() }
-    async fn review_visual(&self, _req: ReviewRequest) -> Result<LlmResponse<ReviewResponse>, ProviderError> {
-        // First review (before patch) returns "issues"; subsequent ones return "pass".
-        let verdict = if *self.patched.lock().unwrap() {
-            "pass".to_string()
+    async fn review_visual(&self, _req: ReviewRequest) -> Result<LlmResponse<ReviewResponse>, ProviderError> { unimplemented!() }
+    async fn fix_diagram(&self, req: drawio_agent_llm_client::FixRequest) -> Result<LlmResponse<String>, ProviderError> {
+        let mut patched = self.patched.lock().unwrap();
+        let first = !*patched;
+        *patched = true;
+        let base = req
+            .current_xml
+            .or(req.scope_xml)
+            .unwrap_or_else(|| FULL_XML.to_string());
+        let xml = if first {
+            // Round 1: actually change something but ask for re-verification.
+            base.replace("value=\"Hello\"", "value=\"Hello*\"")
         } else {
-            // Flip to patched after the first review completes.
-            *self.patched.lock().unwrap() = true;
-            "issues".to_string()
+            // Round 2: verified — no further change, done.
+            base
         };
+        let content = serde_json::json!({
+            "done": !first,
+            "xml": xml,
+            "issues": [],
+            "reasoning": if first { "made a change; needs re-verify" } else { "verified ok" },
+        })
+        .to_string();
         Ok(LlmResponse {
-            content: ReviewResponse {
-                verdict: verdict.clone(),
-                issues: if verdict == "issues" {
-                    vec![drawio_agent_llm_client::ReviewIssue {
-                        kind: "overlap".into(),
-                        severity: "high".into(),
-                        cell_ids: vec!["2".into()],
-                        description: "overlap".into(),
-                    }]
-                } else {
-                    vec![]
-                },
-            },
+            content,
             usage: Usage::default(),
             raw: Value::Null,
             duration_ms: 0,
@@ -478,8 +481,8 @@ async fn agent_loop_empty_session_auto_generates_baseline() {
 }
 
 // ---------------------------------------------------------------------------
-// Stub LLM for the Plan-B subgraph test: records the patch scope, returns
-// a modified subgraph document, and converges after one patch.
+// Stub LLM for the Plan-B subgraph test: records the fix scope, returns a
+// modified subgraph document with done=true, and converges after one fix.
 // ---------------------------------------------------------------------------
 
 /// Full diagram with an unrelated cell (5) so a scope for `["2"]` must NOT
@@ -507,7 +510,8 @@ const SUBGRAPH_FULL_XML: &str = r#"<mxfile host="app.diagrams.net">
   </diagram>
 </mxfile>"#;
 
-/// What the loop's internal patch LLM "returns": cell 2 modified, nothing else.
+/// What the fix LLM "returns": cell 2 modified, nothing else. (Scope-only
+/// document — the server merges it back onto the full model.)
 const SUBGRAPH_PATCHED_XML: &str = r#"<mxfile>
   <diagram id="d">
     <mxGraphModel>
@@ -524,17 +528,15 @@ const SUBGRAPH_PATCHED_XML: &str = r#"<mxfile>
 
 #[derive(Clone)]
 struct SubgraphAwareLlm {
-    issues_served: Arc<std::sync::Mutex<u32>>,
-    patch_scopes: Arc<std::sync::Mutex<Vec<String>>>,
-    patch_current_xmls: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    fix_scopes: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    fix_current_xmls: Arc<std::sync::Mutex<Vec<Option<String>>>>,
 }
 
 impl SubgraphAwareLlm {
     fn new() -> Self {
         Self {
-            issues_served: Arc::new(std::sync::Mutex::new(0)),
-            patch_scopes: Arc::new(std::sync::Mutex::new(Vec::new())),
-            patch_current_xmls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fix_scopes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fix_current_xmls: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -546,25 +548,9 @@ impl LlmProvider for SubgraphAwareLlm {
     }
     async fn generate_xml(
         &self,
-        req: GenerateRequest,
+        _req: GenerateRequest,
     ) -> Result<LlmResponse<String>, ProviderError> {
-        // The only generate_xml call in the loop is the internal patch step
-        // (initial XML is supplied), so every call records a patch request.
-        self.patch_scopes
-            .lock()
-            .unwrap()
-            .push(req.scope.clone().unwrap_or_default());
-        self.patch_current_xmls
-            .lock()
-            .unwrap()
-            .push(req.current_xml.clone());
-        Ok(LlmResponse {
-            content: SUBGRAPH_PATCHED_XML.to_string(),
-            usage: Usage::default(),
-            raw: Value::Null,
-            duration_ms: 0,
-            finish_reason: None,
-        })
+        unimplemented!("subgraph test supplies initial_xml; generate is never called")
     }
     async fn generate_streaming(
         &self,
@@ -576,27 +562,23 @@ impl LlmProvider for SubgraphAwareLlm {
         &self,
         _req: ReviewRequest,
     ) -> Result<LlmResponse<ReviewResponse>, ProviderError> {
-        let mut served = self.issues_served.lock().unwrap();
-        let first = *served == 0;
-        *served += 1;
-        let (verdict, issues) = if first {
-            (
-                "issues",
-                vec![drawio_agent_llm_client::ReviewIssue {
-                    kind: "overlap".into(),
-                    severity: "high".into(),
-                    cell_ids: vec!["2".into()],
-                    description: "overlap".into(),
-                }],
-            )
-        } else {
-            ("pass", vec![])
-        };
+        unimplemented!("v2 loop never calls review_visual")
+    }
+    async fn fix_diagram(
+        &self,
+        req: drawio_agent_llm_client::FixRequest,
+    ) -> Result<LlmResponse<String>, ProviderError> {
+        self.fix_scopes.lock().unwrap().push(req.scope_xml.clone());
+        self.fix_current_xmls.lock().unwrap().push(req.current_xml.clone());
+        let content = serde_json::json!({
+            "done": true,
+            "xml": SUBGRAPH_PATCHED_XML,
+            "issues": [],
+            "reasoning": "scoped fix applied",
+        })
+        .to_string();
         Ok(LlmResponse {
-            content: ReviewResponse {
-                verdict: verdict.into(),
-                issues,
-            },
+            content,
             usage: Usage::default(),
             raw: Value::Null,
             duration_ms: 0,
@@ -606,12 +588,14 @@ impl LlmProvider for SubgraphAwareLlm {
 }
 
 #[tokio::test]
-async fn agent_loop_patch_sends_subgraph_scope_not_full_xml() {
+async fn agent_loop_fix_sends_subgraph_scope_not_full_xml() {
     let llm = Arc::new(SubgraphAwareLlm::new());
     let state = state_with(llm.clone(), Arc::new(MockDriver::new()));
     let app = router(state);
     let sid = create_session_with_xml(app.clone(), SUBGRAPH_FULL_XML).await;
 
+    // v2 scoping is driven by the user's canvas selection (patch_cell_ids);
+    // there is no separate review phase to derive cells from.
     let resp = app
         .clone()
         .oneshot(
@@ -620,8 +604,11 @@ async fn agent_loop_patch_sends_subgraph_scope_not_full_xml() {
                 .uri(format!("/api/sessions/{sid}/agent-loop"))
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({"prompt": "improve"}))
-                        .unwrap(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "prompt": "improve",
+                        "patch_cell_ids": ["2"],
+                    }))
+                    .unwrap(),
                 ))
                 .unwrap(),
         )
@@ -634,10 +621,10 @@ async fn agent_loop_patch_sends_subgraph_scope_not_full_xml() {
     let outcome: AgentOutcome = serde_json::from_slice(&body).unwrap();
     assert!(outcome.converged(), "got {:?}", outcome.final_phase);
 
-    // The internal patch must have sent ONLY the subgraph as scope.
-    let scopes = llm.patch_scopes.lock().unwrap().clone();
-    assert_eq!(scopes.len(), 1, "loop should have patched exactly once");
-    let scope = &scopes[0];
+    // The fix call must have sent ONLY the subgraph as scope.
+    let scopes = llm.fix_scopes.lock().unwrap().clone();
+    assert_eq!(scopes.len(), 1, "loop should have fixed exactly once");
+    let scope = scopes[0].as_deref().expect("scope mode must send a scope");
     assert!(
         scope.len() < SUBGRAPH_FULL_XML.len(),
         "scope ({}) must be shorter than the full diagram ({})",
@@ -653,16 +640,16 @@ async fn agent_loop_patch_sends_subgraph_scope_not_full_xml() {
         "scope must NOT include unrelated cell 5: {scope}"
     );
 
-    // And the full diagram must NOT be sent as current_xml (Plan B sends
+    // And the full diagram must NOT be sent as current_xml (Plan-B sends
     // current_xml: None with only the subgraph as scope).
-    let current_xmls = llm.patch_current_xmls.lock().unwrap().clone();
+    let current_xmls = llm.fix_current_xmls.lock().unwrap().clone();
     assert!(
         current_xmls.iter().all(|c| c.is_none()),
-        "patch must not send the full diagram as current_xml: {current_xmls:?}"
+        "fix must not send the full diagram as current_xml: {current_xmls:?}"
     );
 
-    // The loop still converges with the patched cell applied back into the
-    // full diagram.
+    // The loop converges with the patched cell applied back into the full
+    // diagram.
     assert!(
         outcome.final_xml.contains("value=\"Modified\""),
         "patched cell must reflect the LLM's change"
@@ -670,8 +657,8 @@ async fn agent_loop_patch_sends_subgraph_scope_not_full_xml() {
 }
 
 // ---------------------------------------------------------------------------
-// Gated LLM for the live-streaming test: review_visual blocks until the
-// test releases it, so the loop is provably mid-flight when we observe
+// Gated LLM for the live-streaming test: fix_diagram blocks until the test
+// releases it, so the loop is provably mid-flight when we observe
 // trajectory events on the EventBus.
 // ---------------------------------------------------------------------------
 
@@ -699,13 +686,7 @@ impl LlmProvider for GatedLlm {
         &self,
         _req: GenerateRequest,
     ) -> Result<LlmResponse<String>, ProviderError> {
-        Ok(LlmResponse {
-            content: FULL_XML.to_string(),
-            usage: Usage::default(),
-            raw: Value::Null,
-            duration_ms: 0,
-            finish_reason: None,
-        })
+        unimplemented!()
     }
     async fn generate_streaming(
         &self,
@@ -717,12 +698,25 @@ impl LlmProvider for GatedLlm {
         &self,
         _req: ReviewRequest,
     ) -> Result<LlmResponse<ReviewResponse>, ProviderError> {
+        unimplemented!()
+    }
+    async fn fix_diagram(
+        &self,
+        req: drawio_agent_llm_client::FixRequest,
+    ) -> Result<LlmResponse<String>, ProviderError> {
         self.release.notified().await;
+        let xml = req
+            .current_xml
+            .or(req.scope_xml)
+            .unwrap_or_else(|| FULL_XML.to_string());
+        let content = serde_json::json!({
+            "done": true,
+            "xml": xml,
+            "issues": [],
+        })
+        .to_string();
         Ok(LlmResponse {
-            content: ReviewResponse {
-                verdict: "pass".into(),
-                issues: vec![],
-            },
+            content,
             usage: Usage::default(),
             raw: Value::Null,
             duration_ms: 0,
@@ -793,8 +787,8 @@ fn _suppress_unused(_o: &Event, _l: &AgentLoop) {}
 // ---------------------------------------------------------------------------
 
 /// Counts every `generate_xml` call so the test can assert the loop never
-/// re-generates when handed a starting XML. Reviews always pass (no patch →
-/// no extra generate call from the inner patch step).
+/// re-generates when handed a starting XML. Fix rounds report done=true
+/// with no change → one-round convergence.
 #[derive(Clone)]
 struct CountingLlm {
     generate_calls: Arc<std::sync::Mutex<u32>>,
@@ -844,6 +838,25 @@ impl LlmProvider for CountingLlm {
                 verdict: "pass".into(),
                 issues: vec![],
             },
+            usage: Usage::default(),
+            raw: Value::Null,
+            duration_ms: 0,
+            finish_reason: None,
+        })
+    }
+    async fn fix_diagram(
+        &self,
+        req: drawio_agent_llm_client::FixRequest,
+    ) -> Result<LlmResponse<String>, ProviderError> {
+        // Done in one round, no change: the loop converges immediately and
+        // never touches generate_xml again.
+        let xml = req
+            .current_xml
+            .or(req.scope_xml)
+            .unwrap_or_else(|| FULL_XML.to_string());
+        let content = serde_json::json!({"done": true, "xml": xml, "issues": []}).to_string();
+        Ok(LlmResponse {
+            content,
             usage: Usage::default(),
             raw: Value::Null,
             duration_ms: 0,

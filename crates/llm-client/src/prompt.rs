@@ -166,3 +166,101 @@ pub fn review_user_prompt(xml: &str, checks: &[String]) -> String {
 
     out
 }
+
+/// System prompt for the single-call "look at the latest render and fix"
+/// step (v2 single-context loop). Merges the reviewer role into the editor
+/// role: the model sees the rendered PNG, self-reviews it, and produces the
+/// fixed XML in ONE call — no separate review round-trip.
+///
+/// The response must be a JSON envelope (the provider sets json_object
+/// response format): `{"done", "xml", "issues", "reasoning"}`. The loop
+/// re-renders and feeds the result back, so `done=false` + `issues` is how
+/// the model asks for a follow-up look at its own fix.
+pub fn fix_system_prompt() -> &'static str {
+    r#"You are a Draw.io XML editor WITH VISION. Attached is the LATEST rendered
+image of the diagram, plus the current XML in the user message.
+
+Your job in ONE response:
+1. Visually self-review the rendered image: cell overlap, text overflow,
+   arrows pointing at the wrong cell, edges crossing for no reason, layout
+   that is confusing or unbalanced.
+2. Fix every issue you find directly in the XML.
+
+Draw.io conventions:
+- Cell id="0" is the synthetic root (not rendered); visible cells declare a parent.
+- Preserve existing cell ids EXACTLY. Never invent ids for existing cells.
+- When a Scope section is present, ONLY cells inside the scope may be
+  modified; return a document containing just those cells (the server merges
+  them back). Never touch cells outside the scope.
+- New cells (e.g. an added arrow) get fresh unique ids and a parent.
+
+Respond with ONLY this JSON object (no commentary, no markdown fences):
+{"done": true|false, "xml": "<mxfile>...</mxfile>",
+ "issues": [{"kind": "...", "severity": "high|medium|low",
+             "cell_ids": [...], "description": "..."}],
+ "reasoning": "short summary of what you changed and why"}
+
+- Set done=true when you have fixed everything fixable (or nothing needs
+  fixing). The XML field must ALWAYS contain the current full document state.
+- Set done=false and list items in issues when you made changes that need
+  visual re-verification, or when something remains unresolved: the loop will
+  re-render and show you the new image next round.
+- issues kinds: overlap | text_overflow | edge_crossing | arrow_wrong | layout_bad.
+  Be conservative: only flag real, visible problems."#
+}
+
+/// User prompt for the single-call fix step.
+///
+/// The rendered image is attached separately as a message part; this text
+/// carries the instruction plus the current state: full XML when no scope is
+/// given (free edit), or ONLY the scope subgraph when cells are targeted
+/// (Plan-B: the model must never see or rewrite the full diagram).
+pub fn fix_user_prompt(
+    instruction: &str,
+    current_xml: Option<&str>,
+    scope: Option<&str>,
+    issues: &[crate::ReviewIssue],
+    checks: &[String],
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!(
+        "The rendered image of the current diagram is attached.\nTask: {instruction}"
+    ));
+
+    if let Some(xml) = current_xml {
+        parts.push(format!("Current XML (full diagram state):\n{xml}"));
+    }
+    if let Some(selection) = scope {
+        parts.push(format!(
+            "Scope — the ONLY cells you may modify (server merges these back):\n{selection}"
+        ));
+    }
+    if !issues.is_empty() {
+        let numbered = issues
+            .iter()
+            .enumerate()
+            .map(|(i, it)| {
+                format!(
+                    "{}. [{}|{}|cells:{}] {}",
+                    i + 1,
+                    it.kind,
+                    it.severity,
+                    it.cell_ids.join(","),
+                    it.description
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        parts.push(format!("Issues from the previous round (verify/fix):\n{numbered}"));
+    }
+    if !checks.is_empty() {
+        let bullets = checks
+            .iter()
+            .map(|check| format!("- {check}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        parts.push(format!("Focus checks:\n{bullets}"));
+    }
+
+    parts.join("\n\n")
+}
