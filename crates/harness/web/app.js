@@ -112,53 +112,108 @@ function applyMode() {
   if (!currentGraph) return;
   if (canvasMode === 'pan') {
     currentGraph.setPanning(true);
+    currentGraph.setCellsSelectable(false); // 纯导航：拖动平移，不选 cell
   } else {
     currentGraph.setPanning(false);
+    currentGraph.setCellsSelectable(true);  // 点选/框选
   }
   cancelRubberBand();
 }
 $('mode-select').onclick = () => { canvasMode = 'select'; applyMode(); };
 $('mode-pan').onclick = () => { canvasMode = 'pan'; applyMode(); };
 
-canvasEl.addEventListener('mousedown', (e) => {
-  if (canvasMode !== 'select' || busy || e.button !== 0) return;
-  if (e.target !== canvasEl) return;   // clicked on a cell -> graph handles it
-  const rect = canvasEl.getBoundingClientRect();
+/// 点内 bbox 命中检测：bundle 的 getCellAt 会漏掉白填充 cell 与嵌套组。
+/// 自顶向下遍历（后绘制者优先），按渲染态边界判定。
+function getCellAtBbox(graph, x, y) {
+  const model = graph.getModel();
+  const out = [];
+  const walk = (c) => {
+    if (!c) return;
+    out.push(c);
+    for (let i = 0; i < model.getChildCount(c); i++) walk(model.getChildAt(c, i));
+  };
+  for (let i = 0; i < model.getChildCount(model.getRoot()); i++) walk(model.getChildAt(model.getRoot(), i));
+  for (let i = out.length - 1; i >= 0; i--) {
+    const c = out[i];
+    if (!c || !c.id || c.id === '0' || c.id === '1') continue;
+    const st = graph.view.getState(c);
+    if (!st || typeof st.x !== 'number' || typeof st.width !== 'number') continue;
+    if (x >= st.x && x <= st.x + st.width && y >= st.y && y <= st.y + st.height) return c;
+  }
+  return null;
+}
+
+// 模式感知的交互：pan = 纯导航；select = 点选 cell / 空白处拉框。
+// 容器级 pointerdown（旧实现的 e.target!==canvas 检查永远命中 SVG，框选
+// 因此从不启动）。
+/// client 坐标 → 图坐标：view.scale / view.translate 必须参与换算。
+/// mxUtils.convertPoint 只减去容器偏移，不含 translate——用它检测会全空。
+function clientToGraph(clientX, clientY) {
+  const rect = currentGraph.container.getBoundingClientRect();
+  const v = currentGraph.view;
+  return {
+    x: (clientX - rect.left) / v.scale - v.translate.x,
+    y: (clientY - rect.top) / v.scale - v.translate.y,
+  };
+}
+
+canvasEl.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0 || !currentGraph || busy) return;
+  const p = clientToGraph(e.clientX, e.clientY);
+  let cell = currentGraph.getCellAt(p.x, p.y);
+  if (!cell) cell = getCellAtBbox(currentGraph, p.x, p.y);
+
+  if (canvasMode === 'pan') {
+    return; // 交给 mxGraph 平移
+  }
+  // select 模式
+  if (cell) {
+    currentGraph.setSelectionCell(cell);
+    e.preventDefault();
+    return;
+  }
+  // 空白处 → 开始框选
   rubberBand = { x1: e.clientX, y1: e.clientY, x2: e.clientX, y2: e.clientY };
   rubberBandEl = document.createElement('div');
   rubberBandEl.className = 'rubber-band';
   canvasEl.appendChild(rubberBandEl);
   paintRubberBand();
   e.preventDefault();
-});
-window.addEventListener('mousemove', (e) => {
-  if (!rubberBand) return;
-  rubberBand.x2 = e.clientX; rubberBand.y2 = e.clientY;
-  paintRubberBand();
-});
-window.addEventListener('mouseup', () => {
-  if (!rubberBand || !currentGraph) { cancelRubberBand(); return; }
-  const rect = rubberBand;
-  const p1 = mxUtils.convertPoint(currentGraph.container, rect.x1, rect.y1);
-  const p2 = mxUtils.convertPoint(currentGraph.container, rect.x2, rect.y2);
-  const g = {
-    x: Math.min(p1.x, p2.x), y: Math.min(p1.y, p2.y),
-    width: Math.abs(p2.x - p1.x), height: Math.abs(p2.y - p1.y),
+  const onMove = (ev) => {
+    if (!rubberBand) return;
+    rubberBand.x2 = ev.clientX; rubberBand.y2 = ev.clientY;
+    paintRubberBand();
   };
-  const cells = hitTestCells(g);
-  cancelRubberBand();
-  try { currentGraph.setSelectionCells(cells); } catch (err) { console.warn(err); }
-  if (cells.length) setSelection(cells.filter((c) => c.id).map((c) => c.id));
+  const onUp = () => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    if (!rubberBand || !currentGraph) { cancelRubberBand(); return; }
+    const rect = rubberBand;
+    const p1 = clientToGraph(rect.x1, rect.y1);
+    const p2 = clientToGraph(rect.x2, rect.y2);
+    const g = {
+      x: Math.min(p1.x, p2.x), y: Math.min(p1.y, p2.y),
+      width: Math.abs(p2.x - p1.x), height: Math.abs(p2.y - p1.y),
+    };
+    const cells = hitTestCells(g);
+    cancelRubberBand();
+    try { currentGraph.setSelectionCells(cells); } catch (err) { console.warn(err); }
+    if (cells.length) setSelection(cells.filter((c) => c.id).map((c) => c.id));
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
 });
 
 function paintRubberBand() {
   if (!rubberBandEl || !rubberBand) return;
   const r = rubberBand;
-  const left = Math.min(r.x1, r.x2), top = Math.min(r.y1, r.y2);
-  const p = mxUtils.convertPoint(currentGraph.container, left, top);
+  // overlay 定位用容器坐标（不带 translate），client 减容器原点即可
+  const rect = currentGraph.container.getBoundingClientRect();
+  const left = Math.min(r.x1, r.x2) - rect.left;
+  const top = Math.min(r.y1, r.y2) - rect.top;
   const w = Math.abs(r.x2 - r.x1), h = Math.abs(r.y2 - r.y1);
-  rubberBandEl.style.left = p.x + 'px';
-  rubberBandEl.style.top = p.y + 'px';
+  rubberBandEl.style.left = left + 'px';
+  rubberBandEl.style.top = top + 'px';
   rubberBandEl.style.width = w + 'px';
   rubberBandEl.style.height = h + 'px';
 }

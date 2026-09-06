@@ -105,6 +105,10 @@
 <main>
   <div id="canvas-wrap">
     <div id="canvas"></div>
+    <div id="canvas-modes" class="canvas-modes">
+      <button id="mode-select" class="tool active" title="框选：点选 cell 或拖动空白处拉框">框选</button>
+      <button id="mode-pan" class="tool" title="平移：拖动移动画布">平移</button>
+    </div>
     <div id="placeholder" hidden>
       <div id="placeholder-msg">加载中…</div>
       <div id="welcome" hidden><h3>欢迎</h3><p>会话 = 一个 .drawio 文件。创建一个新会话开始画图，或从上方下拉切换已有会话。</p><button id="welcome-new" class="primary-btn">＋ 新建会话</button></div>

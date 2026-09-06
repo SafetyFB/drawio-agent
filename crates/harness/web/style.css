@@ -124,3 +124,11 @@ select.field, .field select {
 #send.danger { background: var(--err); }
 
 .chat-divider { align-self: center; color: var(--dim); font-size: 11px; margin: 4px 0; }
+
+.canvas-modes {
+  position: absolute; right: 12px; bottom: 12px; z-index: 20;
+  display: flex; gap: 6px; padding: 4px 6px;
+  background: rgba(18, 20, 26, 0.85); border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.canvas-modes .tool { font-size: 12px; padding: 3px 10px; }
