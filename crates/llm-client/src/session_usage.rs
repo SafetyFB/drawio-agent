@@ -41,11 +41,11 @@ impl SessionUsage {
     pub fn record(&mut self, model: &str, purpose: &str, usage: &Usage, cost: f64) {
         self.by_model
             .entry(model.to_string())
-            .or_insert_with(Usage::default)
+            .or_default()
             .add(usage);
         self.by_purpose
             .entry(purpose.to_string())
-            .or_insert_with(Usage::default)
+            .or_default()
             .add(usage);
         self.total_cost += cost;
     }

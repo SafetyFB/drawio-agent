@@ -10,12 +10,10 @@ use axum::http::{Request, StatusCode};
 use drawio_agent_llm_client::{
     GenerateRequest, LlmProvider, LlmResponse, LlmStream, ProviderError, ReviewRequest,
 };
-use drawio_agent_renderer::MockDriver;
 use drawio_agent_server::{
     AppState, CreateSessionRequest, CreateSessionResponse, GenerateRequest as GenReq,
     PatchRequest as PatchReq, ReviewRequest as RevReq, SessionInfoResponse, VersionsResponse,
 };
-use serde_json::json;
 use tower::ServiceExt;
 use uuid::Uuid;
 

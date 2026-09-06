@@ -133,7 +133,7 @@ async fn list_sessions(
             created_at: entry.created_at,
         })
         .collect();
-    summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    summaries.sort_by_key(|s| std::cmp::Reverse(s.created_at));
     Ok(Json(summaries))
 }
 
@@ -263,9 +263,6 @@ async fn generate(
         version_id,
     }))
 }
-
-/// Insert event-emit calls into patch + review. These mirror the generate
-/// pattern: emit `VersionCreated` on success, `Error` on LLM failure.
 
 /// Truncate a user prompt to `max_chars` for use as a version summary.
 fn truncate_summary(s: &str, max_chars: usize) -> String {

@@ -47,7 +47,7 @@ fn get_root_returns_synthetic_root_cell() {
     let model = sample_model();
     let root = model.get("0").expect("root cell id=0 must exist");
     assert_eq!(root.id, "0");
-    assert!(root.children.is_empty() == false, "root must have children");
+    assert!(!root.children.is_empty(), "root must have children");
 }
 
 #[test]

@@ -86,9 +86,6 @@ impl TestLlm {
             fail_with: Mutex::new(None),
         }
     }
-    fn set_response(&self, xml: &str) {
-        *self.response_xml.lock().unwrap() = Some(xml.to_string());
-    }
     fn set_failure(&self, msg: &str) {
         *self.fail_with.lock().unwrap() = Some(msg.to_string());
     }

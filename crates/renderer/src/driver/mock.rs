@@ -67,7 +67,7 @@ impl RenderDriver for MockDriver {
         if let Some(err) = &state.error {
             return Err(RenderError::Export(err.clone()));
         }
-        Ok(state.bytes.clone().unwrap_or_else(|| placeholder_png()))
+        Ok(state.bytes.clone().unwrap_or_else(placeholder_png))
     }
 }
 

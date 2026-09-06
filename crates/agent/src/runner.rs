@@ -347,7 +347,7 @@ fn final_outcome(
         final_xml: state.current_xml.clone().unwrap_or_default(),
         iterations: state.iteration,
         converged: matches!(final_phase, LoopPhase::Done),
-        final_phase: final_phase.clone(),
+        final_phase,
         last_verdict: state.last_verdict.clone(),
         last_issue_count: state.last_issue_count,
         trajectory,

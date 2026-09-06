@@ -10,7 +10,6 @@ use std::sync::Mutex;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use base64::Engine;
 use drawio_agent_llm_client::{
     LlmProvider, LlmResponse, LlmStream, ProviderError, ReviewIssue, ReviewRequest,
     ReviewResponse, Usage,
@@ -108,7 +107,7 @@ fn state_with(llm: Arc<TestLlm>, renderer: Arc<dyn RenderDriver>) -> Arc<AppStat
         sessions: Arc::new(tokio::sync::RwLock::new(
             drawio_agent_server::SessionStore::new(),
         )),
-        llm: llm,
+        llm,
         renderer,
         events: drawio_agent_server::EventBus::new(),
         trajectory: drawio_agent_trajectory::TrajectoryStore::new(),

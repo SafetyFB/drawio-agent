@@ -149,28 +149,6 @@ async fn create_session_with_xml(app: axum::Router, xml: &str) -> String {
     parsed.session_id.as_str().to_string()
 }
 
-async fn create_empty_session(app: axum::Router) -> String {
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/sessions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&CreateSessionRequest::default()).unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body = axum::body::to_bytes(resp.into_body(), 4096)
-        .await
-        .unwrap();
-    let parsed: drawio_agent_server::CreateSessionResponse = serde_json::from_slice(&body).unwrap();
-    parsed.session_id.as_str().to_string()
-}
-
 // ---------------------------------------------------------------------------
 // EventBus unit-level tests (no HTTP)
 // ---------------------------------------------------------------------------
@@ -293,7 +271,7 @@ async fn eventbus_emit_on_unknown_session_lazily_creates_channel() {
 async fn generate_emits_version_created_after_success() {
     let llm = Arc::new(TestLlm::new());
     let state = state_with(llm.clone(), Arc::new(MockDriver::new()));
-    let mut rx = state
+    let rx = state
         .events
         .subscribe(&SessionId::new()) // placeholder; will subscribe to real one below
         .await;

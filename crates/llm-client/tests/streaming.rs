@@ -240,7 +240,7 @@ async fn streaming_sends_stream_true_in_request() {
             })
             .await
             .unwrap();
-        while let Some(_) = stream.next().await {}
+        while stream.next().await.is_some() {}
     }
 
     let body = &transport.recorded()[0].body;

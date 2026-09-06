@@ -243,7 +243,7 @@ async fn jitter_keeps_sleep_within_range() {
         let sleeps = sleeper.recorded();
         assert_eq!(sleeps.len(), 1);
         let s = sleeps[0];
-        assert!(s >= 80 && s <= 120, "sleep {s} out of [80, 120]");
+        assert!((80..=120).contains(&s), "sleep {s} out of [80, 120]");
     }
 }
 

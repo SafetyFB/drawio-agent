@@ -82,8 +82,8 @@ impl MxGraphModel {
             let src = edge.source.as_deref();
             let tgt = edge.target.as_deref();
 
-            let src_in = src.map_or(false, |id| primary_set.contains(id));
-            let tgt_in = tgt.map_or(false, |id| primary_set.contains(id));
+            let src_in = src.is_some_and(|id| primary_set.contains(id));
+            let tgt_in = tgt.is_some_and(|id| primary_set.contains(id));
 
             if !src_in && !tgt_in {
                 continue;
@@ -843,13 +843,10 @@ fn parse_mxgraphmodel(xml: &[u8]) -> Result<MxGraphModel, ParseError> {
                 }
                 _ => {}
             },
-            Ok(Event::End(e)) => match e.name().as_ref() {
-                b"mxCell" => {
-                    if let Some(cell) = current_cell.take() {
-                        cells.push(cell);
-                    }
+            Ok(Event::End(e)) => if e.name().as_ref() == b"mxCell" {
+                if let Some(cell) = current_cell.take() {
+                    cells.push(cell);
                 }
-                _ => {}
             },
             Ok(Event::Eof) => break,
             Err(e) => {

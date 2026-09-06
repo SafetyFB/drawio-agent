@@ -38,13 +38,10 @@ impl AgentDeps for ServerAgentDeps {
         // subgraph (never the full diagram) and its scope-only result is
         // merged back cell-by-cell; untouched cells stay byte-identical.
         let full_parse = drawio_agent_xml_core::MxFile::parse(req.xml.as_bytes());
-        let mut full_file = match full_parse {
-            Ok(f) => Some(f),
-            // Unparseable current state (shouldn't happen — the state was
-            // validated on the way in) — fall back to a plain full-document
-            // fix and let the loop's own validation catch problems.
-            Err(_) => None,
-        };
+        let mut full_file = full_parse.ok();
+        // Unparseable current state (shouldn't happen — the state was validated
+        // on the way in) — falls back to a plain full-document fix and lets
+        // the loop's own validation catch problems.
 
         let cell_id_refs: Vec<&str> = req.cell_ids.iter().map(|s| s.as_str()).collect();
         let (scope_xml, subgraph) = if cell_id_refs.is_empty() {

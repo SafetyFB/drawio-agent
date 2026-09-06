@@ -138,7 +138,8 @@ fn apply_preserves_unrelated_cells() {
     let mut model = sample_model();
 
     // Snapshot every cell's serializable state before apply.
-    let snapshot: Vec<(String, Option<String>, Option<String>, Option<Geometry>)> = [
+    type Snapshot = (String, Option<String>, Option<String>, Option<Geometry>);
+    let snapshot: Vec<Snapshot> = [
         "0", "1", "2", "3", "4",
     ]
     .iter()
