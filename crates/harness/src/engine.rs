@@ -134,7 +134,7 @@ pub struct Harness {
 impl Default for Harness {
     fn default() -> Self {
         Self {
-            max_turns: 10,
+            max_turns: 12,
             max_llm_retries: 2,
         }
     }
@@ -142,33 +142,59 @@ impl Default for Harness {
 
 fn system_prompt(doc: &XmlDoc) -> String {
     format!(
-        r#"你是 drawio 图表的编辑 Agent。当前图表的唯一工件是文件 {path}，
-已用规范格式保存（每个元素一行、属性实体已规范转义、行号稳定）。
-当前文档共 {cells} 个带 id 的元素（含容器），最新渲染图为 {png}。
+        r#"你是 drawio 图表的编辑 Agent，唯一工件是本地文件 {path}
+（规范 XML：每元素一行、行号稳定、属性已规范转义；共 {cells} 个带 id 元素）。
+需要看图时调用 view（最新渲染 {png}），截图会作为图像消息直接发给你。
 
-协作规则：
-- 用户的每一轮消息都可能带「选中区段」（行号标注的 xml 片段），那表示
-  用户只关心这些 cell —— 你的改动必须局限在它们所在的行区间内。
-- 改文件前先用 read / locate 确认准确行号；xml 语法错误、id 重复、
-  引用断掉的 edit 会被系统拒绝并回传错误。
-- 涉及空间位置/连线的问题，先 view 渲染看图，再对照 locate 找 cell。
-- 你的输出必须是**单个 JSON 信封**，不要输出其他文字（不要 markdown 代码块）：
+## 输出协议（每轮必须遵守）
+每轮**只输出一个 JSON 信封**，除此之外不要输出任何文字、解释、markdown
+代码块。一条消息里出现多个 JSON 时系统只取第一个，其余全部丢弃。
 
-工具协议（每轮只选一个）：
+- 调用工具：{{"tool": "<工具名>", "args": {{…}}}}
+- 结束：{{"reply": "<给用户的话>", "done": true}}
+
+JSON 必须合法：字符串里的换行写成 \n、双引号写成 \"。
+工具名只能从下方清单里选，不要发明新工具。
+
+## 核心规则
+1. 文件是唯一真相：动手前用 read/locate 确认当前内容与准确行区间，
+   不要凭记忆猜行号。行号会随编辑漂移，优先用 cell:id。
+2. 用户消息可能附有「选中区段」（带行号的 xml 片段）——改动必须局限在
+   对应 cell 的行区间内，不要动范围外的内容。
+3. edit 会被全量校验：XML 非法、id 重复、引用断掉会被拒绝（文件保持
+   原样）；系统回报 added/changed/removed 清单，出现「范围外改动」警告
+   说明你动了不该动的内容，要立刻修正。
+4. 涉及布局/位置/连线/样式的修改：先 view 看图再动手；关键修改后可以
+   再 view 核对一次，确认没有引入重叠、溢出或断线。
+5. 只有纯信息类问答（用户明确要求"直接回答/不要用工具"）可以直接
+   回复；任何涉及画图、修改、检查的请求都必须通过工具完成。
+6. edit/draw 之后建议 check 一次验证引用完整；全部完成后才用 reply
+   结束，并给用户简短总结。
+
+## 工具
 {specs}
 
-信封例子：
-{{"tool": "locate", "args": {{"query": "订单"}}}}
-{{"tool": "edit", "args": {{"range": "cell:svc-a", "text": "<mxCell ...>…</mxCell>"}}}}
-{{"reply": "已完成：把订单服务节点改为蓝色。", "done": true}}
-
-注意 text 字段里的换行与引号要按 JSON 规则转义；range 优先用 cell:id，
-行号会随编辑漂移，cell:id 不会。"#,
+## 错误处理
+- 工具失败时读返回的错误信息，修正参数重试；不要原样重复失败调用。
+- 预算或上下文超限会被系统强制中止，不要尝试绕过。"#,
         path = doc.path.display(),
         cells = doc.cells.len(),
         png = doc.path.with_extension("png").display(),
         specs = Tools::tool_specs(),
     )
+}
+
+/// Action-ish verbs in the user's ask — when the model answers in plain text
+/// without touching any tool, a reply to one of these probably means the
+/// request was NOT carried out.
+fn looks_like_action(s: &str) -> bool {
+    [
+        "改", "画", "加", "添加", "删", "连", "移", "调整", "新建", "创建", "修复",
+        "设计", "生成", "布局", "优化", "重构", "换", "设置", "移动", "连线", "改色",
+        "改名", "增", "去掉", "放大", "缩小", "对齐", "重新排列", "拖",
+    ]
+    .iter()
+    .any(|k| s.contains(k))
 }
 
 /// Strip ```json fences if the model wrapped its answer in a code block.
@@ -197,12 +223,16 @@ pub fn parse_envelope(raw: &str) -> Result<Value, String> {
     if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
         return Ok(v);
     }
-    // Tolerant scan: first '{' .. balanced last '}'.
-    let start = trimmed.find('{').ok_or_else(|| format!("回复里没有 JSON 信封: {raw}"))?;
+    // Tolerant scan: walk every balanced '{…}' segment. Models sometimes
+    // emit a reasoning JSON first and the real envelope second (or emit two
+    // tool envelopes back to back) — prefer the first candidate that looks
+    // like an envelope (has `tool`/`reply`), else take the first object.
+    let mut candidates: Vec<String> = Vec::new();
     let mut depth = 0i32;
     let mut in_str = false;
     let mut esc = false;
-    for (i, c) in trimmed[start..].char_indices() {
+    let mut seg_start: Option<usize> = None;
+    for (i, c) in trimmed.char_indices() {
         match c {
             '"' if !esc => in_str = !in_str,
             '\\' if in_str => esc = !esc,
@@ -212,20 +242,33 @@ pub fn parse_envelope(raw: &str) -> Result<Value, String> {
             continue;
         }
         match c {
-            '{' => depth += 1,
+            '{' => {
+                depth += 1;
+                if seg_start.is_none() {
+                    seg_start = Some(i);
+                }
+            }
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    let end = start + i + 1;
-                    let candidate = &trimmed[start..end];
-                    return serde_json::from_str(candidate)
-                        .map_err(|e| format!("JSON 解析失败: {e} in {candidate}"));
+                    if let Some(st) = seg_start.take() {
+                        candidates.push(trimmed[st..i + 1].to_string());
+                    }
                 }
             }
             _ => {}
         }
     }
-    Err(format!("JSON 信封不完整: {raw}"))
+    if candidates.is_empty() {
+        return Err(format!("JSON 信封不完整: {raw}"));
+    }
+    let envelope_like = |c: &str| c.contains("\"tool\"") || c.contains("\"reply\"");
+    let pick = candidates
+        .iter()
+        .find(|c| envelope_like(c))
+        .or_else(|| candidates.first())
+        .expect("non-empty");
+    serde_json::from_str(pick).map_err(|e| format!("JSON 解析失败: {e} in {pick}"))
 }
 
 /// Rough token estimate for prompt-size guarding (text chars ≈ 0.5 token
@@ -385,7 +428,12 @@ impl Harness {
                     // model has started calling tools we require protocol
                     // compliance (one correction retry, then give up).
                     if tool_calls == 0 {
-                        let reply = strip_fences(&raw).trim().to_string();
+                        let mut reply = strip_fences(&raw).trim().to_string();
+                        if looks_like_action(user_text) {
+                            reply = format!(
+                                "{reply}\n\n（系统提示：本轮模型未调用任何工具，文件没有被修改。如果这与你的要求不符，请重新表述并强调要用工具修改。）"
+                            );
+                        }
                         emit!(EngineEvent::Final { reply: reply.clone() });
                         stats.add(&usage, spent);
                         remember!();
@@ -401,7 +449,7 @@ impl Harness {
                         last_err = Some(e.clone());
                         history.push(Message::assistant(raw.clone()));
                         history.push(Message::user(format!(
-                            "你的上一条输出不是合法信封: {e}\n请只输出一个 JSON 信封（不要代码块、不要多余文字）。"
+                            "你的上一条输出不是合法信封: {e}\n请只输出一个 JSON 信封，例如 {{\"tool\": \"locate\", \"args\": {{\"query\": \"x\"}}}} 或 {{\"reply\": \"…\", \"done\": true}}；不要 markdown 代码块、不要附带其他文字。"
                         )));
                         continue;
                     }
@@ -433,8 +481,15 @@ impl Harness {
                 Some(n) => n,
                 None if tool_calls == 0 => {
                     // JSON envelope without tool/reply before any tool ran:
-                    // treat the model's raw text as the reply.
-                    let reply = strip_fences(&raw).trim().to_string();
+                    // treat the model's raw text as the reply. If the user's
+                    // ask sounded like an action request, warn that nothing
+                    // was actually changed.
+                    let mut reply = strip_fences(&raw).trim().to_string();
+                    if looks_like_action(user_text) {
+                        reply = format!(
+                            "{reply}\n\n（系统提示：本轮模型未调用任何工具，文件没有被修改。如果这与你的要求不符，请重新表述并强调要用工具修改。）"
+                        );
+                    }
                     emit!(EngineEvent::Final { reply: reply.clone() });
                     stats.add(&usage, spent);
                     remember!();
@@ -446,7 +501,23 @@ impl Harness {
                         cost_yuan: spent,
                     });
                 }
-                None => return Err("信封缺 tool/reply 字段".to_string()),
+                None => {
+                    // Started calling tools already — require the protocol:
+                    // one correction round, then give up.
+                    if last_err.is_none() {
+                        last_err = Some("信封缺 tool/reply 字段".to_string());
+                        history.push(Message::assistant(raw.clone()));
+                        history.push(Message::user(
+                            "信封缺少 tool 或 reply 字段。请只输出一个 JSON 信封：\
+                             {{\"tool\": \"<工具名>\", \"args\": {{…}}}} 或 {{\"reply\": \"…\", \"done\": true}}。"
+                                .to_string(),
+                        ));
+                        continue;
+                    }
+                    stats.add(&usage, spent);
+                    remember!();
+                    return Err("信封缺 tool/reply 字段".to_string());
+                }
             };
             // Tool whitelist + fast fail: a model that hallucinates tool
             // names (e.g. `{"tool":"reply"}`) would otherwise loop until
@@ -535,6 +606,78 @@ mod tests {
     use super::*;
     use crate::xmlfile::XmlDoc;
     use std::collections::VecDeque;
+
+    #[test]
+    fn system_prompt_renders_single_brace_json_examples() {
+        let doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let p = system_prompt(&doc);
+        assert!(p.contains(r#"{"tool": "locate", "args"#) || p.contains(r#"{"tool": "<工具名>""#), "信封示例必须是单层花括号");
+        assert!(p.contains("read   {"), "工具清单必须有 read");
+        assert!(!p.contains("{{"), "提示词里不应残留双层花括号: {}", &p[p.len().saturating_sub(400)..]);
+    }
+
+    #[test]
+    fn envelope_prefers_envelope_over_reasoning_json() {
+        // reasoning JSON first, real envelope second
+        let raw = r#"{"reasoning":"先看一下"}{"tool":"locate","args":{"query":"a"}}"#;
+        let v = parse_envelope(raw).unwrap();
+        assert_eq!(v["tool"], "locate");
+        // two envelopes back to back -> first envelope wins
+        let raw2 = r#"{"tool":"view","args":{}}{"tool":"locate","args":{"query":"a"}}"#;
+        let v2 = parse_envelope(raw2).unwrap();
+        assert_eq!(v2["tool"], "view");
+        // surrounding prose + single envelope
+        let raw3 = "让我看看：{\"tool\":\"check\",\"args\":{}} 完毕";
+        let v3 = parse_envelope(raw3).unwrap();
+        assert_eq!(v3["tool"], "check");
+    }
+
+    #[test]
+    fn looks_like_action_detects_request_verbs() {
+        assert!(looks_like_action("把 svc-b 的颜色改成蓝色"));
+        assert!(looks_like_action("加一个节点"));
+        assert!(!looks_like_action("现在图里有几个节点？"));
+        assert!(!looks_like_action("总结一下刚才做了什么"));
+    }
+
+    #[tokio::test]
+    async fn plain_answer_to_action_ask_warns_nothing_changed() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        let mut fake = FakeChat::new(vec![r#"好的，已经帮你改好了颜色。"#]);
+        let out = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "把节点 b 的颜色改成蓝色", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert_eq!(out.tool_calls, 0);
+        assert!(out.reply.contains("文件没有被修改"), "{}", out.reply);
+        // 纯问答不加警告
+        let mut fake2 = FakeChat::new(vec![r#"图里有 5 个节点。"#]);
+        let out2 = Harness::default()
+            .run(&mut fake2, &mut tools, &mut doc, "图里有几个节点？", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert!(!out2.reply.contains("文件没有被修改"), "{}", out2.reply);
+    }
+
+    #[tokio::test]
+    async fn envelope_missing_fields_gets_one_correction_round() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        // round 1: valid tool; round 2: envelope without tool/reply;
+        // round 3 (after correction): proper reply. Should succeed.
+        let mut fake = FakeChat::new(vec![
+            r#"{"tool":"check","args":{}}"#,
+            r#"{"note":"我还需要看一下"}"#,
+            r#"{"reply":"完成","done":true}"#,
+        ]);
+        let out = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "检查一下图", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "完成");
+        assert_eq!(out.tool_calls, 1);
+    }
 
     #[test]
     fn envelope_parses_plain_and_fenced() {

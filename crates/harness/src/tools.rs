@@ -79,34 +79,36 @@ impl Tools {
 
     /// Tool docs embedded in the system prompt.
     pub fn tool_specs() -> &'static str {
-        r#"可用工具（每轮输出至多一个 JSON 信封，见协议）：
-
-1. read   {"range": "120-156" | "cell:svc-a" | "120"}
-   返回文件中指定区间的原文（带行号）。改之前先读，不要凭记忆猜行号。
+        r#"1. read   {"range": "120-156" | "cell:svc-a" | "120"}}
+   返回文件中指定区间的原文（带行号）。改之前先读；范围尽量小
+   （超长区间会被截断）。行号会随编辑漂移，优先用 cell:id。
 
 2. locate {"query": "order"}
-   在文件中搜索文本/cell id，返回命中的 cell 及其 @行区间。用来把
-   用户说的概念（"订单服务那个框"）映射到文件位置。
+   按文本/cell id 搜索，返回命中的 cell 与 @行区间（最多 12 条）。
+   用来把用户说的概念（"订单服务那个框"）映射到文件位置。
 
-3. edit   {"range": "120-156" | "cell:svc-a", "text": "替换后的完整内容"}
-   把 range 覆盖的行整体替换为 text（text 须为完整元素 XML，可多行）。
-   系统会做全量校验并报告 added/changed/removed cell——只允许改动
-   目标 cell，其他 cell 必须保持字节不变。
+3. edit   {"range": "120-156" | "cell:svc-a", "text": "<完整 XML 片段>"}
+   把 range 覆盖的行整体替换为 text。text 必须是**完整自洽的 XML**：
+   开闭标签齐全、属性完整（如 mxGeometry 要带 as="geometry"、
+   mxCell 要带 parent/vertex），新增 cell 用新的唯一 id，连线要有
+   source/target。只改目标 cell，其余必须字节不变——系统校验后回报
+   added/changed/removed 清单，出现越界改动会被警告。
 
-4. draw   {"xml": "完整 <mxfile>…</mxfile>"}
-   整图重建（新画一张图 / 大改布局时用）。等同于 edit 整个文件。
+4. draw   {"xml": "<mxfile>…</mxfile>"}
+   整图重建（新画一张图或大改布局时用）。xml 必须是完整 mxfile。
 
 5. check  {}
    确定性校验：XML 结构、id 唯一、parent/source/target 引用完整。
+   edit/draw 之后建议调用。
 
 6. view   {}
-   渲染当前文件为截图，并作为图像消息发给你 —— 你会真正看到这张图。
-   仔细检查：节点重叠、文字溢出框体、连线错位/穿框、箭头方向、布局失衡。
-   看完再决定改哪里；改完几何/样式后应再次 view 核对，确认没有引入新问题。
-   注意：画布坐标与 xml 行区间没有 1:1 对应，定位用 locate，看几何值用 read。
+   渲染当前文件为截图并作为图像消息发给你——你会真正看到这张图。
+   检查：节点重叠、文字溢出框体、连线错位/穿框、箭头方向、布局失衡。
+   看完再决定改哪里；不要连续重复调用（上一张图已经在你的上下文里）。
+   画布坐标与 xml 行区间没有 1:1 对应：定位用 locate，几何值用 read。
 
-7. done —— {"reply": "给用户的总结", "done": true}
-   认为任务完成时使用；回复会直接展示给用户。"#
+7. 结束  {"reply": "<给用户的总结>", "done": true}
+   任务完成时使用；reply 会直接展示给用户。"#
     }
 
     /// Run one tool. `name` comes straight from the model envelope; args are
@@ -140,12 +142,32 @@ impl Tools {
             .get("range")
             .and_then(Value::as_str)
             .ok_or_else(|| "read 需要参数 range".to_string())?;
-        let (a, b) = resolve_arg(doc, spec)?;
+        let total_lines = total_lines(doc.canonical());
+        let (a, b) = resolve_arg(doc, spec).or_else(|e| {
+            // read 允许范围超出文件末尾：截到最后一行为止（edit 仍严格拒绝）
+            crate::xmlfile::parse_range_loose(spec, total_lines).map_err(|_| e)
+        })?;
+        const MAX_READ_LINES: usize = 150;
+        let lines = lines_in(doc.canonical(), a, b);
+        let total = lines.lines().count();
+        let body: String = lines
+            .lines()
+            .take(MAX_READ_LINES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let note = if total > MAX_READ_LINES {
+            format!(
+                "\n…（区间共 {total} 行，已截断至前 {MAX_READ_LINES} 行；请缩小 range 分批读）"
+            )
+        } else {
+            String::new()
+        };
         Ok(ToolOutput::text(format!(
-            "@{}:{} 内容如下:\n{}",
+            "@{}:{} 内容如下:\n{}{}",
             file_stem(doc),
             range_str(a, b),
-            numbered(&lines_in(doc.canonical(), a, b), a)
+            numbered(&body, a),
+            note
         )))
     }
 
@@ -156,8 +178,15 @@ impl Tools {
             .ok_or_else(|| "locate 需要参数 query".to_string())?;
         let q = query.to_lowercase();
         let text = doc.canonical();
+        // 只报叶子 cell：容器（diagram 等）的 span 覆盖所有子元素，
+        // 总会命中，属于噪音。
+        let is_leaf = |c: &crate::xmlfile::CellSpan| {
+            !doc.cells.iter().any(|o| {
+                o.id != c.id && o.start_line > c.start_line && o.start_line <= c.end_line
+            })
+        };
         let mut hits: Vec<String> = Vec::new();
-        for c in &doc.cells {
+        for c in doc.cells.iter().filter(|c| is_leaf(c)) {
             let slice = lines_in(text, c.start_line, c.end_line);
             if slice.to_lowercase().contains(&q) {
                 // find first matching line inside the cell for display
@@ -183,13 +212,23 @@ impl Tools {
                 hits.push(s);
             }
         }
+        const MAX_LOCATE_HITS: usize = 12;
         if hits.is_empty() {
             Ok(ToolOutput::text(format!(
                 "没有找到包含 `{query}` 的 cell（共 {} 个 cell）",
                 doc.cells.len()
             )))
         } else {
-            Ok(ToolOutput::text(format!("命中 {} 个 cell:\n{}", hits.len(), hits.join("\n"))))
+            let total = hits.len();
+            let shown = if hits.len() > MAX_LOCATE_HITS {
+                format!(
+                    "命中 {total} 个 cell，显示前 {MAX_LOCATE_HITS} 条（请用更精确的查询缩小范围）:\n{}\n…",
+                    hits[..MAX_LOCATE_HITS].join("\n")
+                )
+            } else {
+                format!("命中 {} 个 cell:\n{}", hits.len(), hits.join("\n"))
+            };
+            Ok(ToolOutput::text(shown))
         }
     }
 
@@ -411,6 +450,34 @@ mod tests {
         let out = t.run(&mut d, "locate", &serde_json::json!({"query": "order"})).await.unwrap();
         assert!(out.text.contains("svc-a"), "{}", out.text);
         assert!(out.text.contains("@"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn read_truncates_oversized_ranges() {
+        // 200+ cells: read 1-300 must truncate at 150 lines with a note.
+        let mut xml = String::from("<mxfile><diagram id=\"d\"><mxGraphModel><root><mxCell id=\"0\"/>");
+        for i in 1..=210 {
+            xml.push_str(&format!(r#"<mxCell id="n{i}" value="x" vertex="1" parent="1"><mxGeometry x="0" y="0" width="10" height="10" as="geometry"/></mxCell>"#));
+        }
+        xml.push_str("</root></mxGraphModel></diagram></mxfile>");
+        let mut d = XmlDoc::from_text(&xml).unwrap();
+        let mut t = Tools::new(false);
+        let out = t.run(&mut d, "read", &serde_json::json!({"range": "1-999"})).await.unwrap();
+        assert!(out.text.contains("已截断"), "{}", &out.text[out.text.len().saturating_sub(120)..]);
+        assert!(out.text.lines().count() <= 160, "{}", out.text.lines().count());
+    }
+
+    #[tokio::test]
+    async fn locate_caps_hits_at_twelve() {
+        let mut xml = String::from("<mxfile><diagram id=\"d\"><mxGraphModel><root><mxCell id=\"0\"/>");
+        for i in 1..=30 {
+            xml.push_str(&format!(r#"<mxCell id="n{i}" value="common word {i}" vertex="1" parent="1"><mxGeometry x="0" y="0" width="10" height="10" as="geometry"/></mxCell>"#));
+        }
+        xml.push_str("</root></mxGraphModel></diagram></mxfile>");
+        let mut d = XmlDoc::from_text(&xml).unwrap();
+        let mut t = Tools::new(false);
+        let out = t.run(&mut d, "locate", &serde_json::json!({"query": "common word"})).await.unwrap();
+        assert!(out.text.contains("命中 30 个 cell，显示前 12 条"), "{}", &out.text[..120]);
     }
 
     #[tokio::test]

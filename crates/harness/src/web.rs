@@ -91,10 +91,29 @@ impl WebState {
 pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建会话目录失败: {e}"))?;
     let chat = OpenAiChat::from_effective().ok();
+    // 启动即打开最近修改的会话（若有），与前端 boot 的选择保持一致
+    let mut current = None;
+    let mut sessions = std::collections::HashMap::new();
+    if let Some(first) = list_session_files(&dir).first() {
+        let name = first
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Ok(doc) = XmlDoc::load(first) {
+            current = Some(name.clone());
+            sessions.insert(
+                name,
+                SessionState {
+                    doc,
+                    stats: crate::engine::SessionStats::default(),
+                },
+            );
+        }
+    }
     let state = Arc::new(Mutex::new(WebState {
         dir: dir.clone(),
-        current: None,
-        sessions: std::collections::HashMap::new(),
+        current,
+        sessions,
         chat,
         tools: Tools::new(true),
         budget_yuan: None,
@@ -571,6 +590,13 @@ async fn api_chat_stream(
             }))
             .into_response();
         }
+        if st.current.is_none() {
+            return Json(json!({
+                "type": "error",
+                "error": "还没有打开的会话：先点「＋ 新建会话」"
+            }))
+            .into_response();
+        }
         st.running_job = true;
     }
 
@@ -580,10 +606,10 @@ async fn api_chat_stream(
     let jobs2 = jobs.clone();
     let task = tokio::spawn(async move {
         let mut st = st2.lock().await;
-        let Some(cur) = st.current.clone() else { return };
+        let cur = st.current.clone().expect("pre-checked");
         let WebState { sessions, chat, tools, budget_yuan, .. } = &mut *st;
-        let Some(chat) = chat.as_mut() else { return };
-        let Some(ss) = sessions.get_mut(&cur) else { return };
+        let chat = chat.as_mut().expect("pre-checked");
+        let ss = sessions.get_mut(&cur).expect("pre-checked");
         let SessionState { doc, stats } = ss;
         let cfg = config::effective_settings().unwrap_or_default();
         *budget_yuan = cfg.budget_yuan;

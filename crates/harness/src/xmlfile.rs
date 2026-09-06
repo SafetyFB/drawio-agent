@@ -758,6 +758,26 @@ fn parse_line_range(spec: &str) -> Result<(usize, usize), XmlError> {
     Ok((a, b))
 }
 
+/// Loose range parse for read-only lookups: strips a path prefix, accepts
+/// ranges that run past the end of the file (clamped), and rejects
+/// zero/inverted ranges.
+pub fn parse_range_loose(spec: &str, total_lines: usize) -> Result<(usize, usize), XmlError> {
+    let spec = spec.trim().trim_start_matches('@');
+    let cand: Vec<&str> = spec
+        .rsplit_once(':')
+        .map(|(_, rest)| vec![rest.trim(), spec])
+        .unwrap_or_else(|| vec![spec]);
+    for c in cand {
+        if let Ok((a, b)) = parse_line_range(c) {
+            if a < 1 || a > total_lines {
+                return Err(XmlError::BadRange(format!("{c} (file has {total_lines} lines)")));
+            }
+            return Ok((a, b.min(total_lines)));
+        }
+    }
+    Err(XmlError::BadRange(spec.into()))
+}
+
 /// id -> element line-slice content, used to diff versions by content.
 ///
 /// Only *leaf* ids are reportable: an element whose span contains another
