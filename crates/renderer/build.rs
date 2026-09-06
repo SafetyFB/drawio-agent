@@ -6,10 +6,9 @@
 //!
 //! `DRAWIO_AGENT_OFFLINE=1` skips the download entirely (emits `None`).
 //!
-//! TODO(bundled_chromium.rs): build.rs unit-testing is awkward (tests e-i in
-//! the original plan); skip for the first iteration. Also: SHA-256 hashes are
-//! logged but NOT enforced yet — bake them into a CHECKSUMS table as a
-//! follow-up (see README "Version bump procedure").
+//! SHA-256 verification is enforced via `src/checksum.rs::CHECKSUMS`
+//! (pulled in with `#[path]`); a mismatch hard-fails the build with both
+//! hashes printed. Bump `PINNED_VERSION` and the `CHECKSUMS` table together.
 
 use std::env;
 use std::fs::{self, File};
@@ -230,6 +229,9 @@ fn ensure_bundled() -> Result<Option<PathBuf>, String> {
         }
     }
     drop(archive);
+
+    // 4b. Zip is ~90MB — don't keep a duplicate copy in the cache dir.
+    let _ = fs::remove_file(&zip_path);
 
     // 5. Verify binary exists at the expected path.
     let extracted_bin = extract_root
