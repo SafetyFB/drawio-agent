@@ -55,6 +55,8 @@ struct StubDeps {
     rounds: std::sync::Mutex<Vec<RoundScript>>,
     /// Every (scope_cell_ids, prior_issue_count, instruction) received.
     fix_calls: std::sync::Mutex<Vec<(Vec<String>, usize, String)>>,
+    /// Memory lines received on every fix call.
+    fix_memories: std::sync::Mutex<Vec<Vec<String>>>,
 }
 
 impl StubDeps {
@@ -63,11 +65,16 @@ impl StubDeps {
             initial_xml: initial_xml.to_string(),
             rounds: std::sync::Mutex::new(rounds),
             fix_calls: std::sync::Mutex::new(Vec::new()),
+            fix_memories: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     fn calls(&self) -> Vec<(Vec<String>, usize, String)> {
         self.fix_calls.lock().unwrap().clone()
+    }
+
+    fn memories(&self) -> Vec<Vec<String>> {
+        self.fix_memories.lock().unwrap().clone()
     }
 }
 
@@ -99,6 +106,7 @@ impl AgentDeps for StubDeps {
             req.prior_issues.len(),
             req.instruction.clone(),
         ));
+        self.fix_memories.lock().unwrap().push(req.memory.clone());
         let mut rounds = self.rounds.lock().unwrap();
         let script = rounds
             .first()
@@ -138,6 +146,7 @@ fn config(prompt: &str, initial_xml: Option<&str>, max_iterations: u32) -> Agent
         max_iterations,
         patch_cell_ids: vec![],
         review_checks: vec![],
+        memory: vec![],
         progress_cb: None,
     }
 }
@@ -501,5 +510,37 @@ async fn streams_progress_events_via_callback_in_order() {
     assert_eq!(
         cb_kinds, traj_kinds,
         "callback order must match recorded trajectory order"
+    );
+}
+
+#[tokio::test]
+async fn session_memory_is_passed_to_every_fix_round() {
+    // R2: AgentLoop.memory (earlier-turn summaries assembled by the server)
+    // must reach the deps fix request unchanged on every round.
+    let config = AgentLoop {
+        memory: vec![
+            "User asked earlier: draw a payment flow".to_string(),
+            "Earlier done: generated the initial diagram (v3)".to_string(),
+        ],
+        ..config("fix it", Some(INITIAL_XML), 5)
+    };
+    let deps = StubDeps::new(
+        INITIAL_XML,
+        vec![RoundScript {
+            done: false,
+            changed: true,
+            issues: vec![issue("overlap", &["2"])],
+            reject: None,
+        }],
+    );
+    let _outcome = run(config, &deps).await.expect("loop terminates");
+    let memories = deps.memories();
+    assert!(!memories.is_empty());
+    assert!(
+        memories.iter().all(|m| m == &vec![
+            "User asked earlier: draw a payment flow".to_string(),
+            "Earlier done: generated the initial diagram (v3)".to_string(),
+        ]),
+        "memory must be forwarded verbatim on every round: {memories:?}"
     );
 }

@@ -28,8 +28,8 @@ pub use run::{
     RendererKind, ReqwestHttpTransport, ServerConfig, StubLlm,
 };
 pub use state::{
-    EventBus, SessionData, SessionId, SessionMeta, SessionStore, VersionEntry, VersionMeta,
-    WsEvent,
+    ConversationEntry, EventBus, SessionData, SessionId, SessionMeta, SessionStore,
+    VersionEntry, VersionMeta, WsEvent,
 };
 
 /// Errors surfaced by the server (per-route handlers translate to HTTP status).
@@ -113,6 +113,11 @@ pub struct SessionInfoResponse {
     pub id: SessionId,
     pub meta: SessionMeta,
     pub current_xml: Option<String>,
+    /// Persistent conversation memory (R2): user asks + completed-turn
+    /// summaries. The frontend ignores it today; it is what later runs
+    /// replay as background context.
+    #[serde(default)]
+    pub conversation: Vec<ConversationEntry>,
 }
 
 /// Response body for `GET /api/sessions/:id/versions`.

@@ -56,4 +56,6 @@ pub struct LoopState {
     pub current_xml: Option<String>,
     pub last_verdict: Option<String>,
     pub last_issue_count: u32,
+    /// `reasoning` from the most recent fix round (model self-report).
+    pub last_reasoning: Option<String>,
 }

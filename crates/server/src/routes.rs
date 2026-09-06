@@ -14,10 +14,10 @@ use serde_json::json;
 use tokio::sync::broadcast;
 
 use crate::{
-    state::WsEvent, AgentLoopRequest, AppState, CreateSessionRequest, CreateSessionResponse,
-    GenerateRequest, GenerateResponse, PatchRequest, PatchResponse, RenderResponse,
-    ReviewRequest, ServerAgentDeps, SessionInfoResponse, SessionSummary, ServerError,
-    VersionsResponse,
+    state::{WsEvent, ConversationEntry}, AgentLoopRequest, AppState, CreateSessionRequest,
+    CreateSessionResponse, GenerateRequest, GenerateResponse, PatchRequest, PatchResponse,
+    RenderResponse, ReviewRequest, ServerAgentDeps, SessionId, SessionInfoResponse,
+    SessionSummary, ServerError, VersionsResponse,
 };
 
 /// Record a TrajectoryEvent to the store AND emit it on the EventBus as
@@ -152,6 +152,7 @@ async fn get_session(
         id: session_id,
         meta: data.meta,
         current_xml,
+        conversation: data.conversation,
     }))
 }
 
@@ -180,12 +181,14 @@ async fn generate(
             return Err(ServerError::SessionNotFound(session_id.clone()));
         }
     }
+    let memory = record_user_ask_and_memory(&state, &session_id, "generate", &req.prompt).await;
     let llm_req = drawio_agent_llm_client::GenerateRequest {
         user_prompt: req.prompt.clone(),
         current_xml: None,
         scope: None,
         feedback: None,
         json_mode: req.json_mode,
+        memory,
     };
 
     // Trajectory: log LlmCallStarted before dispatch (record + emit).
@@ -258,6 +261,22 @@ async fn generate(
             },
         )
         .await;
+    // Conversation memory: note what this turn produced (the user ask was
+    // recorded before the run).
+    state
+        .sessions
+        .write()
+        .await
+        .push_conversation(
+            &session_id,
+            ConversationEntry::new(
+                "agent",
+                "generate",
+                format!("Generated a diagram from scratch for: {}", truncate_summary(&req.prompt, 80)),
+                Some(version_id),
+            ),
+        )
+        .await;
     Ok(Json(GenerateResponse {
         xml: resp.content,
         version_id,
@@ -272,6 +291,56 @@ fn truncate_summary(s: &str, max_chars: usize) -> String {
         let truncated: String = s.chars().take(max_chars).collect();
         format!("{truncated}…")
     }
+}
+
+/// Turn the session's conversation memory into LLM-readable context lines
+/// (R2). Replays the OLDEST of the recent tail first so the model sees the
+/// asks in chronological order; each line is truncated to bound tokens.
+///
+/// The current XML already carries the diagram state — memory only needs
+/// the *intent/decision* trail, so storing full XML/PNG here would be pure
+/// waste.
+fn conversation_memory(
+    entries: &[ConversationEntry],
+    max_entries: usize,
+    max_chars: usize,
+) -> Vec<String> {
+    let tail = entries.iter().rev().take(max_entries).collect::<Vec<_>>();
+    tail.iter()
+        .rev()
+        .map(|e| match e.role.as_str() {
+            "agent" => format!(
+                "Earlier done: {}",
+                truncate_summary(&e.text, max_chars)
+            ),
+            _ => format!(
+                "User asked earlier: {}",
+                truncate_summary(&e.text, max_chars)
+            ),
+        })
+        .collect()
+}
+
+/// Record the user's ask into the conversation before a run starts, and
+/// return the memory lines to inject into that run.
+async fn record_user_ask_and_memory(
+    state: &AppState,
+    session_id: &SessionId,
+    kind: &str,
+    text: &str,
+) -> Vec<String> {
+    let conv = state.sessions.read().await.conversation(session_id).await;
+    let memory = conversation_memory(&conv, 8, 300);
+    state
+        .sessions
+        .write()
+        .await
+        .push_conversation(
+            session_id,
+            ConversationEntry::new("user", kind, truncate_summary(text, 300), None),
+        )
+        .await;
+    memory
 }
 
 async fn patch(
@@ -301,6 +370,7 @@ async fn patch(
                 "session has no current XML — call /generate first".into(),
             )
         })?;
+    let memory = record_user_ask_and_memory(&state, &session_id, "patch", &req.instruction).await;
 
     // 3. Parse and grab the model mutably.
     let mut file = drawio_agent_xml_core::MxFile::parse(current_xml.as_bytes())
@@ -329,6 +399,7 @@ async fn patch(
         scope: Some(scope_xml),
         feedback: None,
         json_mode: req.json_mode,
+        memory,
     };
 
     // Trajectory: log LlmCallStarted before dispatch (record + emit).
@@ -657,6 +728,7 @@ async fn run_agent_loop(
         .current_xml(&session_id)
         .await;
     let initial_xml = req.initial_xml.clone().or(session_xml);
+    let memory = record_user_ask_and_memory(&state, &session_id, "agent-loop", &req.prompt).await;
 
     // Bridge the server's shared providers into the Agent Loop. Wire the
     // loop's progress callback to the EventBus through an unbounded channel
@@ -697,6 +769,7 @@ async fn run_agent_loop(
         max_iterations: req.max_iterations,
         patch_cell_ids: req.patch_cell_ids,
         review_checks: req.review_checks,
+        memory,
         progress_cb: Some(std::sync::Arc::new(move |evt| {
             let _ = tx.send(evt);
         })),
@@ -742,6 +815,32 @@ async fn run_agent_loop(
                 version_id,
                 kind: "agent-loop".into(),
             },
+        )
+        .await;
+
+    // Conversation memory: summarize this turn for later runs. The
+    // model's own final reasoning (when present) is the most useful
+    // carry-over — it says what was changed and why.
+    let reasoning = outcome.last_reasoning.clone();
+    let converged = outcome.converged;
+    let iterations = outcome.iterations;
+    state
+        .sessions
+        .write()
+        .await
+        .push_conversation(
+            &session_id,
+            ConversationEntry::new(
+                "agent",
+                "agent-loop",
+                format!(
+                    "Refine finished: {iterations} round(s), converged={converged}{}",
+                    reasoning
+                        .map(|r| format!("; model note: {}", truncate_summary(&r, 200)))
+                        .unwrap_or_default()
+                ),
+                Some(version_id),
+            ),
         )
         .await;
 

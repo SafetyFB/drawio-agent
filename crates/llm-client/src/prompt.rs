@@ -87,14 +87,40 @@ Output ONLY the <mxfile>...</mxfile> document, no commentary."#
 /// User prompt for a single XML generation call.
 ///
 /// The raw `user_prompt` is always included. Optional sections are appended in
-/// a stable order (current diagram, scope, feedback) and only when present.
+/// a stable order (memory, current diagram, scope, feedback) and only when
+/// present.
 pub fn codegen_user_prompt(
     user_prompt: &str,
     current_xml: Option<&str>,
     scope: Option<&str>,
     feedback: Option<&[String]>,
 ) -> String {
+    codegen_user_prompt_with_memory(user_prompt, current_xml, scope, feedback, &[])
+}
+
+/// [`codegen_user_prompt`] with a session-memory section (R2): summaries of
+/// earlier turns, rendered as bullet context so follow-up requests remember
+/// what the user already asked and what was already done.
+pub fn codegen_user_prompt_with_memory(
+    user_prompt: &str,
+    current_xml: Option<&str>,
+    scope: Option<&str>,
+    feedback: Option<&[String]>,
+    memory: &[String],
+) -> String {
     let mut parts: Vec<String> = Vec::new();
+
+    if !memory.is_empty() {
+        let bullets = memory
+            .iter()
+            .map(|m| format!("- {m}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        parts.push(format!(
+            "Earlier turns in this session (context — do NOT redo unless asked):\n{bullets}"
+        ));
+    }
+
     parts.push(format!(
         "Generate Draw.io XML for the following request:\n{user_prompt}"
     ));
@@ -221,8 +247,21 @@ pub fn fix_user_prompt(
     scope: Option<&str>,
     issues: &[crate::ReviewIssue],
     checks: &[String],
+    memory: &[String],
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
+
+    if !memory.is_empty() {
+        let bullets = memory
+            .iter()
+            .map(|m| format!("- {m}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        parts.push(format!(
+            "Earlier turns in this session (context — do NOT redo unless asked):\n{bullets}"
+        ));
+    }
+
     parts.push(format!(
         "The rendered image of the current diagram is attached.\nTask: {instruction}"
     ));

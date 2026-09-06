@@ -80,6 +80,7 @@ impl AgentDeps for ServerAgentDeps {
                 issues: prior_issues,
                 checks: req.checks.clone(),
                 image_png: req.image_png.clone(),
+                memory: req.memory.clone(),
             })
             .await
             .map_err(|e| FixError::Llm(e.to_string()))?;

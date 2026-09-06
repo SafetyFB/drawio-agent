@@ -50,6 +50,11 @@ pub struct AgentLoop {
     /// Optional reviewer focus checks, forwarded to every fix round.
     /// Default: empty (the model decides what to look for).
     pub review_checks: Vec<String>,
+    /// Session memory (R2): summaries of earlier turns, injected into every
+    /// fix round as background context so follow-up runs remember what the
+    /// user already asked and what was already done. Kept stable across
+    /// rounds (only the round-specific feedback notes change).
+    pub memory: Vec<String>,
     /// Optional live-progress callback. Invoked (synchronously, in record
     /// order) for every trajectory event the loop records, before the run
     /// finishes.
@@ -64,6 +69,7 @@ impl std::fmt::Debug for AgentLoop {
             .field("max_iterations", &self.max_iterations)
             .field("patch_cell_ids", &self.patch_cell_ids)
             .field("review_checks", &self.review_checks)
+            .field("memory", &self.memory)
             .field("progress_cb", &"<callback>")
             .finish()
     }
@@ -78,6 +84,7 @@ impl AgentLoop {
             max_iterations: 5,
             patch_cell_ids: Vec::new(),
             review_checks: Vec::new(),
+            memory: Vec::new(),
             progress_cb: None,
         }
     }
@@ -120,6 +127,10 @@ pub struct AgentOutcome {
     pub last_verdict: Option<String>,
     /// Count of issues reported in the last fix round.
     pub last_issue_count: u32,
+    /// `reasoning` from the most recent fix round (the model's own summary of
+    /// what it changed), when the model provided one.
+    #[serde(default)]
+    pub last_reasoning: Option<String>,
     /// All trajectory events recorded during the run.
     pub trajectory: Vec<drawio_agent_trajectory::Event>,
 }

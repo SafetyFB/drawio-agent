@@ -116,6 +116,7 @@ async fn json_mode_sends_response_format_field() {
         scope: None,
         feedback: None,
         json_mode: true,
+        memory: vec![],
     })
     .await
     .unwrap();
@@ -141,6 +142,7 @@ async fn json_mode_extracts_xml_field_from_response() {
             scope: None,
             feedback: None,
             json_mode: true,
+            memory: vec![],
         })
         .await
         .unwrap();
@@ -162,6 +164,7 @@ async fn json_mode_preserves_reasoning_when_present() {
             scope: None,
             feedback: None,
             json_mode: true,
+            memory: vec![],
         })
         .await
         .unwrap();
@@ -189,6 +192,7 @@ async fn json_mode_errors_on_invalid_json_response() {
             scope: None,
             feedback: None,
             json_mode: true,
+            memory: vec![],
         })
         .await
         .expect_err("invalid JSON must error");
@@ -209,6 +213,7 @@ async fn json_mode_errors_when_xml_field_missing() {
             scope: None,
             feedback: None,
             json_mode: true,
+            memory: vec![],
         })
         .await
         .expect_err("missing xml field must error");
@@ -233,6 +238,7 @@ async fn json_mode_errors_when_xml_field_is_not_a_string() {
             scope: None,
             feedback: None,
             json_mode: true,
+            memory: vec![],
         })
         .await
         .expect_err("xml field must be a string");
@@ -253,6 +259,7 @@ async fn no_json_mode_does_not_send_response_format() {
         scope: None,
         feedback: None,
         json_mode: false,
+        memory: vec![],
     })
     .await
     .unwrap();
@@ -276,6 +283,7 @@ async fn no_json_mode_returns_raw_string_content() {
             scope: None,
             feedback: None,
             json_mode: false,
+            memory: vec![],
         })
         .await
         .unwrap();
@@ -298,6 +306,7 @@ async fn json_mode_still_extracts_usage_correctly() {
             scope: None,
             feedback: None,
             json_mode: true,
+            memory: vec![],
         })
         .await
         .unwrap();
@@ -322,6 +331,7 @@ async fn json_mode_handles_xml_with_special_chars() {
             scope: None,
             feedback: None,
             json_mode: true,
+            memory: vec![],
         })
         .await
         .unwrap();
@@ -339,6 +349,7 @@ async fn default_json_mode_is_false() {
         scope: None,
         feedback: None,
         json_mode: false,
+        memory: vec![],
     };
     assert!(!req.json_mode);
 }

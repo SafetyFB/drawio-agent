@@ -375,6 +375,7 @@ async fn streaming_works_with_json_mode() {
         .generate_streaming(GenerateRequest {
             user_prompt: "x".into(),
             json_mode: true,
+            memory: vec![],
             ..Default::default()
         })
         .await

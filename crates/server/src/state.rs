@@ -83,6 +83,48 @@ pub struct SessionData {
     pub versions: Vec<VersionEntry>,
     /// Unix milliseconds at creation (used to order the session list).
     pub created_at: u64,
+    /// Persistent conversation memory (R2): one entry per user request
+    /// (role="user") and per completed turn (role="agent", a short
+    /// summary). Replayed into later runs as background context so the
+    /// model remembers earlier asks and outcomes across runSend calls.
+    pub conversation: Vec<ConversationEntry>,
+}
+
+/// One entry of the session's persistent conversation memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationEntry {
+    /// `"user"` (a request) or `"agent"` (a completed-turn summary).
+    pub role: String,
+    /// Short human/LLM-readable text: what was asked / what was done.
+    pub text: String,
+    /// Which endpoint produced this entry ("generate" | "patch" |
+    /// "agent-loop").
+    pub kind: String,
+    /// Version created by this turn, if any.
+    pub version_id: Option<Uuid>,
+    /// Unix milliseconds.
+    pub at_ms: u64,
+}
+
+impl ConversationEntry {
+    pub fn new(
+        role: &str,
+        kind: &str,
+        text: impl Into<String>,
+        version_id: Option<Uuid>,
+    ) -> Self {
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Self {
+            role: role.to_string(),
+            kind: kind.to_string(),
+            text: text.into(),
+            version_id,
+            at_ms,
+        }
+    }
 }
 
 /// One past (or current) version: the XML plus metadata.
@@ -184,6 +226,7 @@ impl SessionStore {
             meta,
             versions: Vec::new(),
             created_at,
+            conversation: Vec::new(),
         };
         self.inner.write().await.insert(id.clone(), data);
         id
@@ -230,6 +273,27 @@ impl SessionStore {
         let guard = self.inner.read().await;
         let data = guard.get(id)?;
         data.versions.last().map(|v| v.xml.clone())
+    }
+
+    /// Append a conversation entry (user ask or agent turn summary).
+    pub async fn push_conversation(
+        &self,
+        id: &SessionId,
+        entry: ConversationEntry,
+    ) {
+        let mut guard = self.inner.write().await;
+        if let Some(data) = guard.get_mut(id) {
+            data.conversation.push(entry);
+        }
+    }
+
+    /// Snapshot of the session's conversation memory.
+    pub async fn conversation(&self, id: &SessionId) -> Vec<ConversationEntry> {
+        let guard = self.inner.read().await;
+        guard
+            .get(id)
+            .map(|d| d.conversation.clone())
+            .unwrap_or_default()
     }
 
     /// List all version metadata for a session, newest last.

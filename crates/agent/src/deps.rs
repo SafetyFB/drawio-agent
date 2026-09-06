@@ -27,6 +27,9 @@ pub struct FixRequest {
     pub prior_issues: Vec<ReviewIssue>,
     /// Optional reviewer focus checks.
     pub checks: Vec<String>,
+    /// Session memory (R2): summaries of earlier turns, rendered as stable
+    /// background context for this round.
+    pub memory: Vec<String>,
 }
 
 /// Result of one fix round, already merged/validated by the deps impl so

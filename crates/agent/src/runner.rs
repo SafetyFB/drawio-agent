@@ -62,6 +62,7 @@ pub async fn run<D: AgentDeps + ?Sized>(
         current_xml: None,
         last_verdict: None,
         last_issue_count: 0,
+        last_reasoning: None,
     };
     // Trajectory events are recorded through the store so each one gets a
     // stable id/seq/timestamp; the final list is embedded in the outcome.
@@ -87,6 +88,7 @@ pub async fn run<D: AgentDeps + ?Sized>(
                     scope: None,
                     feedback: None,
                     json_mode: false,
+                    memory: config.memory.clone(),
                 })
                 .await
             {
@@ -198,6 +200,7 @@ pub async fn run<D: AgentDeps + ?Sized>(
             cell_ids: scope_cells,
             prior_issues: pending_issues.clone(),
             checks: config.review_checks.clone(),
+            memory: config.memory.clone(),
         };
         match deps.fix(&fix_req).await {
             Ok(out) => {
@@ -215,6 +218,7 @@ pub async fn run<D: AgentDeps + ?Sized>(
                 .await;
                 state.last_verdict = Some(if out.done { "pass" } else { "issues" }.into());
                 state.last_issue_count = out.issues.len() as u32;
+                state.last_reasoning = out.reasoning.clone();
                 if out.changed {
                     state.current_xml = Some(out.xml.clone());
                 }
@@ -350,6 +354,7 @@ fn final_outcome(
         final_phase,
         last_verdict: state.last_verdict.clone(),
         last_issue_count: state.last_issue_count,
+        last_reasoning: state.last_reasoning.clone(),
         trajectory,
     }
 }

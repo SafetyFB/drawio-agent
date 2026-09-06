@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::prompt::{
-    codegen_system_prompt, codegen_user_prompt, fix_system_prompt, fix_user_prompt,
+    codegen_system_prompt, codegen_user_prompt_with_memory, fix_system_prompt, fix_user_prompt,
     patch_system_prompt, review_system_prompt,
 };
 use crate::transport::{HttpTransport, TransportError};
@@ -43,6 +43,8 @@ pub struct GenerateRequest {
     /// When true, request `response_format: {type: "json_object"}` and
     /// parse the assistant content as `{"xml": "...", "reasoning": "..."}`.
     pub json_mode: bool,
+    /// Session memory (R2): summaries of earlier turns rendered as context.
+    pub memory: Vec<String>,
 }
 
 /// A single issue found during visual review.
@@ -94,6 +96,8 @@ pub struct FixRequest {
     pub checks: Vec<String>,
     /// Latest rendered PNG the model must visually review.
     pub image_png: Vec<u8>,
+    /// Session memory (R2): summaries of earlier turns rendered as context.
+    pub memory: Vec<String>,
 }
 
 /// Parsed JSON envelope returned by the fix step:
@@ -292,11 +296,12 @@ impl LlmProvider for OpenAiCompatProvider {
         let (system_msg, user_msg) = if req.scope.is_some() {
             (
                 patch_system_prompt(),
-                codegen_user_prompt(
+                codegen_user_prompt_with_memory(
                     &req.user_prompt,
                     req.current_xml.as_deref(),
                     req.scope.as_deref(),
                     req.feedback.as_deref(),
+                    &req.memory,
                 ),
             )
         } else {
@@ -344,11 +349,12 @@ impl LlmProvider for OpenAiCompatProvider {
         let (system_msg, user_msg) = if req.scope.is_some() {
             (
                 patch_system_prompt(),
-                codegen_user_prompt(
+                codegen_user_prompt_with_memory(
                     &req.user_prompt,
                     req.current_xml.as_deref(),
                     req.scope.as_deref(),
                     req.feedback.as_deref(),
+                    &req.memory,
                 ),
             )
         } else {
@@ -430,6 +436,7 @@ impl LlmProvider for OpenAiCompatProvider {
             req.scope_xml.as_deref(),
             &req.issues,
             &req.checks,
+            &req.memory,
         );
         let mut body = json!({
             "model": self.config.model,
