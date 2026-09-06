@@ -761,16 +761,18 @@ async fn api_history_list(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_
         .iter()
         .enumerate()
         .map(|(i, r)| {
+            // 聊天渲染所需字段（不含 xml 快照，体积小）
             json!({
                 "idx": i,
                 "ts": r.ts,
-                "user": r.user.chars().take(120).collect::<String>(),
+                "user": r.user,
+                "reply": r.reply,
                 "tool_calls": r.tool_calls,
                 "usage_in": r.usage_in,
                 "usage_out": r.usage_out,
                 "cost_yuan": r.cost_yuan,
                 "error": r.error,
-                "xml_chars": r.xml.chars().count(),
+                "events": r.events,
             })
         })
         .collect();

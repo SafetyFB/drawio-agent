@@ -123,21 +123,4 @@ select.field, .field select {
 #usage.warn { border-color: var(--warn); color: var(--warn); }
 #send.danger { background: var(--err); }
 
-#histlog { border-bottom: 1px solid var(--line); max-height: 40%; overflow-y: auto; padding: 6px 10px; }
-.hist-item { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; margin: 6px 0; cursor: pointer; }
-.hist-item:hover { border-color: var(--accent); }
-.hist-user { font-weight: 600; }
-.hist-meta { color: var(--dim); font-size: 11px; margin-top: 2px; }
-.hist-detail { margin-top: 6px; border-top: 1px dashed var(--line); padding-top: 6px; font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 260px; overflow-y: auto; }
-.hist-detail .ev { color: var(--fg); }
-.hist-detail .ev.dim { color: var(--dim); }
-.hist-actions { display: flex; gap: 6px; margin-top: 6px; }
-.hist-actions button { font-size: 12px; padding: 2px 8px; }
-
-#session-picker {
-  background: #242836; color: var(--fg); border: 1px solid var(--line);
-  border-radius: 8px; padding: 4px 8px; font: inherit; max-width: 220px;
-}
-#welcome { text-align: center; color: var(--dim); max-width: 380px; }
-#welcome h3 { color: var(--fg); }
-#welcome button { margin-top: 8px; }
+.chat-divider { align-self: center; color: var(--dim); font-size: 11px; margin: 4px 0; }

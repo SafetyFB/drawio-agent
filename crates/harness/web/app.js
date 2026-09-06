@@ -236,8 +236,7 @@ async function switchSession(name, announce) {
   $('chatlog').innerHTML = '';
   if (announce) log('tool-note', `已进入会话（文件）: ${name}`);
   await loadSessions();
-  // 选中会话即看到它的历史记录（只读时间线）
-  await openHistory(true);
+  await renderHistoryIntoChat();
   return true;
 }
 
@@ -494,8 +493,7 @@ $('chatform').onsubmit = async (ev) => {
     const cur = list.find((x) => x.current);
     if (cur) {
       await refreshCanvas();
-      // 进入页面即展示当前会话的历史记录（只读时间线）
-      await openHistory(true);
+      await renderHistoryIntoChat();
     } else if (list.length) {
       await switchSession(list[0].name, false);
     } else {
@@ -673,91 +671,44 @@ form.addEventListener('submit', async (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// R5: per-file history panel (trajectory inspect / restore / export/import)
+// R5: 历史 = 聊天记录本身（无感重放，不再有单独面板）
 // ---------------------------------------------------------------------------
 
-const histLog = $('histlog');
-let histOpen = false;
-
-async function openHistory(force) {
-  if (busy && typeof force !== 'boolean') { log('error', '任务运行中——先点「停止」再查看历史'); return; }
-  if (typeof force === 'boolean') histOpen = force;
-  else histOpen = !histOpen;
-  histLog.hidden = !histOpen;
-  $('hist-btn').classList.toggle('active', histOpen);
-  if (!histOpen) return;
+/// 把会话历史按聊天流形式铺进 chatlog：user 气泡 → 工具轨迹 → 回复气泡。
+/// 打开页面/切换会话时调用，看起来就像上次的对话一直在这里。
+async function renderHistoryIntoChat() {
+  if (busy) return;
   let data;
   try { data = await (await fetch('/api/history')).json(); }
-  catch (e) { log('error', '历史读取失败: ' + e); return 0; }
-  const count = (data.records || []).length;
-  $('hist-btn').textContent = count ? `历史(${count})` : '历史';
-  histLog.innerHTML = '';
-  // 作用域标注：历史属于「当前会话（文件）」这条时间线
-  const scope = document.createElement('div');
-  scope.className = 'hist-meta';
-  scope.style.margin = '4px 2px 6px';
-  const cur = picker.value ? picker.value : '(未选择会话)';
-  scope.innerHTML = `时间线 · 当前会话：<b>${escapeHtml(cur)}</b><br>
-    <span style="font-size:11px">会话 = 文件（横向切换工作区）；这里 = 本文件内的任务轨迹与版本回滚。</span>`;
-  histLog.appendChild(scope);
-  if (!data.records || !data.records.length) {
-    const d = document.createElement('div');
-    d.className = 'dim';
-    d.textContent = '暂无历史记录（完成一次对话后自动记录）';
-    histLog.appendChild(d);
-    return count;
+  catch (e) { return; }
+  const recs = (data.records || []).slice(0, 50).reverse(); // 旧→新
+  if (!recs.length) return;
+  const divider = document.createElement('div');
+  divider.className = 'msg chat-divider';
+  divider.textContent = '── 历史记录 ──';
+  $('chatlog').appendChild(divider);
+  for (const r of recs) {
+    logMsg('user', r.user);
+    for (const ev of r.events || []) {
+      const t = ev.type;
+      if (t === 'tool') logMsg('tool-note', `→ ${ev.name} ${ev.args || ''}`);
+      else if (t === 'tool_result') logMsg('tool-note', `↳ ${ev.name}: ${ev.preview || ''}${ev.has_image ? ' 📷' : ''}`);
+      else if (t === 'usage') logMsg('tool-note', `  · tokens +${ev.in}/+${ev.out}${ev.cost_yuan > 0 ? ' ≈ ' + fmtCost(ev.cost_yuan) : ''}`);
+    }
+    if (r.error) logMsg('error', '错误: ' + r.error);
+    if (r.reply) logMsg('assistant', r.reply);
+    else logMsg('tool-note', '（本轮无回复）');
   }
-  for (const r of data.records) {
-    const item = document.createElement('div');
-    item.className = 'hist-item';
-    const d = new Date(r.ts * 1000);
-    const ts = d.toLocaleString('zh-CN', { hour12: false });
-    item.innerHTML = `<div class="hist-user">${escapeHtml(r.user)}</div>
-      <div class="hist-meta">${ts} · ${r.tool_calls} 次工具 · ${r.usage_in + r.usage_out} tokens${r.cost_yuan > 0 ? ' · ' + fmtCost(r.cost_yuan) : ''}${r.error ? ' · ⚠ 出错' : ''}</div>`;
-    const detail = document.createElement('div');
-    detail.className = 'hist-detail';
-    detail.hidden = true;
-    item.appendChild(detail);
-    item.onclick = async () => {
-      detail.hidden = !detail.hidden;
-      if (detail.hidden) return;
-      detail.textContent = '加载中…';
-      const full = await (await fetch('/api/history/' + r.idx)).json();
-      if (!full.ok) { detail.textContent = full.error || '读取失败'; return; }
-      const rec = full.record;
-      let txt = '';
-      for (const ev of rec.events || []) {
-        const t = ev.type;
-        if (t === 'tool') txt += `→ ${ev.name} ${ev.args || ''}\n`;
-        else if (t === 'tool_result') txt += `↳ ${ev.name}: ${ev.preview || ''}${ev.has_image ? ' 📷' : ''}\n`;
-        else if (t === 'usage') txt += `· tokens +${ev.in}/+${ev.out}\n`;
-        else if (t === 'reply') txt += `回复: ${ev.reply}\n`;
-        else if (t === 'error') txt += `错误: ${ev.error}\n`;
-      }
-      if (rec.error) txt += `错误: ${rec.error}\n`;
-      txt += `\n最终回复: ${rec.reply}\n（xml ${rec.xml.length} 字符）`;
-      detail.textContent = txt;
-      // 历史是只读记录：仅提供导出，不做回溯
-      const acts = document.createElement('div');
-      acts.className = 'hist-actions';
-      const dl = document.createElement('button');
-      dl.textContent = '导出会话 JSON';
-      dl.onclick = (e) => {
-        e.stopPropagation();
-        const blob = new Blob([JSON.stringify(rec, null, 2)], { type: 'application/json' });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = `drawio-ctx-${r.idx}.json`;
-        a.click();
-      };
-      acts.append(dl);
-      detail.appendChild(acts);
-    };
-    histLog.appendChild(item);
-  }
-  return count;
+  $('chatlog').scrollTop = $('chatlog').scrollHeight;
 }
-$('hist-btn').onclick = () => openHistory();
+
+/// log() 但总是 append（启动期 log 定义早于本函数也无妨）
+function logMsg(kind, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + kind;
+  div.textContent = text;
+  $('chatlog').appendChild(div);
+}
 
 $('ctx-import-btn').onclick = () => { if (guardBusy()) return; $('ctx-file').click(); };
 $('ctx-file').onchange = async () => {
