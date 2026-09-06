@@ -34,13 +34,18 @@
         <button type="button" id="settings-close" class="icon-btn" aria-label="Close settings">✕</button>
       </div>
       <form id="settings-form" class="settings-form">
-        <label class="field">
-          <span>Provider</span>
-          <select id="cfg-kind">
-            <option value="openai-compat">OpenAI-compatible API</option>
-            <option value="mock">Mock（离线占位）</option>
-          </select>
-        </label>
+        <div id="cfg-current" class="cfg-current">
+          <div class="cfg-current-head">
+            <span class="panel-label">当前生效配置</span>
+            <span id="cfg-dirty" class="cfg-dirty" hidden>● 有未保存的更改</span>
+          </div>
+          <dl id="cfg-current-body" class="cfg-current-body"></dl>
+        </div>
+        <div id="cfg-demo-hint" class="test-result ok" hidden>
+          尚未配置 LLM Provider（未找到配置文件或环境变量）。<br>
+          填写下方 Base URL / API Key / Model 并点「测试连接」→「保存」即可开始使用。
+        </div>
+        <input type="hidden" id="cfg-kind" value="openai-compat">
         <label class="field">
           <span>Base URL</span>
           <input id="cfg-base-url" type="url" placeholder="https://open.bigmodel.cn/api/paas/v4" autocomplete="off" spellcheck="false">

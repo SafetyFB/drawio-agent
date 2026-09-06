@@ -269,3 +269,80 @@ async fn connection_test_handles_validation_without_network() {
 /// Silence unused-import warnings if trait methods are not called here.
 #[allow(dead_code)]
 fn _keep(_p: Arc<dyn LlmProvider>) {}
+
+#[tokio::test]
+async fn switching_to_mock_keeps_saved_credentials() {
+    // Regression: saving mock used to wipe base_url/api_key/model, which
+    // silently broke switching back to the real provider.
+    let state = mock_state_with_config_path(Some(temp_config_path())).await;
+    let app = router(state.clone());
+
+    let save = |body: Value| {
+        app.clone().oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/config")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+    };
+
+    let resp = save(serde_json::json!({
+        "kind": "openai-compat",
+        "base_url": "https://real.test/v1",
+        "api_key": "sk-real-key-123456",
+        "model": "glm-4.6v",
+    }))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Flip to mock…
+    let resp = save(serde_json::json!({"kind": "mock"})).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // …credentials must survive.
+    let stored = state.llm_settings.read().unwrap().clone();
+    assert_eq!(stored.kind, drawio_agent_server::LlmKind::Mock);
+    assert_eq!(stored.base_url, "https://real.test/v1");
+    assert_eq!(stored.api_key, "sk-real-key-123456");
+    assert_eq!(stored.model, "glm-4.6v");
+}
+
+#[tokio::test]
+async fn unconfigured_provider_fails_fast_with_settings_hint() {
+    // No file, no env, no override -> every call errors with a clear hint
+    // (never a silent mock fallback).
+    let settings = LlmSettings {
+        kind: drawio_agent_server::LlmKind::Unconfigured,
+        ..Default::default()
+    };
+    let provider = drawio_agent_server::build_provider(&settings);
+    let err = provider
+        .generate_xml(drawio_agent_llm_client::GenerateRequest {
+            user_prompt: "anything".into(),
+            ..Default::default()
+        })
+        .await
+        .expect_err("unconfigured provider must error");
+    assert!(
+        err.to_string().contains("未配置"),
+        "error must point at the settings UI: {err}"
+    );
+}
+
+#[tokio::test]
+async fn effective_settings_never_defaults_to_mock() {
+    // Regression: with nothing configured the resolver must report
+    // Unconfigured — silently running on the stub made users think their
+    // prompts were being processed by a real model.
+    let settings = drawio_agent_server::effective_settings(None);
+    // NOTE: this test runs in an env that MAY carry DRAWIO_AGENT_LLM_*;
+    // only assert the no-fallback invariant when no env is present.
+    if std::env::var("DRAWIO_AGENT_LLM_PROVIDER").is_err() {
+        assert_eq!(settings.kind, drawio_agent_server::LlmKind::Unconfigured);
+    } else {
+        assert_ne!(settings.kind, drawio_agent_server::LlmKind::Mock);
+    }
+}

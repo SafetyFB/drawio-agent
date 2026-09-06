@@ -170,3 +170,9 @@ button.secondary:hover { background:#252a36; }
 .test-result.fail { background:rgba(239,68,68,.12); border:1px solid rgba(239,68,68,.35); color:#fca5a5; }
 .test-result.pending { background:rgba(10,124,185,.1); border:1px solid rgba(10,124,185,.3); color:#7dd3fc; }
 .provider-badge { padding:.25rem .6rem; border-radius:999px; background:var(--surface-2); border:1px solid var(--border); color:var(--text-dim); font-size:.72rem; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.cfg-current { padding:.6rem .75rem; border:1px solid var(--border); border-radius:8px; background:var(--bg); }
+.cfg-current-head { display:flex; align-items:center; justify-content:space-between; gap:.5rem; }
+.cfg-dirty { font-size:.72rem; font-weight:600; color:var(--warning); }
+.cfg-current-body { display:grid; grid-template-columns:auto 1fr; gap:.25rem .8rem; margin:.45rem 0 0; font-size:.78rem; }
+.cfg-current-body dt { color:var(--text-dim); }
+.cfg-current-body dd { margin:0; color:var(--text); word-break:break-all; }

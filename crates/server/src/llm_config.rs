@@ -21,7 +21,13 @@ use crate::run::StubLlm;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LlmKind {
-    /// Built-in stub (no network; returns canned diagrams).
+    /// No provider configured yet (no config file, no env, nothing the
+    /// user saved). Every LLM call fails fast with a clear message that
+    /// points at the settings UI. Never a silent fallback.
+    #[serde(rename = "unconfigured")]
+    Unconfigured,
+    /// Built-in stub (no network; returns canned diagrams). Only used by
+    /// tests and explicit API/CLI opt-in — the UI does not offer it.
     Mock,
     /// Any OpenAI-compatible `/chat/completions` endpoint.
     #[serde(rename = "openai-compat")]
@@ -31,6 +37,7 @@ pub enum LlmKind {
 impl std::fmt::Display for LlmKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::Unconfigured => "unconfigured",
             Self::Mock => "mock",
             Self::OpenAiCompat => "openai-compat",
         })
@@ -52,7 +59,7 @@ pub struct LlmSettings {
 impl Default for LlmSettings {
     fn default() -> Self {
         Self {
-            kind: LlmKind::Mock,
+            kind: LlmKind::Unconfigured,
             base_url: String::new(),
             api_key: String::new(),
             model: String::new(),
@@ -77,10 +84,50 @@ pub fn mask_secret(secret: &str) -> String {
     format!("{}…{}", &secret[..4], &secret[secret.len() - 4..])
 }
 
+/// Error message shown for every LLM call while no provider is configured.
+pub const UNCONFIGURED_MSG: &str =
+    "LLM 未配置：请点击右上角 ⚙ 打开设置，填写 Base URL / API Key / Model 并保存";
+
+/// A provider that fails every call with a clear configuration hint.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnconfiguredLlm;
+
+#[async_trait]
+impl LlmProvider for UnconfiguredLlm {
+    fn name(&self) -> &str {
+        "unconfigured"
+    }
+    async fn generate_xml(
+        &self,
+        _req: GenerateRequest,
+    ) -> Result<LlmResponse<String>, ProviderError> {
+        Err(ProviderError::Provider(UNCONFIGURED_MSG.into()))
+    }
+    async fn generate_streaming(
+        &self,
+        _req: GenerateRequest,
+    ) -> Result<LlmStream, ProviderError> {
+        Err(ProviderError::Provider(UNCONFIGURED_MSG.into()))
+    }
+    async fn review_visual(
+        &self,
+        _req: ReviewRequest,
+    ) -> Result<LlmResponse<ReviewResponse>, ProviderError> {
+        Err(ProviderError::Provider(UNCONFIGURED_MSG.into()))
+    }
+    async fn fix_diagram(
+        &self,
+        _req: FixRequest,
+    ) -> Result<LlmResponse<String>, ProviderError> {
+        Err(ProviderError::Provider(UNCONFIGURED_MSG.into()))
+    }
+}
+
 /// Build a live provider for the given settings (used at startup, on PUT,
 /// and by the connection test).
 pub fn build_provider(settings: &LlmSettings) -> Arc<dyn LlmProvider> {
     match settings.kind {
+        LlmKind::Unconfigured => Arc::new(UnconfiguredLlm),
         LlmKind::Mock => Arc::new(StubLlm),
         LlmKind::OpenAiCompat => {
             let transport: Arc<dyn drawio_agent_llm_client::HttpTransport> =
@@ -133,11 +180,13 @@ pub fn save_config_file(path: &Path, llm: &LlmSettings) -> Result<(), String> {
 }
 
 /// Resolve the effective settings: config file wins (the UI is the source
-/// of truth once it saved), then env vars, then the mock stub.
+/// of truth once it saved), then env vars. Nothing found → [`LlmKind::Unconfigured`]:
+/// the server runs, but every LLM call fails fast with a settings hint —
+/// never a silent mock fallback.
 pub fn effective_settings(file: Option<&Path>) -> LlmSettings {
     if let Some(p) = file {
         if let Some(s) = load_config_file(p) {
-            if !matches!(s.kind, LlmKind::Mock)
+            if matches!(s.kind, LlmKind::OpenAiCompat)
                 && (s.base_url.is_empty() || s.model.is_empty())
             {
                 // A saved openai-compat config missing fields is broken;
@@ -149,10 +198,13 @@ pub fn effective_settings(file: Option<&Path>) -> LlmSettings {
             }
         }
     }
-    env_settings().unwrap_or_default()
+    env_settings().unwrap_or_else(|| LlmSettings {
+        kind: LlmKind::Unconfigured,
+        ..Default::default()
+    })
 }
 
-fn env_settings() -> Option<LlmSettings> {
+pub fn env_settings() -> Option<LlmSettings> {
     match std::env::var("DRAWIO_AGENT_LLM_PROVIDER").as_deref() {
         Ok("mock") => Some(LlmSettings {
             kind: LlmKind::Mock,

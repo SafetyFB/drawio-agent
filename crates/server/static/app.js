@@ -35,10 +35,13 @@
   const settingsClose = $('settings-close');
   const settingsCancel = $('settings-cancel');
   const cfgKind = $('cfg-kind');
+  const cfgDemoHint = $('cfg-demo-hint');
   const cfgBaseUrl = $('cfg-base-url');
   const cfgApiKey = $('cfg-api-key');
   const cfgModel = $('cfg-model');
   const cfgFile = $('cfg-file');
+  const cfgCurrentBody = $('cfg-current-body');
+  const cfgDirty = $('cfg-dirty');
   const cfgTestBtn = $('cfg-test-btn');
   const cfgSaveBtn = $('cfg-save-btn');
   const testResult = $('test-result');
@@ -64,6 +67,8 @@
   let currentSelection = [];
   let currentGraph = null;
   let currentDepth = 'fast';
+  // Effective LLM config as last loaded from GET /api/config (dirty check).
+  let effectiveCfg = null;
   // Canvas interaction mode: 'pan' (default) or 'select' (rubber-band marquee).
   let canvasMode = 'pan';
   // In-progress rubber band, in raw client (viewport) coordinates.
@@ -1104,6 +1109,55 @@
       };
     }
 
+    function renderDemoHint(kind) {
+      cfgDemoHint.hidden = kind !== 'mock' && kind !== 'unconfigured';
+      cfgDemoHint.textContent = kind === 'mock'
+        ? '当前为内置演示模式（未连接任何 API，生成的是示例图）。填写并保存即可启用真实生成。'
+        : '尚未配置 LLM Provider（未找到配置文件或环境变量）。填写下方并点「测试连接」→「保存」即可开始使用。';
+    }
+
+    /** Render the 'currently effective' summary from a GET /api/config. */
+    function renderEffective(cfg) {
+      effectiveCfg = cfg;
+      const llm = cfg.llm || {};
+      const rows = [];
+      const kindLabel = llm.kind === 'mock'
+        ? '演示模式（mock）'
+        : llm.kind === 'unconfigured'
+          ? '未配置'
+          : 'OpenAI-compatible';
+      rows.push(['Provider', kindLabel]);
+      if (llm.kind === 'openai-compat') {
+        rows.push(['Endpoint', llm.base_url ? hostOf(llm.base_url) : '—']);
+        rows.push(['Model', llm.model || '—']);
+      }
+      rows.push(['API Key', llm.api_key_masked ? `${llm.api_key_masked}（已设置）` : '未设置']);
+      const source = llm.kind === 'unconfigured'
+        ? '无（首次配置）'
+        : cfg.config_file ? `配置文件 · ${cfg.config_file}` : '环境变量';
+      rows.push(['来源', source]);
+      rows.push(['渲染', 'Chromium（内置，固定）']);
+      cfgCurrentBody.innerHTML = '';
+      for (const [k, v] of rows) {
+        const dt = document.createElement('dt');
+        dt.textContent = k;
+        const dd = document.createElement('dd');
+        dd.textContent = v;
+        cfgCurrentBody.appendChild(dt);
+        cfgCurrentBody.appendChild(dd);
+      }
+      cfgDirty.hidden = true;
+    }
+
+    function checkDirty() {
+      if (!effectiveCfg) return;
+      const l = effectiveCfg.llm || {};
+      const formChanged = l.kind === 'openai-compat'
+        ? (cfgBaseUrl.value.trim() !== (l.base_url || '') || cfgModel.value.trim() !== (l.model || ''))
+        : (cfgBaseUrl.value.trim() !== '' || cfgModel.value.trim() !== '');
+      cfgDirty.hidden = !formChanged;
+    }
+
     function showTestResult(cls, html) {
       testResult.className = `test-result ${cls}`;
       testResult.innerHTML = html;
@@ -1114,14 +1168,16 @@
       clearTestResult();
       try {
         const cfg = await api('GET', '/api/config');
-        cfgKind.value = cfg.llm.kind;
+        renderEffective(cfg);
+        renderDemoHint(cfg.llm.kind);
         cfgBaseUrl.value = cfg.llm.base_url || '';
         cfgModel.value = cfg.llm.model || '';
         cfgApiKey.value = '';
         cfgApiKey.placeholder = cfg.llm.api_key_masked || 'sk-…';
         cfgFile.textContent = cfg.config_file ? `配置文件：${cfg.config_file}` : '未持久化（仅本次运行）';
         settingsModal.hidden = false;
-        cfgKind.focus();
+        cfgBaseUrl.focus();
+        checkDirty();
       } catch (err) {
         showError(`读取设置失败：${err.message}`);
       }
@@ -1139,6 +1195,7 @@
     }
 
     settingsBtn.addEventListener('click', openSettings);
+    [cfgBaseUrl, cfgApiKey, cfgModel].forEach(el => el.addEventListener('input', checkDirty));
     settingsClose.addEventListener('click', closeSettings);
     settingsCancel.addEventListener('click', closeSettings);
     settingsModal.addEventListener('click', (e) => {
@@ -1156,7 +1213,7 @@
         const res = await api('POST', '/api/config/test', payload);
         if (res.ok) {
           const extra = res.latency_ms != null ? ` · ${res.latency_ms}ms` : '';
-          showTestResult('ok', `✓ ${escapeHtml(res.detail || 'connected')}${extra}`);
+          showTestResult('ok', `✓ ${escapeHtml(res.detail || 'connected')}${extra}<br><small>测试通过——点「保存」才会生效并持久化。</small>`);
         } else {
           showTestResult('fail', `✗ ${escapeHtml(res.error || 'connection failed')}`);
         }
@@ -1170,31 +1227,27 @@
     settingsForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       const payload = cfgPayload();
-      if (payload.kind === 'openai-compat' && (!payload.base_url || !payload.model)) {
+      payload.kind = 'openai-compat'; // demo mode is not user-selectable anymore
+      if (!payload.base_url || !payload.model) {
         showTestResult('fail', '✗ base URL 与 model 必填');
         return;
       }
       cfgSaveBtn.disabled = true;
       try {
         await api('PUT', '/api/config', payload);
-        closeSettings();
         clearError();
+        const savedCfg = await api('GET', '/api/config');
+        renderEffective(savedCfg);
+        renderDemoHint(savedCfg.llm.kind);
+        cfgBaseUrl.value = savedCfg.llm.base_url || '';
+        cfgModel.value = savedCfg.llm.model || '';
+        cfgApiKey.value = '';
+        cfgApiKey.placeholder = savedCfg.llm.api_key_masked || 'sk-…';
+        cfgFile.textContent = savedCfg.config_file ? `配置文件：${savedCfg.config_file}` : '未持久化（仅本次运行）';
+        updateBadge();
+        closeSettings();
         // Reflect the new provider in the top bar / status for clarity.
-        const saved = await api('GET', '/api/config');
-        const label = saved.llm.kind === 'mock'
-          ? 'mock'
-          : `${saved.llm.model} · ${saved.llm.base_url.replace(/^https?:\/\//, '').replace(/\/$/, '')}`;
-        const providerBadge = $('provider-badge');
-        if (!providerBadge) {
-          const b = document.createElement('span');
-          b.id = 'provider-badge';
-          b.className = 'provider-badge';
-          b.title = 'Current LLM provider (settings ⚙)';
-          b.textContent = label;
-          settingsBtn.insertAdjacentElement('beforebegin', b);
-        } else {
-          providerBadge.textContent = label;
-        }
+        updateBadge();
       } catch (err) {
         showTestResult('fail', `✗ 保存失败：${escapeHtml(err.message)}`);
       } finally {
@@ -1269,17 +1322,31 @@
     updateRefineHint();
   }
 
+  function hostOf(url) {
+    try { return new URL(url).host || url; } catch { return url; }
+  }
+
+  function badgeLabel(cfg) {
+    const l = cfg.llm || {};
+    if (l.kind === 'unconfigured') return '未配置 LLM（点 ⚙ 设置）';
+    if (l.kind === 'mock') return '演示模式（mock）';
+    return `${l.model} · ${hostOf(l.base_url || '')}`;
+  }
+
+  function updateBadge(cfg) {
+    const b = document.getElementById('provider-badge');
+    if (!b) return;
+    b.textContent = badgeLabel(cfg || { llm: {} });
+  }
+
   async function loadProviderBadge() {
     try {
       const cfg = await api('GET', '/api/config');
-      const label = cfg.llm.kind === 'mock'
-        ? 'mock'
-        : `${cfg.llm.model} · ${(cfg.llm.base_url || '').replace(/^https?:\/\//, '').replace(/\/$/, '')}`;
       const b = document.createElement('span');
       b.id = 'provider-badge';
       b.className = 'provider-badge';
-      b.title = 'Current LLM provider (settings ⚙)';
-      b.textContent = label;
+      b.title = '当前 LLM provider（⚙ 设置）';
+      b.textContent = badgeLabel(cfg);
       settingsBtn.insertAdjacentElement('beforebegin', b);
     } catch (err) { /* badge is cosmetic */ }
   }

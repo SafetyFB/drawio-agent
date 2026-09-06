@@ -928,9 +928,24 @@ async fn put_config(
             merged.api_key = current; // keep the existing secret
         }
     } else {
-        merged.base_url.clear();
-        merged.model.clear();
-        merged.api_key.clear();
+        // Switching to the demo stub must NOT wipe saved credentials: the
+        // UI treats mock as "unconfigured", and users flip back and forth
+        // while testing. PUT is full-replacement, so backfill everything
+        // from the current settings when the body only flips the kind.
+        let current = state
+            .llm_settings
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        if merged.base_url.is_empty() {
+            merged.base_url = current.base_url;
+        }
+        if merged.model.is_empty() {
+            merged.model = current.model;
+        }
+        if merged.api_key.is_empty() {
+            merged.api_key = current.api_key;
+        }
     }
 
     let provider = crate::llm_config::build_provider(&merged);
