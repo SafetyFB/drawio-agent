@@ -60,32 +60,6 @@ pub struct LlmSettings {
     pub budget_yuan: Option<f64>,
 }
 
-/// Well-known model prices (¥/1M tokens, 2025 官方公开价，仅作填表便利;
-/// 实际以账单为准，可手动修改). Preset only when the user asks.
-pub fn preset_prices(model: &str) -> Option<(f64, f64)> {
-    let m = model.to_lowercase();
-    let p = if m.contains("glm-4.6") || m.contains("glm-4.5") {
-        (5.0, 15.0)
-    } else if m.contains("glm-4-flash") {
-        (0.0, 0.0)
-    } else if m.contains("glm-4") || m.contains("glm-4v") {
-        (0.1, 0.1)
-    } else if m.contains("deepseek-chat") {
-        (2.0, 8.0)
-    } else if m.contains("deepseek-reasoner") {
-        (4.0, 16.0)
-    } else if m.contains("gpt-4o") {
-        (17.0, 68.0)
-    } else if m.contains("gpt-4o-mini") {
-        (1.1, 4.4)
-    } else if m.contains("qwen") && m.contains("vl") {
-        (2.0, 6.0)
-    } else {
-        return None;
-    };
-    Some(p)
-}
-
 /// ¥ cost of a usage at the given settings (0 price = 0 cost, token 照常统计).
 pub fn usage_cost(input_tokens: u64, output_tokens: u64, s: &LlmSettings) -> f64 {
     input_tokens as f64 / 1e6 * s.price_input_per_m

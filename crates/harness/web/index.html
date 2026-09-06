@@ -46,7 +46,7 @@
       </div>
       <label class="field">
         <span>Base URL</span>
-        <input id="cfg-base-url" type="url" placeholder="https://open.bigmodel.cn/api/paas/v4" autocomplete="off" spellcheck="false">
+        <input id="cfg-base-url" type="url" placeholder="https://example.com/v1" autocomplete="off" spellcheck="false">
       </label>
       <label class="field">
         <span>API Key（留空 = 保持不变）</span>
@@ -54,7 +54,7 @@
       </label>
       <label class="field">
         <span>Model</span>
-        <input id="cfg-model" type="text" placeholder="glm-4.6v（多模态模型才能 view 看图）" autocomplete="off" spellcheck="false">
+        <input id="cfg-model" type="text" placeholder="多模态模型才能 view 看图" autocomplete="off" spellcheck="false">
       </label>
       <div class="grid2">
         <label class="field">
@@ -65,7 +65,7 @@
           <span>思考模式</span>
           <select id="cfg-thinking">
             <option value="default">跟随模型默认</option>
-            <option value="no-think">关闭思考（快，GLM 4.6+）</option>
+            <option value="no-think">关闭思考（部分模型支持，更快）</option>
           </select>
         </label>
       </div>
@@ -79,16 +79,10 @@
           <input id="cfg-price-out" type="number" step="0.01" min="0" placeholder="15" autocomplete="off">
         </label>
       </div>
-      <div class="grid2">
-        <label class="field">
-          <span>会话预算 ¥（超预算自动中断，留空不限）</span>
-          <input id="cfg-budget" type="number" step="0.1" min="0" placeholder="5" autocomplete="off">
-        </label>
-        <div class="field">
-          <span>&nbsp;</span>
-          <button type="button" id="cfg-preset-btn" class="secondary">按模型填常见价格</button>
-        </div>
-      </div>
+      <label class="field">
+        <span>会话预算 ¥（超预算自动中断，留空不限）</span>
+        <input id="cfg-budget" type="number" step="0.1" min="0" placeholder="5" autocomplete="off">
+      </label>
       <div class="field-static">渲染：本地 chromium · 配置文件：<span id="cfg-file"></span></div>
       <div id="test-result" class="test-result" hidden></div>
       <div class="modal-actions">

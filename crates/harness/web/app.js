@@ -1339,26 +1339,6 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !modal.hidden) closeSettings();
 });
 
-$('cfg-preset-btn').onclick = () => {
-  const model = cfgModel.value.trim().toLowerCase();
-  const presets = {
-    'glm-4.6': [5, 15], 'glm-4.5': [5, 15], 'glm-4-flash': [0, 0],
-    'glm-4v': [0.1, 0.1], 'deepseek-chat': [2, 8], 'deepseek-reasoner': [4, 16],
-    'gpt-4o': [17, 68], 'gpt-4o-mini': [1.1, 4.4],
-  };
-  let picked = null;
-  for (const [k, v] of Object.entries(presets)) {
-    if (model.includes(k)) { picked = v; break; }
-  }
-  if (picked) {
-    cfgPriceIn.value = picked[0];
-    cfgPriceOut.value = picked[1];
-    setTestResult('ok', `已按 ${cfgModel.value.trim()} 填入价格（¥${picked[0]}/${picked[1]} 每百万 tokens，2025 官方公开价，以账单为准可改）`);
-  } else {
-    setTestResult('err', `没有 ${cfgModel.value.trim() || '(空)'} 的预设价格，请手动填写（可参考: glm-4.6 5/15、deepseek-chat 2/8、gpt-4o-mini 1.1/4.4）`);
-  }
-};
-
 $('cfg-test-btn').onclick = async () => {
   const payload = {
     base_url: cfgBaseUrl.value.trim(),

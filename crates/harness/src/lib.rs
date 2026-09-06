@@ -18,7 +18,7 @@ pub mod web;
 pub mod xmlfile;
 
 pub use chat::{CallOpts, Chat, ChatError, Message, OpenAiChat, Reply, Usage};
-pub use config::{LlmSettings, ThinkingMode, mask_secret, preset_prices, usage_cost};
+pub use config::{LlmSettings, ThinkingMode, mask_secret, usage_cost};
 pub use engine::{parse_envelope, EngineEvent, Harness, ProgressFn, RunOpts, SessionStats, TurnOutcome};
 pub use history::{HistoryRec, SessionBundle};
 pub use refs::{resolve_refs, ResolvedRef};
