@@ -35,7 +35,7 @@
       <div id="drawio-container" class="drawio-container"></div>
       <div id="canvas-placeholder" class="canvas-placeholder" style="display:none">
         <p>No diagram yet.</p>
-        <p class="sub">Describe what you want in the AI panel and hit Generate.</p>
+        <p class="sub">Describe what you want in the AI panel and hit Send.</p>
       </div>
       <div id="canvas-overlay" class="canvas-overlay" style="display:none">
         <span class="spinner" aria-hidden="true"></span>
@@ -57,9 +57,19 @@
 
       <label for="prompt" class="panel-label">AI 助手</label>
       <textarea id="prompt" rows="6" placeholder="Describe the diagram you want…"></textarea>
-      <div class="actions">
-        <button id="generate-btn" type="button">Generate</button>
-        <button id="loop-btn" type="button" class="secondary">Run Loop</button>
+      <div class="send-row">
+        <div class="thinking-toggle" role="radiogroup" aria-label="Thinking depth">
+          <button type="button" class="thinking-option" data-depth="fast" role="radio" aria-checked="true">
+            <span class="thinking-icon" aria-hidden="true">⚡</span> Fast
+          </button>
+          <button type="button" class="thinking-option" data-depth="refine" role="radio" aria-checked="false">
+            <span class="thinking-icon" aria-hidden="true">🔄</span> Refine
+          </button>
+        </div>
+        <button type="button" id="send-btn" class="primary-btn send-btn" disabled>
+          <span>Send</span>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
       </div>
       <div id="run-status" class="run-status" style="display:none">
         <span class="spinner" aria-hidden="true"></span>
