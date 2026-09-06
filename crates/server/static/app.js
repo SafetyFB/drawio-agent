@@ -33,7 +33,7 @@
   const settingsModal = $('settings-modal');
   const settingsForm = $('settings-form');
   const settingsClose = $('settings-close');
-  const settingsCancel = $('settings-cancel');
+  const settingsCancel = $('cfg-cancel-btn');
   const cfgKind = $('cfg-kind');
   const cfgDemoHint = $('cfg-demo-hint');
   const cfgBaseUrl = $('cfg-base-url');
@@ -1244,10 +1244,8 @@
         cfgApiKey.value = '';
         cfgApiKey.placeholder = savedCfg.llm.api_key_masked || 'sk-…';
         cfgFile.textContent = savedCfg.config_file ? `配置文件：${savedCfg.config_file}` : '未持久化（仅本次运行）';
-        updateBadge();
+        updateBadge(savedCfg);
         closeSettings();
-        // Reflect the new provider in the top bar / status for clarity.
-        updateBadge();
       } catch (err) {
         showTestResult('fail', `✗ 保存失败：${escapeHtml(err.message)}`);
       } finally {
@@ -1330,7 +1328,7 @@
     const l = cfg.llm || {};
     if (l.kind === 'unconfigured') return '未配置 LLM（点 ⚙ 设置）';
     if (l.kind === 'mock') return '演示模式（mock）';
-    return `${l.model} · ${hostOf(l.base_url || '')}`;
+    return `${l.model || '?'} · ${hostOf(l.base_url || '')}`;
   }
 
   function updateBadge(cfg) {
