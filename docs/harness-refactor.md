@@ -79,8 +79,14 @@ Drawio 原始文件通常压缩且单行 —— 行号无意义、diff 不可读
       新截图到达后自动折叠，上下文至多保留最近一张。E2E：两个重叠节点，
       模型自主 7 次工具调用（view→定位→edit→view 核对→done）修复对齐，
       svc-a 位置零改动
-- [ ] M6 （可选）web 画布瘦壳：mxGraph 渲染 + 框选 → cell ids，其余全部走
-      本 harness 语义
+- [x] M6 web 画布瘦壳：`drawio-harness web <file> [port]`（默认 8787）。
+      单进程 = REPL 同款 XmlDoc/Tools/engine；浏览器里 mxGraph 渲染 + 框选
+      （复用旧 UI 验证过的 marquee/hitTest/patch 模式），框选 cell ids 随
+      下一条消息 POST，服务端经 span 索引翻译成 @cell 引用上下文 —— 与
+      REPL 的 /sel 完全同一条路径。另有 /api/check /undo /reload 与检查/撤销/
+      重载按钮；viewer bundle 从 renderer assets 单份读取不复制。
+      E2E：POST /api/chat 携带 cell_ids=[svc-b]，模型 4 次工具调用完成
+      "橙色虚线边框 + 不重叠"修改，文件落盘。
 
 ## 当前仓库布局
 
@@ -102,8 +108,9 @@ crates/harness     新：二进制 drawio-harness
 ## 用法
 
 ```bash
-cargo run -p drawio-harness -- path/to/diagram.drawio        # 交互
+cargo run -p drawio-harness -- path/to/diagram.drawio        # 交互 REPL
 cargo run -p drawio-harness -- new fresh.drawio              # 空图
+cargo run -p drawio-harness -- web demo.drawio [port]        # 浏览器画布+框选+聊天
 DRAWIO_LLM_BASE_URL=… DRAWIO_LLM_MODEL=… DRAWIO_LLM_API_KEY=… \
   cargo run -p drawio-harness -- demo.drawio "把 svc-b 改成绿色"  # one-shot
 ```

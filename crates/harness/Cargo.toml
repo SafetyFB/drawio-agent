@@ -17,5 +17,6 @@ async-trait = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
 reqwest = { workspace = true }
 drawio-agent-renderer = { path = "../renderer" }
+axum = { workspace = true }
 
 [dev-dependencies]

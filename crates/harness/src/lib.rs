@@ -9,6 +9,7 @@ pub mod chat;
 pub mod engine;
 pub mod refs;
 pub mod tools;
+pub mod web;
 pub mod xmlfile;
 
 pub use chat::{Chat, ChatError, Message, OpenAiChat};

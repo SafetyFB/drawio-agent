@@ -36,6 +36,9 @@ cargo test -p drawio-agent-renderer   # chromium 渲染（复用）
 ## 用法
 
 ```bash
+# 浏览器模式：mxGraph 画布 + 框选 + 聊天（http://127.0.0.1:8787）
+cargo run -p drawio-harness -- web demo.drawio
+
 # 交互 REPL（无 LLM 也能用：/view /check /xml /sel /undo /save /reload）
 cargo run -p drawio-harness -- demo.drawio
 
@@ -58,7 +61,8 @@ DRAWIO_LLM_API_KEY=<key> \
 | `crates/harness/src/xmlfile.rs` | 规范化 / 解压 / 校验 / span 索引 / 行区间编辑 |
 | `crates/harness/src/refs.rs` | @ 引用解析与上下文注入 |
 | `crates/harness/src/tools.rs` | read locate edit draw check view |
-| `crates/harness/src/chat.rs` | OpenAI-compatible chat |
+| `crates/harness/src/chat.rs` | OpenAI-compatible chat（text + image parts） |
+| `crates/harness/web/` + `web.rs` | 浏览器画布：mxGraph 渲染、框选 → cell ids、聊天 |
 | `crates/harness/src/engine.rs` | JSON 信封循环 |
 | `crates/harness/src/main.rs` | REPL + one-shot |
 | `crates/renderer` | 保留的 chromium CDP 渲染 |

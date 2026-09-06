@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>drawio harness</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header>
+  <span class="title">drawio harness</span>
+  <span id="file" class="chip">…</span>
+  <span id="cells" class="chip dim">…</span>
+  <span id="llm" class="chip dim">…</span>
+  <span class="spacer"></span>
+  <button id="mode-select" class="tool active">框选</button>
+  <button id="mode-pan" class="tool">平移</button>
+  <button id="check" class="tool">检查</button>
+  <button id="undo" class="tool">撤销</button>
+  <button id="reload" class="tool">重新加载</button>
+</header>
+<div id="llm-banner" hidden>⚠ LLM 未配置 —— 画布与本地命令可用，聊天不可用。
+  设置 DRAWIO_LLM_BASE_URL / DRAWIO_LLM_MODEL（DRAWIO_LLM_API_KEY 可选）后重启。</div>
+<main>
+  <div id="canvas-wrap">
+    <div id="canvas"></div>
+    <div id="placeholder" hidden>
+      <div id="placeholder-msg">加载中…</div>
+    </div>
+    <div id="hint">拖动空白处框选；选中 cell 会随下一条消息一起发送（@file 引用语义）。</div>
+  </div>
+  <aside id="side">
+    <div id="chatlog"></div>
+    <div id="sel-chip" class="sel-chip" hidden></div>
+    <form id="chatform">
+      <textarea id="input" rows="3" placeholder="描述要画的/要改的…（选中 cell 自动附带）"></textarea>
+      <div class="row"><span id="sel-note" class="dim"></span><button id="send" type="submit">发送</button></div>
+    </form>
+  </aside>
+</main>
+<script src="/vendor/viewer-static.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

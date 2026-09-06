@@ -1,0 +1,71 @@
+:root {
+  --bg: #12141a; --panel: #1b1e27; --line: #2a2e3a; --fg: #dfe3ea;
+  --dim: #8b93a5; --accent: #4f8cff; --ok: #4caf7d; --warn: #e0a63c; --err: #e5636b;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg); color: var(--fg);
+  font: 13px/1.5 -apple-system, "PingFang SC", "Segoe UI", sans-serif;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.title { font-weight: 600; margin-right: 6px; }
+.chip { padding: 2px 10px; border-radius: 10px; background: #242836; }
+.dim { color: var(--dim); }
+.spacer { flex: 1; }
+button {
+  background: #242836; color: var(--fg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 12px; cursor: pointer; font: inherit;
+}
+button:hover { border-color: var(--accent); }
+button.tool.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+#llm-banner {
+  background: #3a2f14; color: var(--warn); padding: 6px 12px; font-size: 12px;
+}
+main { flex: 1; display: flex; min-height: 0; }
+#canvas-wrap { flex: 1; position: relative; min-width: 0; }
+#canvas { position: absolute; inset: 0; overflow: hidden; background:
+  radial-gradient(#1e222c 1px, transparent 1px); background-size: 22px 22px;
+  background-color: var(--bg); }
+#canvas > div { overflow: hidden; }
+#placeholder {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: var(--dim);
+}
+.rubber-band {
+  position: absolute; border: 1px dashed var(--accent);
+  background: rgba(79, 140, 255, 0.12); z-index: 10; pointer-events: none;
+}
+#hint {
+  position: absolute; left: 10px; bottom: 8px; color: var(--dim); font-size: 12px;
+  background: rgba(18, 20, 26, 0.8); padding: 3px 10px; border-radius: 10px;
+}
+#side {
+  width: 340px; display: flex; flex-direction: column;
+  border-left: 1px solid var(--line); background: var(--panel);
+}
+#chatlog { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+.msg { white-space: pre-wrap; word-break: break-word; }
+.msg.user { align-self: flex-end; background: #26314a; border-radius: 10px; padding: 6px 10px; max-width: 90%; }
+.msg.assistant { align-self: flex-start; color: var(--fg); max-width: 95%; }
+.msg.tool-note { color: var(--dim); font-size: 12px; align-self: flex-start; }
+.msg.error { color: var(--err); align-self: flex-start; }
+.msg.ok { color: var(--ok); align-self: flex-start; font-size: 12px; }
+#chatform { border-top: 1px solid var(--line); padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+textarea {
+  width: 100%; resize: none; background: #12141a; color: var(--fg);
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px; font: inherit;
+}
+textarea:focus { outline: none; border-color: var(--accent); }
+.row { display: flex; align-items: center; gap: 8px; }
+#sel-note { flex: 1; color: var(--dim); font-size: 12px; }
+#send { background: var(--accent); color: #fff; border: none; padding: 6px 18px; }
+#send:disabled { opacity: 0.5; cursor: wait; }
+.sel-chip {
+  margin: 6px 10px 0; padding: 5px 10px; border: 1px solid var(--accent);
+  border-radius: 8px; font-size: 12px; color: var(--accent);
+}

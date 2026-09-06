@@ -45,8 +45,23 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("用法: drawio-harness <file.drawio|file.xml> [one-shot 对话消息…]\n       drawio-harness new <file>   创建空图");
+        eprintln!(
+            "用法:\n  drawio-harness <file> [one-shot 对话消息…]    本地 REPL\n  drawio-harness new <file>                      创建空图\n  drawio-harness web <file> [port]               浏览器画布 + 框选 + 聊天 (默认 8787)"
+        );
         std::process::exit(2);
+    }
+    if args[0] == "web" {
+        if args.len() < 2 {
+            eprintln!("用法: drawio-harness web <file> [port]");
+            std::process::exit(2);
+        }
+        let path = PathBuf::from(&args[1]);
+        let port = args.get(2).and_then(|p| p.parse().ok()).unwrap_or(8787);
+        if let Err(e) = rt.block_on(drawio_harness::web::serve(path, port)) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     let mut path = PathBuf::from(&args[0]);
