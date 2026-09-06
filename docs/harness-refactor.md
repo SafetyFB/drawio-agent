@@ -67,11 +67,42 @@ Drawio 原始文件通常压缩且单行 —— 行号无意义、diff 不可读
 ## 里程碑
 
 - [x] M0 分支 + 本文档
-- [ ] M1 xmlfile：规范化/往返/span 索引/校验（单元测试先行）
-- [ ] M2 refs：@记号解析 → 上下文注入
-- [ ] M3 工具 + REPL：人工驱动 edit/view/undo 全流程可用（无 LLM 也能干活）
-- [ ] M4 chat + loop：接入任意 OpenAI-compatible 端点（`DRAWIO_LLM_*` env），
-      模型驱动工具闭环
+- [x] M1 xmlfile：规范化/往返/span 索引/校验（单元测试先行）
+- [x] M2 refs：@记号解析 → 上下文注入
+- [x] M3 工具 + REPL：人工驱动 edit/view/undo 全流程可用（无 LLM 也能干活）
+- [x] M4 chat + loop：接入任意 OpenAI-compatible 端点（`DRAWIO_LLM_*` env），
+      模型驱动工具闭环（已用 GLM 真实端点 E2E 验证：模型自主 3-4 次工具调用，
+      只有目标 cell 变化，其余 cell 字节级不变）
 - [ ] M5 view 带图像 part 注入模型（视觉自审闭环回到一条 chat 里）
 - [ ] M6 （可选）web 画布瘦壳：mxGraph 渲染 + 框选 → cell ids，其余全部走
       本 harness 语义
+
+## 当前仓库布局
+
+```
+Cargo.toml          workspace = renderer + harness
+crates/renderer     保留：chromium CDP 渲染（find/launch/render + 3.4MB viewer bundle）
+crates/harness     新：二进制 drawio-harness
+  src/xmlfile.rs    唯一工件：规范 pretty-print mxfile + span 索引 + 行区间编辑
+  src/refs.rs       @cell:id / @lines / @file:lines → 带行号的 xml 片段（aider 风格）
+  src/tools.rs      read locate edit draw check view（模型信封与 REPL 共用）
+  src/chat.rs       OpenAI-compatible chat（DRAWIO_LLM_BASE_URL/MODEL/API_KEY）
+  src/engine.rs     JSON 信封循环：{tool,args} | {reply,done}，解析容错 + 一次纠错重试
+  src/main.rs       REPL：/view /check /xml /sel /undo /save /reload + one-shot 模式
+```
+
+旧 crate（xml-core/llm-client/agent/trajectory/server）保留在
+`pre-harness-refactor` tag 与 `main` 上，可随时对照。
+
+## 用法
+
+```bash
+cargo run -p drawio-harness -- path/to/diagram.drawio        # 交互
+cargo run -p drawio-harness -- new fresh.drawio              # 空图
+DRAWIO_LLM_BASE_URL=… DRAWIO_LLM_MODEL=… DRAWIO_LLM_API_KEY=… \
+  cargo run -p drawio-harness -- demo.drawio "把 svc-b 改成绿色"  # one-shot
+```
+
+文件首次加载即被展开/规范化为每行一个元素的 mxfile（`compressed="false"`），
+drawio 应用仍可正常打开；后续所有编辑都是行区间文本替换，未触碰的行
+字节级不变。
