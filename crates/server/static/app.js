@@ -28,6 +28,11 @@
   const btnExportPng = $('export-png-btn');
   const downloadSvgBtn = $('download-svg-btn');
   const copyXmlUrlBtn = $('copy-xml-url-btn');
+  const selectionPatch = $('selection-patch');
+  const selectionChip = $('selection-chip');
+  const selectionClear = $('selection-clear');
+  const selectionInstruction = $('selection-instruction');
+  const selectionModifyBtn = $('selection-modify-btn');
 
   let ws = null;
   let reconnectTimer = null;
@@ -36,6 +41,8 @@
   let currentXml = null;
   let isRunning = false;
   let activityEntries = [];
+  let currentSelection = [];
+  let currentGraph = null;
 
   async function api(method, path, body) {
     const opts = { method, headers: {} };
@@ -106,6 +113,53 @@
     runStatusText.textContent = text;
   }
 
+  function updateSelectionState(cellIds) {
+    currentSelection = cellIds || [];
+    const count = currentSelection.length;
+    selectionChip.textContent = `${count} selected`;
+    selectionModifyBtn.disabled = count === 0 || !selectionInstruction.value.trim();
+    if (count > 0) {
+      selectionPatch.hidden = false;
+    } else {
+      selectionPatch.hidden = true;
+      selectionInstruction.value = '';
+    }
+  }
+
+  async function patchSelected() {
+    if (!currentSessionId) return;
+    const cellIds = currentSelection;
+    const instruction = selectionInstruction.value.trim();
+    if (cellIds.length === 0 || !instruction) return;
+
+    setLoading(true, 'patching selected cells…');
+    selectionModifyBtn.disabled = true;
+    selectionInstruction.disabled = true;
+    const previousLabel = selectionModifyBtn.textContent;
+    selectionModifyBtn.textContent = 'Modifying…';
+    try {
+      const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}/patch`, {
+        cell_ids: cellIds,
+        instruction,
+        json_mode: false,
+      });
+      if (result && result.xml) {
+        loadXmlIntoCanvas(result.xml);
+      }
+      currentSelection = [];
+      updateSelectionState([]);
+      selectionInstruction.value = '';
+      addActivity('StateTransition', { from: 'selected cells', to: `patched · v:${(result.version_id || '').slice(0, 8)}` });
+    } catch (err) {
+      showError(`Patch failed: ${err.message}`);
+    } finally {
+      setLoading(false);
+      selectionModifyBtn.disabled = false;
+      selectionInstruction.disabled = false;
+      selectionModifyBtn.textContent = previousLabel;
+    }
+  }
+
   function escapeHtml(str) {
     return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
   }
@@ -123,6 +177,9 @@
   function loadXmlIntoCanvas(xml) {
     currentXml = xml;
     drawioContainer.innerHTML = '';
+    currentGraph = null;
+    currentSelection = [];
+    updateSelectionState([]);
     updateActionButtons();
     if (!xml || !xml.trim()) {
       drawioContainer.style.display = 'none';
@@ -149,6 +206,7 @@
       codec.decode(models[0], model);
 
       const graph = new window.mxGraph(drawioContainer, model);
+      currentGraph = graph;
       graph.setEnabled(true);
       graph.setPanning(true);
       graph.setCellsEditable(false);   // pan/zoom/gestures on; cells stay read-only
@@ -157,6 +215,12 @@
       graph.setCellsConnectable(false);
       graph.centerZoom = true;
       graph.refresh();
+
+      graph.getSelectionModel().addListener(window.mxEvent.SELECTION_CHANGED, () => {
+        const selected = graph.getSelectionCells();
+        const realCells = selected.filter(c => c.id && c.id !== '0' && c.id !== '1');
+        updateSelectionState(realCells.map(c => c.id));
+      });
 
       const bounds = graph.getGraphBounds();
       const border = 20;
@@ -501,6 +565,20 @@
     btnExportPng.addEventListener('click', exportPng);
     downloadSvgBtn.addEventListener('click', downloadSvg);
     copyXmlUrlBtn.addEventListener('click', copyXmlUrl);
+
+    selectionClear.addEventListener('click', () => {
+      if (currentGraph) currentGraph.clearSelection();
+    });
+    selectionModifyBtn.addEventListener('click', patchSelected);
+    selectionInstruction.addEventListener('input', () => {
+      selectionModifyBtn.disabled = currentSelection.length === 0 || !selectionInstruction.value.trim();
+    });
+    selectionInstruction.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        patchSelected();
+      }
+    });
 
     window.addEventListener('hashchange', async () => {
       const id = hashSession();

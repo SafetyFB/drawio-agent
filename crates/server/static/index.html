@@ -40,6 +40,17 @@
     </section>
 
     <aside class="ai-panel" aria-label="AI assistant">
+      <div id="selection-patch" class="selection-patch" hidden>
+        <div class="selection-header">
+          <span class="selection-chip" id="selection-chip">0 selected</span>
+          <button type="button" class="link-btn" id="selection-clear">clear</button>
+        </div>
+        <textarea id="selection-instruction" rows="2" placeholder="e.g. 把这两个 box 之间的距离拉远"></textarea>
+        <div class="selection-actions">
+          <button type="button" id="selection-modify-btn" class="primary-btn" disabled>Modify selected</button>
+        </div>
+      </div>
+
       <label for="prompt" class="panel-label">AI 助手</label>
       <textarea id="prompt" rows="6" placeholder="Describe the diagram you want…"></textarea>
       <div class="actions">
