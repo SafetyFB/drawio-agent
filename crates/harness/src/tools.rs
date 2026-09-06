@@ -1,0 +1,398 @@
+//! Tools the model (and the human REPL) can invoke. Every mutation goes
+//! through `XmlDoc::apply_edit` — line-range textual replacement + full
+//! validation — so locality (untouched bytes stay untouched) is a property
+//! of the mechanics, not a promise.
+
+use std::sync::Arc;
+
+use serde_json::Value;
+
+use crate::xmlfile::{check_doc, lines_in, total_lines, CheckReport, EditReport, XmlDoc};
+
+/// Result of executing one tool: free-form text fed back to the model.
+pub type ToolResult = String;
+
+/// Renderer backend shared across `view` calls (constructed lazily per call
+/// for now — chromium launch is ~1s, fine for interactive use).
+pub struct Tools {
+    pub render: bool,
+    pub open_png: bool,
+    pub renderer: Option<Arc<drawio_agent_renderer::Renderer>>,
+}
+
+impl std::fmt::Debug for Tools {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tools")
+            .field("render", &self.render)
+            .field("open_png", &self.open_png)
+            .field("renderer", &self.renderer.is_some())
+            .finish()
+    }
+}
+
+/// Resolve a range argument that may be a number, `a-b`, `cell:id`, or a
+/// full `@file:lines` token, against the doc.
+fn resolve_arg(doc: &XmlDoc, spec: &str) -> Result<(usize, usize), String> {
+    let spec = spec.trim().trim_start_matches('@');
+    doc.resolve_range(spec)
+        .map_err(|e| format!("无法解析范围 `{spec}`: {e}"))
+}
+
+fn numbered(text: &str, start: usize) -> String {
+    let mut out = String::new();
+    for (i, l) in text.lines().enumerate() {
+        out.push_str(&format!("{:>5}| {}\n", start + i, l));
+    }
+    out
+}
+
+impl Tools {
+    pub fn new(render: bool, open_png: bool) -> Self {
+        Self {
+            render,
+            open_png,
+            renderer: None,
+        }
+    }
+
+    /// Tool docs embedded in the system prompt.
+    pub fn tool_specs() -> &'static str {
+        r#"可用工具（每轮输出至多一个 JSON 信封，见协议）：
+
+1. read   {"range": "120-156" | "cell:svc-a" | "120"}
+   返回文件中指定区间的原文（带行号）。改之前先读，不要凭记忆猜行号。
+
+2. locate {"query": "order"}
+   在文件中搜索文本/cell id，返回命中的 cell 及其 @行区间。用来把
+   用户说的概念（"订单服务那个框"）映射到文件位置。
+
+3. edit   {"range": "120-156" | "cell:svc-a", "text": "替换后的完整内容"}
+   把 range 覆盖的行整体替换为 text（text 须为完整元素 XML，可多行）。
+   系统会做全量校验并报告 added/changed/removed cell——只允许改动
+   目标 cell，其他 cell 必须保持字节不变。
+
+4. draw   {"xml": "完整 <mxfile>…</mxfile>"}
+   整图重建（新画一张图 / 大改布局时用）。等同于 edit 整个文件。
+
+5. check  {}
+   确定性校验：XML 结构、id 唯一、parent/source/target 引用完整。
+
+6. view   {}
+   渲染当前文件为 PNG（文件旁 diagram.png）并打开。看完图再决定改哪里。
+   注意：画布位置与 xml 行区间没有 1:1 对应，需用 locate 或几何值换算。
+
+7. done —— {"reply": "给用户的总结", "done": true}
+   认为任务完成时使用；回复会直接展示给用户。"#
+    }
+
+    /// Run one tool. `name` comes straight from the model envelope; args are
+    /// free-form JSON. Returns the tool result text (Err = tool failed; the
+    /// error text goes back to the model as the result of a failed call).
+    pub async fn run(
+        &mut self,
+        doc: &mut XmlDoc,
+        name: &str,
+        args: &Value,
+    ) -> Result<ToolResult, String> {
+        match name {
+            "read" => self.read(doc, args),
+            "locate" => self.locate(doc, args),
+            "edit" => self.edit(doc, args, false),
+            "draw" => self.edit(doc, args, true),
+            "check" => self.check(doc),
+            "view" => self.view(doc).await,
+            other => Err(format!("未知工具 `{other}`。可用: read locate edit draw check view")),
+        }
+    }
+
+    fn read(&self, doc: &XmlDoc, args: &Value) -> Result<ToolResult, String> {
+        let spec = args
+            .get("range")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "read 需要参数 range".to_string())?;
+        let (a, b) = resolve_arg(doc, spec)?;
+        Ok(format!("@{}:{} 内容如下:\n{}", file_stem(doc), range_str(a, b), numbered(&lines_in(doc.canonical(), a, b), a)))
+    }
+
+    fn locate(&self, doc: &XmlDoc, args: &Value) -> Result<ToolResult, String> {
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "locate 需要参数 query".to_string())?;
+        let q = query.to_lowercase();
+        let text = doc.canonical();
+        let mut hits: Vec<String> = Vec::new();
+        for c in &doc.cells {
+            let slice = lines_in(text, c.start_line, c.end_line);
+            if slice.to_lowercase().contains(&q) {
+                // find first matching line inside the cell for display
+                let hit_line = slice
+                    .lines()
+                    .enumerate()
+                    .find(|(_, l)| l.to_lowercase().contains(&q))
+                    .map(|(i, l)| (c.start_line + i, l.to_string()));
+                let value = attr_value(&slice, "value").unwrap_or_default();
+                let style = attr_value(&slice, "style").unwrap_or_default();
+                let mut s = format!(
+                    "cell `{}` @{}-{}  value={:?}{}{}",
+                    c.id,
+                    c.start_line,
+                    c.end_line,
+                    truncate(&value, 40),
+                    if style.is_empty() { String::new() } else { format!(" style={:?}", truncate(&style, 30)) },
+                    if c.tag == "mxCell" { String::new() } else { format!(" tag={}", c.tag) }
+                );
+                if let Some((ln, l)) = hit_line {
+                    s.push_str(&format!("\n  {:>5}| {}", ln, truncate(&l, 120)));
+                }
+                hits.push(s);
+            }
+        }
+        if hits.is_empty() {
+            Ok(format!("没有找到包含 `{query}` 的 cell（共 {} 个 cell）", doc.cells.len()))
+        } else {
+            Ok(format!("命中 {} 个 cell:\n{}", hits.len(), hits.join("\n")))
+        }
+    }
+
+    fn edit(&mut self, doc: &mut XmlDoc, args: &Value, whole: bool) -> Result<ToolResult, String> {
+        let (range_spec, text) = if whole {
+            let xml = args
+                .get("xml")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "draw 需要参数 xml".to_string())?;
+            ("1-end".to_string(), xml.to_string())
+        } else {
+            let spec = args
+                .get("range")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "edit 需要参数 range".to_string())?;
+            let text = args
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "edit 需要参数 text".to_string())?;
+            (spec.to_string(), text.to_string())
+        };
+
+        let (start, end) = if whole {
+            (1usize, total_lines(doc.canonical()))
+        } else {
+            resolve_arg(doc, &range_spec)?
+        };
+        match doc.apply_edit(start, end, &text) {
+            Ok(report) if report.noop => Ok("no-op：内容与当前文件相同，未修改。".into()),
+            Ok(report) => {
+                doc.save()
+                    .map_err(|e| format!("保存失败: {e}"))?;
+                Ok(format!(
+                    "编辑已应用并保存。{}",
+                    report_summary(&report)
+                ))
+            }
+            Err(e) => Err(format!("编辑被拒绝（文件未改动）: {e}")),
+        }
+    }
+
+    fn check(&self, doc: &XmlDoc) -> Result<ToolResult, String> {
+        match check_doc(doc.canonical()) {
+            Ok(r) => Ok(r.summarize()),
+            Err(e) => Err(format!("校验失败: {e}")),
+        }
+    }
+
+    /// Render current doc to PNG (file dir) and open it.
+    pub async fn view(&mut self, doc: &XmlDoc) -> Result<ToolResult, String> {
+        if !self.render {
+            return Ok("渲染未启用（无 chromium）。请用 /view 在本地渲染查看。".into());
+        }
+        let renderer = match &self.renderer {
+            Some(r) => r.clone(),
+            None => {
+                let driver = drawio_agent_renderer::HeadlessChromiumDriver::launch().await;
+                let driver = match driver {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return Err(format!(
+                            "chromium 启动失败: {e}（可设 DRAWIO_AGENT_CHROMIUM_PATH 指定路径）"
+                        ))
+                    }
+                };
+                let r = Arc::new(drawio_agent_renderer::Renderer::new(Arc::new(driver)));
+                self.renderer = Some(r.clone());
+                r
+            }
+        };
+        let opts = drawio_agent_renderer::RenderOptions::default();
+        match renderer.render(doc.canonical(), &opts).await {
+            Ok(png) => {
+                let stem = file_stem(doc).replace(".xml", "").replace(".drawio", "");
+                let png_path = doc
+                    .path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join(format!("{stem}.png"));
+                if std::fs::write(&png_path, &png).is_err() {
+                    return Ok(format!("已渲染 {} bytes，但写入 {} 失败", png.len(), png_path.display()));
+                }
+                if self.open_png {
+                    open_with_system_viewer(&png_path);
+                }
+                Ok(format!(
+                    "已渲染并保存 {} ({} bytes, cells={})",
+                    png_path.display(),
+                    png.len(),
+                    doc.cells.len()
+                ))
+            }
+            Err(e) => Err(format!("渲染失败: {e}")),
+        }
+    }
+}
+
+fn open_with_system_viewer(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    #[cfg(not(unix))]
+    let _ = std::process::Command::new("cmd").args(["/C", "start", ""]).arg(path).spawn();
+}
+
+pub fn report_summary(r: &EditReport) -> String {
+    if r.noop {
+        return "no-op（无变化）".into();
+    }
+    let mut s = format!(
+        "added={} removed={} changed={} unchanged={}",
+        r.added.len(),
+        r.removed.len(),
+        r.changed.len(),
+        r.unchanged
+    );
+    if !r.changed.is_empty() {
+        s.push_str(&format!(" changed=[{}]", r.changed.join(", ")));
+    }
+    if !r.added.is_empty() {
+        s.push_str(&format!(" added=[{}]", r.added.join(", ")));
+    }
+    if !r.removed.is_empty() {
+        s.push_str(&format!(" removed=[{}]", r.removed.join(", ")));
+    }
+    if !r.off_range.is_empty() {
+        s.push_str(&format!(
+            " ⚠️ 改动越界（不在请求区间内）: [{}]",
+            r.off_range.join(", ")
+        ));
+    }
+    s
+}
+
+fn attr_value(slice: &str, key: &str) -> Option<String> {
+    let marker = format!("{key}=\"");
+    let i = slice.find(&marker)?;
+    let rest = &slice[i + marker.len()..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(n).collect();
+        format!("{t}…")
+    }
+}
+
+fn file_stem(doc: &XmlDoc) -> String {
+    doc.path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "diagram.xml".into())
+}
+
+fn range_str(a: usize, b: usize) -> String {
+    if a == b {
+        a.to_string()
+    } else {
+        format!("{a}-{b}")
+    }
+}
+
+pub fn check_text(text: &str) -> Result<CheckReport, String> {
+    check_doc(text).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc() -> XmlDoc {
+        let s = r#"<mxfile host="app.diagrams.net"><diagram id="d1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="svc-a" value="Order Service" vertex="1" parent="1"><mxGeometry x="40" y="60" width="160" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+        XmlDoc::from_text(s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn edit_by_cell_id_applies_and_reports() {
+        let mut d = doc();
+        let mut t = Tools::new(false, false);
+        let args = serde_json::json!({
+            "range": "cell:svc-a",
+            "text": r#"<mxCell id="svc-a" value="Payments" vertex="1" parent="1"><mxGeometry x="40" y="60" width="200" height="60" as="geometry"/></mxCell>"#
+        });
+        let out = t.run(&mut d, "edit", &args).await.unwrap();
+        assert!(out.contains("changed=[svc-a]"), "{out}");
+        assert!(d.canonical().contains("Payments"));
+        assert!(!d.canonical().contains("Order Service"));
+    }
+
+    #[tokio::test]
+    async fn draw_replaces_whole_file() {
+        let mut d = doc();
+        let mut t = Tools::new(false, false);
+        let xml = r#"<mxfile host="x"><diagram id="d2"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="n1" value="New" vertex="1" parent="1"><mxGeometry x="0" y="0" width="100" height="50" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+        let out = t.run(&mut d, "draw", &serde_json::json!({ "xml": xml })).await.unwrap();
+        assert!(out.contains("added=[n1]"), "{out}");
+        assert!(d.id_to_cell("svc-a").is_none());
+    }
+
+    #[tokio::test]
+    async fn bad_edit_is_rejected_and_file_unchanged() {
+        let mut d = doc();
+        let before = d.canonical().to_string();
+        let mut t = Tools::new(false, false);
+        let out = t.run(&mut d, "edit", &serde_json::json!({"range": "cell:svc-a", "text": "<mxCell>"})).await;
+        assert!(out.is_err());
+        assert_eq!(d.canonical(), before);
+    }
+
+    #[tokio::test]
+    async fn locate_finds_by_value() {
+        let mut d = doc();
+        let mut t = Tools::new(false, false);
+        let out = t.run(&mut d, "locate", &serde_json::json!({"query": "order"})).await.unwrap();
+        assert!(out.contains("svc-a"), "{out}");
+        assert!(out.contains("@"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn read_returns_numbered_lines() {
+        let mut d = doc();
+        let mut t = Tools::new(false, false);
+        let start_line = {
+            let a = d.id_to_cell("svc-a").unwrap();
+            a.start_line
+        };
+        let end_line = {
+            let a = d.id_to_cell("svc-a").unwrap();
+            a.end_line
+        };
+        let range = format!("{start_line}-{end_line}");
+        let out = t
+            .run(&mut d, "read", &serde_json::json!({"range": range}))
+            .await
+            .unwrap();
+        assert!(out.contains("Order Service"), "{out}");
+        assert!(out.contains(&format!("{start_line}|")));
+    }
+}

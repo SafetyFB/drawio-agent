@@ -429,10 +429,9 @@ pub fn index(text: &str) -> Result<Vec<CellSpan>, XmlError> {
     let mut out: Vec<CellSpan> = Vec::new();
     let mut seen: HashMap<String, usize> = HashMap::new();
 
-    let mut pos_before = 0usize;
     loop {
         buf.clear();
-        pos_before = reader.buffer_position() as usize;
+        let pos_before = reader.buffer_position() as usize;
         match reader.read_event_into(&mut buf) {
             Ok(Event::Eof) => break,
             Ok(ev) => {
@@ -558,36 +557,6 @@ pub struct EditReport {
     /// Changed cells whose span does NOT touch the edited line range.
     pub off_range: Vec<String>,
     pub unchanged: usize,
-}
-
-impl EditReport {
-    fn summarize(&self) -> String {
-        if self.noop {
-            return "no-op：内容与当前文件完全相同，未做任何修改".to_string();
-        }
-        let mut s = format!(
-            "{} added / {} removed / {} changed / {} unchanged; 范围外改动: {}",
-            self.added.len(),
-            self.removed.len(),
-            self.changed.len(),
-            self.unchanged,
-            if self.off_range.is_empty() {
-                "无".to_string()
-            } else {
-                self.off_range.join(", ")
-            }
-        );
-        if !self.added.is_empty() {
-            s.push_str(&format!("\n  added: {}", self.added.join(", ")));
-        }
-        if !self.removed.is_empty() {
-            s.push_str(&format!("\n  removed: {}", self.removed.join(", ")));
-        }
-        if !self.off_range.is_empty() {
-            s.push_str("\n  ⚠️ 以上 cell 不在你请求编辑的行区间内 —— 如非有意，请撤销并重试");
-        }
-        s
-    }
 }
 
 /// Loaded, canonical document with its span index.
