@@ -27,7 +27,7 @@ button.secondary:hover { background:#252a36; }
 .status.closed { color:var(--danger); }
 @keyframes pulse { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:.5; transform:scale(.85); } }
 
-.workspace { flex:1; display:grid; grid-template-columns:minmax(0,1.4fr) minmax(320px,1fr); gap:1px; background:var(--border); overflow:hidden; }
+.workspace { flex:1; display:grid; grid-template-columns:minmax(0,1.4fr) minmax(320px,1fr); grid-template-rows:minmax(0,1fr); gap:1px; background:var(--border); overflow:hidden; }
 .canvas-region { position:relative; background:var(--bg); display:flex; flex-direction:column; }
 .drawio-container { flex:1; min-height:0; overflow:auto; position:relative; touch-action:none; -webkit-user-select:none; user-select:none; }
 .drawio-container[data-mode="select"] { cursor:crosshair; }
@@ -41,7 +41,7 @@ button.secondary:hover { background:#252a36; }
 .canvas-placeholder .sub { font-size:.85rem; }
 .canvas-overlay { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; gap:.6rem; background:rgba(11,13,17,.75); color:var(--text); font-weight:500; }
 
-.ai-panel { background:var(--surface); padding:1rem; display:flex; flex-direction:column; gap:.75rem; overflow-y:auto; }
+.ai-panel { background:var(--surface); padding:1rem; display:flex; flex-direction:column; gap:.75rem; overflow:hidden; min-height:0; }
 .panel-label { font-size:.8rem; font-weight:600; text-transform:uppercase; letter-spacing:.04em; color:var(--text-dim); }
 #prompt { width:100%; padding:.65rem; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font:inherit; resize:vertical; outline:none; }
 #prompt:focus { border-color:var(--brand); box-shadow:0 0 0 2px var(--brand-glow); }
@@ -76,7 +76,7 @@ button.secondary:hover { background:#252a36; }
 /* ---------- chat thread (conversation skeleton) ---------- */
 .primary-btn { background:var(--brand); color:#e0f2fe; font-weight:600; box-shadow:0 0 0 1px rgba(10,124,185,.5), 0 4px 14px -4px var(--brand-glow); }
 .primary-btn:hover:not(:disabled) { background:#0c8ece; color:#fff; }
-.composer { display:flex; flex-direction:column; gap:.5rem; border-top:1px solid var(--border); padding-top:.75rem; }
+.composer { flex:none; display:flex; flex-direction:column; gap:.5rem; border-top:1px solid var(--border); padding-top:.75rem; }
 .prompt-attachments { display:flex; flex-wrap:wrap; gap:.4rem; }
 .prompt-attachments[hidden] { display:none; }
 .attach-chip { display:inline-flex; align-items:center; gap:.4rem; max-width:100%; padding:.28rem .6rem; border-radius:999px; background:rgba(10,124,185,.16); border:1px solid rgba(10,124,185,.4); color:#7dd3fc; font-size:.78rem; font-weight:600; }
@@ -84,7 +84,9 @@ button.secondary:hover { background:#252a36; }
 .attach-chip .attach-x:hover { opacity:1; color:#fff; }
 .attach-hint { font-size:.72rem; color:var(--text-dim); }
 
-.chat-thread { flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:.6rem; padding:.25rem .1rem .25rem 0; }
+/* The composer never shrinks out of view on short windows: all vertical
+   compression is absorbed by the scrolling chat thread. */
+.chat-thread { flex:1 1 0%; min-height:72px; overflow-y:auto; display:flex; flex-direction:column; gap:.6rem; padding:.25rem .1rem .25rem 0; }
 .bubble { display:flex; flex-direction:column; gap:.3rem; max-width:92%; padding:.6rem .8rem; border-radius:10px; font-size:.85rem; line-height:1.5; word-break:break-word; }
 .bubble.user { align-self:flex-end; background:rgba(10,124,185,.18); border:1px solid rgba(10,124,185,.35); border-bottom-right-radius:2px; }
 .bubble.agent { align-self:flex-start; background:var(--surface-2); border:1px solid var(--border); border-bottom-left-radius:2px; }
@@ -135,8 +137,9 @@ button.secondary:hover { background:#252a36; }
 .xml-fallback .text { color:var(--text-dim); }
 
 @media (max-width:900px) {
-  .workspace { grid-template-columns:1fr; grid-template-rows:1.2fr auto; }
-  .ai-panel { max-height:60vh; }
+  .workspace { grid-template-columns:1fr; grid-template-rows:1.2fr auto; overflow:auto; }
+  .ai-panel { max-height:none; }
+  .chat-thread { max-height:34vh; min-height:120px; }
   .action-bar { flex-wrap:wrap; }
   .action-bar__actions { width:100%; justify-content:flex-start; }
 }
