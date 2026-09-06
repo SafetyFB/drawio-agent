@@ -10,10 +10,33 @@
 
 use serde_json::{Value, json};
 
+use std::sync::Arc;
+
 use crate::chat::{CallOpts, Chat, Message, Part, Usage};
 use crate::config::usage_cost;
 use crate::tools::{ToolOutput, Tools};
 use crate::xmlfile::XmlDoc;
+
+/// Live progress events emitted by [`Harness::run`] as an ask unfolds —
+/// powers R4 progress rendering (web stream / CLI live trace).
+#[derive(Debug, Clone)]
+pub enum EngineEvent {
+    /// A model round is starting (index/max = rounds, not tool calls).
+    Turn { index: usize },
+    /// Raw assistant envelope the model just produced.
+    ModelOutput { raw: String },
+    /// About to execute a tool.
+    Tool { name: String, args: String },
+    /// Tool finished (text preview; image tools mark has_image).
+    ToolResult { name: String, text: String, has_image: bool },
+    /// One LLM call's usage + cost (¥ under configured prices).
+    Usage { usage: Usage, cost_yuan: f64 },
+    /// Ask finished with the model's final reply.
+    Final { reply: String },
+}
+
+/// Callback type for progress events (web stream / CLI trace).
+pub type ProgressFn = Arc<dyn Fn(EngineEvent) + Send + Sync>;
 
 #[derive(Debug)]
 pub struct TurnOutcome {
@@ -203,7 +226,15 @@ impl Harness {
         context: &str,
         opts: &RunOpts,
         stats: &mut SessionStats,
+        progress: &Option<ProgressFn>,
     ) -> Result<TurnOutcome, String> {
+        macro_rules! emit {
+            ($e:expr) => {
+                if let Some(f) = progress {
+                    f(EngineEvent::from($e));
+                }
+            };
+        }
         let mut history: Vec<Message> = vec![Message::system(system_prompt(doc))];
         let full = if context.trim().is_empty() {
             user_text.to_string()
@@ -215,10 +246,12 @@ impl Harness {
         let mut envelopes = Vec::new();
         let mut tool_calls = 0usize;
         let mut last_err: Option<String> = None;
+        let mut bad_tools = 0usize;
         let mut spent: f64 = 0.0;
         let mut usage = Usage::default();
 
         for turn in 0..self.max_turns {
+            emit!(EngineEvent::Turn { index: turn });
             // Context-length guard: fail loudly instead of silently blowing
             // the configured window.
             if let Some(limit) = opts.context_limit {
@@ -247,11 +280,16 @@ impl Harness {
             {
                 Ok(reply) => {
                     usage.add(&reply.usage);
-                    spent += usage_cost(
+                    let cost = usage_cost(
                         reply.usage.input_tokens,
                         reply.usage.output_tokens,
                         &price_opts(opts),
                     );
+                    spent += cost;
+                    emit!(EngineEvent::Usage {
+                        usage: reply.usage,
+                        cost_yuan: cost,
+                    });
                     reply.text
                 }
                 Err(e) => {
@@ -276,12 +314,15 @@ impl Harness {
                 }
             };
             last_err = None;
+            emit!(EngineEvent::ModelOutput { raw: raw.clone() });
             envelopes.push(raw.clone());
 
             if let Some(reply) = env.get("reply").and_then(Value::as_str) {
+                let reply = reply.to_string();
+                emit!(EngineEvent::Final { reply: reply.clone() });
                 stats.add(&usage, spent);
                 return Ok(TurnOutcome {
-                    reply: reply.to_string(),
+                    reply,
                     tool_calls,
                     envelopes,
                     usage,
@@ -293,13 +334,41 @@ impl Harness {
                 .get("tool")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "信封缺 tool/reply 字段".to_string())?;
+            // Tool whitelist + fast fail: a model that hallucinates tool
+            // names (e.g. `{"tool":"reply"}`) would otherwise loop until
+            // max_turns.
+            if !["read", "locate", "edit", "draw", "check", "view"].contains(&name) {
+                bad_tools += 1;
+                if bad_tools >= 2 {
+                    stats.add(&usage, spent);
+                    return Err(format!(
+                        "模型连续输出未知工具 `{name}`，已中止。请检查系统提示中的工具协议是否被遵守。"
+                    ));
+                }
+                history.push(Message::assistant(raw.clone()));
+                history.push(Message::user(format!(
+                    "`{name}` 不是可用工具。可用工具: read locate edit draw check view。\
+                     每轮只输出一个 JSON 信封；完成后用 {{\"reply\": \"...\", \"done\": true}} 结束。"
+                )));
+                continue;
+            }
+            bad_tools = 0;
             let args = env.get("args").cloned().unwrap_or(json!({}));
+            emit!(EngineEvent::Tool {
+                name: name.to_string(),
+                args: serde_json::to_string(&args).unwrap_or_default(),
+            });
             history.push(Message::assistant(raw));
             let result = match tools.run(doc, name, &args).await {
                 Ok(out) => out,
                 Err(text) => ToolOutput::text(format!("工具执行失败: {text}")),
             };
             tool_calls += 1;
+            emit!(EngineEvent::ToolResult {
+                name: name.to_string(),
+                text: result.text.clone(),
+                has_image: result.image_png.is_some(),
+            });
             let mut parts = vec![Part::Text(format!("[工具结果 {name}]\n{}", result.text))];
             if let Some(png) = result.image_png {
                 parts.push(Part::ImagePng(png));
@@ -435,7 +504,7 @@ mod tests {
         let mut stats = SessionStats::default();
 
         let outcome = harness
-            .run(&mut fake, &mut tools, &mut doc, "两个节点重叠了，看看并修复 b", "", &RunOpts::default(), &mut stats)
+            .run(&mut fake, &mut tools, &mut doc, "两个节点重叠了，看看并修复 b", "", &RunOpts::default(), &mut stats, &None)
             .await
             .unwrap();
         assert_eq!(outcome.tool_calls, 2);
@@ -474,7 +543,7 @@ mod tests {
             ..Default::default()
         };
         let outcome = Harness::default()
-            .run(&mut fake, &mut tools, &mut doc, "hi", "", &opts, &mut stats)
+            .run(&mut fake, &mut tools, &mut doc, "hi", "", &opts, &mut stats, &None)
             .await
             .unwrap();
         assert_eq!(outcome.usage.input_tokens, 1000);
@@ -501,7 +570,7 @@ mod tests {
             ..Default::default()
         };
         let err = Harness::default()
-            .run(&mut fake2, &mut tools, &mut doc, "hi", "", &opts_broke, &mut SessionStats::default())
+            .run(&mut fake2, &mut tools, &mut doc, "hi", "", &opts_broke, &mut SessionStats::default(), &None)
             .await
             .unwrap_err();
         assert!(err.contains("预算"), "{err}");
@@ -518,7 +587,7 @@ mod tests {
             ..Default::default()
         };
         let err = Harness::default()
-            .run(&mut fake, &mut tools, &mut doc, "hi", "", &opts, &mut SessionStats::default())
+            .run(&mut fake, &mut tools, &mut doc, "hi", "", &opts, &mut SessionStats::default(), &None)
             .await
             .unwrap_err();
         assert!(err.contains("context_length"), "{err}");
@@ -539,7 +608,7 @@ mod tests {
         let renderer = drawio_agent_renderer::Renderer::new(std::sync::Arc::new(mock));
         let mut tools = Tools::with_renderer(renderer);
         let outcome = Harness::default()
-            .run(&mut fake, &mut tools, &mut doc, "检查布局", "", &RunOpts::default(), &mut SessionStats::default())
+            .run(&mut fake, &mut tools, &mut doc, "检查布局", "", &RunOpts::default(), &mut SessionStats::default(), &None)
             .await
             .unwrap();
         assert_eq!(outcome.tool_calls, 3);

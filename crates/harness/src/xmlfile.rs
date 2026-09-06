@@ -764,14 +764,11 @@ fn content_map(text: &str, cells: &[CellSpan]) -> HashMap<String, String> {
         if !is_leaf(c) {
             continue;
         }
+        // Content only — line positions shift when anything above a cell is
+        // inserted/deleted and must NOT count as a change.
         m.insert(
             c.id.clone(),
-            format!(
-                "{}:{}:{}",
-                c.start_line,
-                c.end_line,
-                lines_in(text, c.start_line, c.end_line)
-            ),
+            lines_in(text, c.start_line, c.end_line),
         );
     }
     m

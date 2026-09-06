@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{FromRef, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -19,12 +19,44 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use axum::body::Body;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
+
 use crate::chat::{Chat, OpenAiChat};
 use crate::config::{self, LlmSettings};
-use crate::engine::Harness;
+use crate::engine::{EngineEvent, Harness, ProgressFn};
 use crate::refs;
 use crate::tools::Tools;
 use crate::xmlfile::{check_doc, XmlDoc};
+
+/// Separate, small lock for the running job's abort handle so /cancel stays
+/// responsive even while the big state lock is held by a running engine.
+#[derive(Debug, Default)]
+pub struct JobControl {
+    pub current: Mutex<Option<(u64, tokio::task::AbortHandle)>>,
+}
+
+/// Router state bundle (axum resolves per-handler State via FromRef).
+#[derive(Clone)]
+struct AppState {
+    big: Arc<Mutex<WebState>>,
+    jobs: Arc<JobControl>,
+}
+
+impl FromRef<AppState> for Arc<Mutex<WebState>> {
+    fn from_ref(s: &AppState) -> Self {
+        s.big.clone()
+    }
+}
+impl FromRef<AppState> for Arc<JobControl> {
+    fn from_ref(s: &AppState) -> Self {
+        s.jobs.clone()
+    }
+}
 
 #[derive(Debug)]
 pub struct WebState {
@@ -59,6 +91,8 @@ pub async fn serve(path: PathBuf, port: u16) -> Result<(), String> {
         budget_yuan: None,
     }));
 
+    let jobs = Arc::new(JobControl::default());
+    let app_state = AppState { big: state, jobs };
     let app = Router::new()
         .route("/", get(page))
         .route("/app.css", get(css))
@@ -72,7 +106,9 @@ pub async fn serve(path: PathBuf, port: u16) -> Result<(), String> {
         .route("/api/reload", post(api_reload))
         .route("/api/config", get(api_config_get).put(api_config_put))
         .route("/api/config/test", post(api_config_test))
-        .with_state(state);
+        .route("/api/chat/stream", post(api_chat_stream))
+        .route("/api/chat/cancel", post(api_chat_cancel))
+        .with_state(app_state);
 
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -165,6 +201,27 @@ struct ChatReq {
     cell_ids: Vec<String>,
 }
 
+/// Canvas selection -> @cell refs -> numbered xml context (REPL /sel 同款).
+fn selection_ctx(cell_ids: &[String], doc: &XmlDoc) -> String {
+    if cell_ids.is_empty() {
+        return String::new();
+    }
+    let tokens = cell_ids
+        .iter()
+        .map(|id| format!("@cell:{id}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (resolved, errors, snippet) = refs::resolve_refs(&tokens, doc);
+    for e in &errors {
+        eprintln!("selection ref warning: {e}");
+    }
+    if resolved.is_empty() {
+        String::new()
+    } else {
+        snippet
+    }
+}
+
 async fn api_chat(
     State(st): State<Arc<Mutex<WebState>>>,
     Json(req): Json<ChatReq>,
@@ -176,28 +233,8 @@ async fn api_chat(
             "error": "LLM 未配置：设置 DRAWIO_LLM_BASE_URL / DRAWIO_LLM_MODEL（DRAWIO_LLM_API_KEY 可选）后重启"
         }));
     }
-    // Canvas selection -> @cell refs -> numbered xml context (same as REPL /sel).
-    let ctx = if req.cell_ids.is_empty() {
-        String::new()
-    } else {
-        let tokens = req
-            .cell_ids
-            .iter()
-            .map(|id| format!("@cell:{id}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let (resolved, errors, snippet) = refs::resolve_refs(&tokens, &st.doc);
-        for e in &errors {
-            eprintln!("selection ref warning: {e}");
-        }
-        if resolved.is_empty() {
-            String::new()
-        } else {
-            snippet
-        }
-    };
-
-    // Snapshot config knobs per ask: hot config changes apply next ask.
+    // Canvas selection -> @cell refs (same as REPL /sel / stream endpoint).
+    let ctx = selection_ctx(&req.cell_ids, &st.doc);
     let cfg = config::effective_settings().unwrap_or_default();
     let budget_yuan = cfg.budget_yuan;
     let opts = {
@@ -210,7 +247,7 @@ async fn api_chat(
     let harness = Harness::default();
     let WebState { doc, chat, tools, usage, .. } = &mut *st;
     let chat = chat.as_mut().expect("checked above");
-    match harness.run(chat, tools, doc, &req.text, &ctx, &opts, usage).await {
+    match harness.run(chat, tools, doc, &req.text, &ctx, &opts, usage, &None).await {
         Ok(outcome) => Json(json!({
             "reply": outcome.reply,
             "tool_calls": outcome.tool_calls,
@@ -419,5 +456,146 @@ async fn api_config_test(Json(req): Json<ConfigPutReq>) -> Json<serde_json::Valu
             "usage": json!({ "in": reply.usage.input_tokens, "out": reply.usage.output_tokens }),
         })),
         Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// R4: streaming progress (NDJSON over fetch) + cancel
+// ---------------------------------------------------------------------------
+
+static JOB_ID: AtomicU64 = AtomicU64::new(0);
+
+/// One engine event -> one NDJSON line for the frontend.
+fn event_line(ev: &EngineEvent) -> serde_json::Value {
+    match ev {
+        EngineEvent::Turn { index } => json!({ "type": "turn", "index": index }),
+        EngineEvent::ModelOutput { raw } => json!({
+            "type": "model",
+            "preview": truncate_utf8(raw, 300),
+        }),
+        EngineEvent::Tool { name, args } => json!({
+            "type": "tool",
+            "name": name,
+            "args": truncate_utf8(args, 200),
+        }),
+        EngineEvent::ToolResult { name, text, has_image } => json!({
+            "type": "tool_result",
+            "name": name,
+            "preview": text.lines().next().unwrap_or("").chars().take(200).collect::<String>(),
+            "has_image": has_image,
+        }),
+        EngineEvent::Usage { usage, cost_yuan } => json!({
+            "type": "usage",
+            "in": usage.input_tokens,
+            "out": usage.output_tokens,
+            "cost_yuan": cost_yuan,
+        }),
+        EngineEvent::Final { reply } => json!({ "type": "reply", "reply": reply }),
+    }
+}
+
+fn truncate_utf8(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+async fn api_chat_stream(
+    State(st): State<Arc<Mutex<WebState>>>,
+    State(jobs): State<Arc<JobControl>>,
+    Json(req): Json<ChatReq>,
+) -> Response {
+    let configured = { st.lock().await.chat.is_some() };
+    if !configured {
+        return Json(json!({
+            "type": "error",
+            "error": "LLM 未配置：点右上角 ⚙ 填写并保存"
+        }))
+        .into_response();
+    }
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
+    let job_id = JOB_ID.fetch_add(1, Ordering::SeqCst) + 1;
+    let st2 = st.clone();
+    let jobs2 = jobs.clone();
+    let task = tokio::spawn(async move {
+        let mut st = st2.lock().await;
+        let WebState { doc, chat, tools, usage, budget_yuan, .. } = &mut *st;
+        let Some(chat) = chat.as_mut() else { return };
+        let cfg = config::effective_settings().unwrap_or_default();
+        *budget_yuan = cfg.budget_yuan;
+        let opts = {
+            let mut o = crate::engine::RunOpts::from_settings(&cfg);
+            if let Some(b) = *budget_yuan {
+                o.budget_remaining = (b - usage.cost_yuan).max(0.0);
+            }
+            o
+        };
+        // Canvas selection -> @cell refs (same as REPL /sel / old endpoint).
+        let ctx = selection_ctx(&req.cell_ids, doc);
+        let harness = Harness::default();
+        let tx2 = tx.clone();
+        let progress: ProgressFn = Arc::new(move |ev: EngineEvent| {
+            let line = event_line(&ev).to_string();
+            let _ = tx2.try_send(format!("{line}\n").into_bytes());
+        });
+        let outcome = harness
+            .run(chat, tools, doc, &req.text, &ctx, &opts, usage, &Some(progress))
+            .await;
+        match outcome {
+            Ok(o) => {
+                let _ = tx
+                    .send(
+                        format!(
+                            "{}\n",
+                            json!({
+                                "type": "done",
+                                "tool_calls": o.tool_calls,
+                                "session": json!({
+                                    "in": usage.usage.input_tokens,
+                                    "out": usage.usage.output_tokens,
+                                    "cost_yuan": usage.cost_yuan,
+                                    "budget_yuan": budget_yuan,
+                                }),
+                            })
+                        )
+                        .into_bytes(),
+                    )
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(format!("{}\n", json!({ "type": "error", "error": e })).into_bytes())
+                    .await;
+            }
+        }
+        // Clear this job's abort handle (best effort).
+        let mut cur = jobs2.current.lock().await;
+        if let Some((id, _)) = cur.as_ref() {
+            if *id == job_id {
+                *cur = None;
+            }
+        }
+    });
+
+    jobs.current.lock().await.replace((job_id, task.abort_handle()));
+    let stream = ReceiverStream::new(rx).map(|bytes| Ok::<_, std::io::Error>(axum::body::Bytes::from(bytes)));
+    (
+        axum::http::StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/x-ndjson")],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+async fn api_chat_cancel(
+    State(jobs): State<Arc<JobControl>>,
+) -> Json<serde_json::Value> {
+    let mut cur = jobs.current.lock().await;
+    match cur.take() {
+        Some((id, handle)) => {
+            handle.abort();
+            Json(json!({ "ok": true, "job": id, "note": "已发送停止信号" }))
+        }
+        None => Json(json!({ "ok": false, "error": "当前没有运行中的任务" })),
     }
 }

@@ -2,6 +2,7 @@
 //! canonical xml file, chat with the model, or drive the tools by hand.
 
 use std::io::{BufRead, Write};
+use std::sync::Arc;
 use std::path::PathBuf;
 use drawio_harness::chat::{Chat, OpenAiChat};
 use drawio_harness::engine::Harness;
@@ -103,7 +104,7 @@ fn main() {
         std::process::exit(2);
     }
 
-    let mut doc = match XmlDoc::load(&path) {
+    let doc = match XmlDoc::load(&path) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("加载失败: {e}");
@@ -125,35 +126,74 @@ fn main() {
         println!("提示: LLM 未配置。配置方式: drawio-harness config set --base-url … --model …，或用 DRAWIO_LLM_BASE_URL / DRAWIO_LLM_MODEL / DRAWIO_LLM_API_KEY 环境变量。当前进入本地工具模式（/view /check /xml /sel 仍可用）。");
     }
 
-    let harness = Harness::default();
-    let mut tools = Tools::new(true);
-    let mut session_usage = drawio_harness::SessionStats::default();
-    let mut pending_ctx: String = String::new();
-    let mut chat = chat.map(|c| Box::new(c) as Box<dyn Chat>);
+    // ---- R4: interactive REPL with live trace + /stop -------------------
+    // All mutable session state lives behind one tokio Mutex so a chat turn
+    // can run as a background task while the main thread keeps reading
+    // stdin (its only job while busy is to accept /stop).
+    let repl = Arc::new(tokio::sync::Mutex::new(ReplSession {
+        harness: Harness::default(),
+        tools: Tools::new(true),
+        doc,
+        usage: drawio_harness::SessionStats::default(),
+        pending_ctx: String::new(),
+        chat: chat.map(|c| Box::new(c) as Box<dyn Chat>),
+    }));
 
     let single_msg = if one_shot {
         Some(one_shot_args.join(" "))
     } else {
         None
     };
+    if let Some(msg) = single_msg {
+        // one-shot: synchronous run with live trace on stderr
+        let outcome = rt.block_on(run_one_ask(repl.clone(), msg, true));
+        print_turn_result(&outcome);
+        return;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<drawio_harness::TurnOutcome, String>>();
+    let mut running: bool = false;
+    let mut abort: Option<tokio::task::AbortHandle> = None;
     let mut stdin = std::io::stdin().lock();
 
     loop {
-        let line = if let Some(m) = single_msg.clone() {
-            Some(m)
-        } else {
-            print!("diagram> ");
-            std::io::stdout().flush().ok();
-            let mut l = String::new();
-            match stdin.read_line(&mut l) {
-                Ok(0) => None,
-                Ok(_) => Some(l),
-                Err(_) => None,
+        // Collect a finished turn before prompting again.
+        while let Ok(res) = rx.try_recv() {
+            running = false;
+            abort = None;
+            print_turn_result(&res);
+        }
+        print!("{}", if running { "(运行中… 输入 /stop 打断) diagram> " } else { "diagram> " });
+        std::io::stdout().flush().ok();
+        let mut l = String::new();
+        match stdin.read_line(&mut l) {
+            Ok(0) => {
+                // stdin closed: if a turn is running, wait for its result.
+                if running {
+                    if let Ok(res) = rx.recv() {
+                        print_turn_result(&res);
+                    }
+                }
+                break;
             }
-        };
-        let Some(line) = line else { break };
-        let line = line.trim().to_string();
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let line = l.trim().to_string();
         if line.is_empty() {
+            continue;
+        }
+
+        if running {
+            if line == "/stop" || line == "/cancel" {
+                if let Some(h) = abort.take() {
+                    h.abort();
+                }
+                running = false;
+                println!("⏹ 已停止。文件保持最近一次一致状态。");
+            } else {
+                eprintln!("任务运行中——输入 /stop 可打断（其它命令稍后再试）。");
+            }
             continue;
         }
 
@@ -164,145 +204,220 @@ fn main() {
             match cmd {
                 "help" => println!("{HELP}"),
                 "quit" | "q" | "exit" => break,
-                "view" => match rt.block_on(tools.view(&doc, true)) {
-                    Ok(out) => println!("{}", out.text),
-                    Err(e) => eprintln!("{e}"),
-                },
-                "check" => match check_doc(doc.canonical()) {
-                    Ok(r) => println!("{}", r.summarize()),
-                    Err(e) => eprintln!("校验失败: {e}"),
-                },
-                "xml" => {
-                    let (a, b) = if rest.is_empty() {
-                        (1, doc.canonical().lines().count())
-                    } else {
-                        match doc.resolve_range(rest) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!("{e}");
-                                continue;
-                            }
+                "view" => {
+                    let st = repl.clone();
+                    let r = rt.block_on(async move {
+                        let mut r = st.lock().await;
+                        let ReplSession { tools, doc, .. } = &mut *r;
+                        tools.view(doc, true).await
+                    });
+                    match r {
+                        Ok(out) => println!("{}", out.text),
+                        Err(e) => eprintln!("{e}"),
+                    }
+                }
+                "check" => {
+                    let st = repl.clone();
+                    rt.block_on(async move {
+                        let r = st.lock().await;
+                        match check_doc(r.doc.canonical()) {
+                            Ok(cr) => println!("{}", cr.summarize()),
+                            Err(e) => eprintln!("校验失败: {e}"),
                         }
-                    };
-                    println!("{}", numbered(&lines_in(doc.canonical(), a, b), a));
+                    });
+                }
+                "xml" => {
+                    let st = repl.clone();
+                    let rest = rest.to_string();
+                    rt.block_on(async move {
+                        let r = st.lock().await;
+                        let (a, b) = if rest.is_empty() {
+                            (1, r.doc.canonical().lines().count())
+                        } else {
+                            match r.doc.resolve_range(&rest) {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    eprintln!("{e}");
+                                    return;
+                                }
+                            }
+                        };
+                        println!("{}", numbered(&lines_in(r.doc.canonical(), a, b), a));
+                    });
                 }
                 "sel" | "select" => {
                     if rest.is_empty() {
                         eprintln!("用法: /sel cell:id1 cell:id2 或行区间");
                         continue;
                     }
-                    let tokens: Vec<String> = rest
-                        .split_whitespace()
-                        .flat_map(|t| t.split(','))
-                        .filter(|t| !t.is_empty())
-                        .map(|t| if t.starts_with('@') { t.to_string() } else { format!("@{t}") })
-                        .collect();
-                    let text = tokens.join(" ");
-                    let (resolved, errors, snippet) = refs::resolve_refs(&text, &doc);
-                    for e in &errors {
-                        eprintln!("警告: {e}");
-                    }
-                    pending_ctx = snippet.trim().to_string();
-                    if resolved.is_empty() {
-                        eprintln!("没有解析到任何 cell。");
-                    } else {
-                        println!("已选中 {} 个引用，将附加到下一轮对话:", resolved.len());
-                        println!("{snippet}");
-                    }
-                }
-                "undo" => match doc.undo() {
-                    Some(_) => {
-                        let _ = doc.save();
-                        println!("已撤销，文件已回滚并保存。");
-                    }
-                    None => println!("没有可撤销的编辑。"),
-                },
-                "save" => {
-                    let _ = doc.save();
-                    println!("已保存 {}", doc.path.display());
-                }
-                "reload" => match XmlDoc::load(&path) {
-                    Ok(d) => {
-                        doc = d;
-                        println!("已重新加载。");
-                        print_doc_summary(&doc);
-                    }
-                    Err(e) => eprintln!("重载失败: {e}"),
-                },
-                other => println!("未知命令 /{other}（/help 查看）"),
-            }
-        } else {
-            match chat.as_mut() {
-                None => {
-                    eprintln!(
-                        "未配置 LLM。可用命令: /view /check /xml /sel /undo（或设置 DRAWIO_LLM_BASE_URL / DRAWIO_LLM_MODEL）"
-                    );
-                }
-                Some(c) => {
-                    let ctx = std::mem::take(&mut pending_ctx);
-                    let ctx = if ctx.is_empty() {
-                        // user typed @refs inline -> let the engine resolve
-                        let (_, errs, snippet) = refs::resolve_refs(&line, &doc);
-                        for e in &errs {
+                    let st = repl.clone();
+                    let rest = rest.to_string();
+                    rt.block_on(async move {
+                        let mut r = st.lock().await;
+                        let tokens: Vec<String> = rest
+                            .split_whitespace()
+                            .flat_map(|t| t.split(','))
+                            .filter(|t| !t.is_empty())
+                            .map(|t| if t.starts_with('@') { t.to_string() } else { format!("@{t}") })
+                            .collect();
+                        let text = tokens.join(" ");
+                        let (resolved, errors, snippet) = refs::resolve_refs(&text, &r.doc);
+                        for e in &errors {
                             eprintln!("警告: {e}");
                         }
-                        snippet
-                    } else {
-                        ctx
-                    };
-                    let cfg = drawio_harness::config::effective_settings().unwrap_or_default();
-                    let budget = cfg.budget_yuan;
-                    let opts = {
-                        let mut o = drawio_harness::RunOpts::from_settings(&cfg);
-                        if let Some(b) = budget {
-                            o.budget_remaining = (b - session_usage.cost_yuan).max(0.0);
+                        r.pending_ctx = snippet.trim().to_string();
+                        if resolved.is_empty() {
+                            eprintln!("没有解析到任何 cell。");
+                        } else {
+                            println!("已选中 {} 个引用，将附加到下一轮对话:", resolved.len());
+                            println!("{snippet}");
                         }
-                        o
-                    };
-                    match rt.block_on(harness.run(
-                        c.as_mut(),
-                        &mut tools,
-                        &mut doc,
-                        &line,
-                        &ctx,
-                        &opts,
-                        &mut session_usage,
-                    )) {
-                        Ok(outcome) => {
-                            if !outcome.reply.is_empty() {
-                                println!("── {}\n", outcome.reply);
-                            }
-                            if outcome.tool_calls > 0 {
-                                println!("（本轮工具调用 {} 次）", outcome.tool_calls);
-                            }
-                            let spent = outcome.cost_yuan;
-                            println!(
-                                "用量: {} in + {} out tokens{}",
-                                outcome.usage.input_tokens,
-                                outcome.usage.output_tokens,
-                                if spent > 0.0 {
-                                    format!(" ≈ ¥{spent:.4}")
-                                } else {
-                                    String::new()
-                                }
-                            );
-                            if let Some(b) = budget {
-                                println!(
-                                    "会话累计: ¥{:.4} / ¥{b:.2}{}",
-                                    session_usage.cost_yuan,
-                                    if session_usage.cost_yuan >= b { "（已达预算上限）" } else { "" }
-                                );
-                            }
-                        }
-                        Err(e) => eprintln!("对话出错: {e}"),
-                    }
+                    });
                 }
+                "undo" => {
+                    let st = repl.clone();
+                    rt.block_on(async move {
+                        let mut r = st.lock().await;
+                        match r.doc.undo() {
+                            Some(_) => {
+                                let _ = r.doc.save();
+                                println!("已撤销，文件已回滚并保存。");
+                            }
+                            None => println!("没有可撤销的编辑。"),
+                        }
+                    });
+                }
+                "save" => {
+                    let st = repl.clone();
+                    rt.block_on(async move {
+                        let r = st.lock().await;
+                        let _ = r.doc.save();
+                        println!("已保存 {}", r.doc.path.display());
+                    });
+                }
+                "reload" => {
+                    let st = repl.clone();
+                    let path = path.clone();
+                    rt.block_on(async move {
+                        let mut r = st.lock().await;
+                        match XmlDoc::load(&path) {
+                            Ok(d) => {
+                                r.doc = d;
+                                println!("已重新加载。");
+                                print_doc_summary(&r.doc);
+                            }
+                            Err(e) => eprintln!("重载失败: {e}"),
+                        }
+                    });
+                }
+                other => println!("未知命令 /{other}（/help 查看）"),
             }
+            continue;
         }
 
-        if one_shot {
-            break;
+        // ---- plain text: start a chat turn in the background -------------
+        let has_llm = rt.block_on(async { repl.lock().await.chat.is_some() });
+        if !has_llm {
+            eprintln!("未配置 LLM。可用命令: /view /check /xml /sel /undo（或 `drawio-harness config set …`）");
+            continue;
         }
+        let repl2 = repl.clone();
+        let tx2 = tx.clone();
+        running = true;
+        let handle = rt.spawn(async move {
+            let res = run_one_ask(repl2, line, true).await;
+            let _ = tx2.send(res);
+        });
+        abort = Some(handle.abort_handle());
+    }
+}
+
+struct ReplSession {
+    harness: Harness,
+    tools: Tools,
+    doc: XmlDoc,
+    usage: drawio_harness::SessionStats,
+    pending_ctx: String,
+    chat: Option<Box<dyn Chat>>,
+}
+
+/// Run one ask inside the session lock, with optional live trace.
+async fn run_one_ask(
+    repl: Arc<tokio::sync::Mutex<ReplSession>>,
+    line: String,
+    trace: bool,
+) -> Result<drawio_harness::TurnOutcome, String> {
+    use drawio_harness::engine::EngineEvent;
+    let mut r = repl.lock().await;
+    let ctx = std::mem::take(&mut r.pending_ctx);
+    let ctx = if ctx.is_empty() {
+        let (_, errs, snippet) = refs::resolve_refs(&line, &r.doc);
+        for e in &errs {
+            eprintln!("警告: {e}");
+        }
+        snippet
+    } else {
+        ctx
+    };
+    let cfg = drawio_harness::config::effective_settings().unwrap_or_default();
+    let budget = cfg.budget_yuan;
+    let opts = {
+        let mut o = drawio_harness::RunOpts::from_settings(&cfg);
+        if let Some(b) = budget {
+            o.budget_remaining = (b - r.usage.cost_yuan).max(0.0);
+        }
+        o
+    };
+    if r.chat.is_none() {
+        return Err("LLM 未配置".into());
+    }
+    let progress: Option<drawio_harness::engine::ProgressFn> = if trace {
+        Some(Arc::new(|ev: EngineEvent| match ev {
+            EngineEvent::Turn { index } => eprintln!("  · 模型轮次 {} …", index + 1),
+            EngineEvent::ModelOutput { .. } => {}
+            EngineEvent::Tool { name, args } => {
+                let a: String = args.chars().take(160).collect();
+                eprintln!("  → {name} {a}");
+            }
+            EngineEvent::ToolResult { name, text, has_image } => {
+                let first = text.lines().next().unwrap_or("");
+                let t: String = first.chars().take(200).collect();
+                eprintln!("  ↳ {name}: {t}{}", if has_image { " 📷" } else { "" });
+            }
+            EngineEvent::Usage { usage, cost_yuan } => eprintln!(
+                "  · tokens +{}/+{} ≈ ¥{:.4}",
+                usage.input_tokens, usage.output_tokens, cost_yuan
+            ),
+            EngineEvent::Final { .. } => {}
+        }))
+    } else {
+        None
+    };
+    let ReplSession { harness, tools, doc, usage, chat, .. } = &mut *r;
+    let chat: &mut dyn Chat = chat.as_mut().expect("checked above").as_mut();
+    harness
+        .run(chat, tools, doc, &line, &ctx, &opts, usage, &progress)
+        .await
+}
+
+fn print_turn_result(res: &Result<drawio_harness::TurnOutcome, String>) {
+    match res {
+        Ok(outcome) => {
+            if !outcome.reply.is_empty() {
+                println!("── {}\n", outcome.reply);
+            }
+            if outcome.tool_calls > 0 {
+                println!("（本轮工具调用 {} 次）", outcome.tool_calls);
+            }
+            let spent = outcome.cost_yuan;
+            println!(
+                "用量: {} in + {} out tokens{}",
+                outcome.usage.input_tokens,
+                outcome.usage.output_tokens,
+                if spent > 0.0 { format!(" ≈ ¥{spent:.4}") } else { String::new() }
+            );
+        }
+        Err(e) => eprintln!("对话出错: {e}"),
     }
 }
 

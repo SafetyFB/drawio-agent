@@ -249,34 +249,97 @@ $('reload').onclick = async () => {
   await refreshCanvas();
 };
 
+// (busy 已在顶部声明)
+
+async function cancelJob() {
+  const r = await api('/api/chat/cancel', {});
+  if (r.ok) log('tool-note', '⏹ 已发送停止信号，等待中断…');
+  else if (r.error && !String(r.error).includes('没有运行中')) log('error', '停止失败: ' + r.error);
+}
+
+async function handleStreamEvent(ev) {
+  switch (ev.type) {
+    case 'turn':
+      log('tool-note', `— 模型轮次 ${ev.index + 1} …`);
+      break;
+    case 'tool':
+      log('tool-note', `→ ${ev.name} ${ev.args || ''}`);
+      break;
+    case 'tool_result':
+      log('tool-note', `↳ ${ev.name}: ${ev.preview || ''}${ev.has_image ? ' 📷' : ''}`);
+      break;
+    case 'usage': {
+      const c = ev.cost_yuan > 0 ? ' · ' + fmtCost(ev.cost_yuan) : '';
+      log('tool-note', `  本轮用量 ${ev.in} in / ${ev.out} out tokens${c}`);
+      break;
+    }
+    case 'reply':
+      log('assistant', ev.reply);
+      break;
+    case 'done':
+      log('tool-note', `（本轮工具调用 ${ev.tool_calls} 次）`);
+      if (ev.session) renderUsage(ev.session);
+      break;
+    case 'error':
+      log('error', '对话出错：' + ev.error);
+      break;
+    default:
+      break;
+  }
+}
+
 $('chatform').onsubmit = async (ev) => {
   ev.preventDefault();
-  if (busy) return;
+  if (busy) { await cancelJob(); return; }
   const text = $('input').value.trim();
   if (!text) return;
   busy = true;
-  $('send').disabled = true;
+  $('send').disabled = false;
+  $('send').textContent = '停止';
+  $('send').classList.add('danger');
   const ids = selectedIds.slice();
   log('user', text);
   $('input').value = '';
   setSelection([]);
   try {
-    const r = await api('/api/chat', { text, cell_ids: ids });
-    if (r.error) {
-      log('error', '对话出错：' + r.error);
-    } else {
-      log('tool-note', `（工具调用 ${r.tool_calls} 次 · 本轮 ${r.usage ? r.usage.in + ' in / ' + r.usage.out + ' out tokens' : ''}${r.cost_yuan > 0 ? ' · ' + fmtCost(r.cost_yuan) : ''}）`);
-      log('assistant', r.reply);
+    const resp = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, cell_ids: ids }),
+    });
+    if (!resp.ok || !resp.body) {
+      const t = await resp.text();
+      log('error', '请求失败 HTTP ' + resp.status + ': ' + t.slice(0, 300));
+      return;
     }
-    if (r.session) renderUsage(r.session);
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (!line) continue;
+        let ev2;
+        try { ev2 = JSON.parse(line); } catch (e) { continue; }
+        await handleStreamEvent(ev2);
+      }
+    }
   } catch (e) {
-    log('error', '网络错误：' + e);
+    log('error', '网络错误: ' + (e && e.message ? e.message : e));
+  } finally {
+    busy = false;
+    $('send').textContent = '发送';
+    $('send').classList.remove('danger');
+    await refreshCanvas();
+    const st = await (await fetch('/api/state')).json();
+    $('cells').textContent = `${st.cells} 个元素 / ${st.lines} 行`;
+    if (st.session) renderUsage(st.session);
   }
-  busy = false;
-  $('send').disabled = false;
-  await refreshCanvas();
-  const st = await (await fetch('/api/state')).json();
-  $('cells').textContent = `${st.cells} 个元素 / ${st.lines} 行`;
 };
 
 // ---------------------------------------------------------------------------

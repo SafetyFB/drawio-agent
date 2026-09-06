@@ -121,3 +121,4 @@ select.field, .field select {
 }
 #usage { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #usage.warn { border-color: var(--warn); color: var(--warn); }
+#send.danger { background: var(--err); }
