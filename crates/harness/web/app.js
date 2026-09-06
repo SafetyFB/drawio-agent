@@ -514,3 +514,114 @@ form.addEventListener('submit', async (e) => {
   } catch (err) { setTestResult('err', '网络错误: ' + err); }
   btn.disabled = false;
 });
+
+// ---------------------------------------------------------------------------
+// R5: per-file history panel (trajectory inspect / restore / export/import)
+// ---------------------------------------------------------------------------
+
+const histLog = $('histlog');
+let histOpen = false;
+
+async function openHistory() {
+  histOpen = !histOpen;
+  histLog.hidden = !histOpen;
+  $('hist-btn').classList.toggle('active', histOpen);
+  if (!histOpen) return;
+  let data;
+  try { data = await (await fetch('/api/history')).json(); }
+  catch (e) { log('error', '历史读取失败: ' + e); return; }
+  histLog.innerHTML = '';
+  if (!data.records || !data.records.length) {
+    const d = document.createElement('div');
+    d.className = 'dim';
+    d.textContent = '暂无历史记录（完成一次对话后自动记录）';
+    histLog.appendChild(d);
+    return;
+  }
+  for (const r of data.records) {
+    const item = document.createElement('div');
+    item.className = 'hist-item';
+    const d = new Date(r.ts * 1000);
+    const ts = d.toLocaleString('zh-CN', { hour12: false });
+    item.innerHTML = `<div class="hist-user">${escapeHtml(r.user)}</div>
+      <div class="hist-meta">${ts} · ${r.tool_calls} 次工具 · ${r.usage_in + r.usage_out} tokens${r.cost_yuan > 0 ? ' · ' + fmtCost(r.cost_yuan) : ''}${r.error ? ' · ⚠ 出错' : ''}</div>`;
+    const detail = document.createElement('div');
+    detail.className = 'hist-detail';
+    detail.hidden = true;
+    item.appendChild(detail);
+    item.onclick = async () => {
+      detail.hidden = !detail.hidden;
+      if (detail.hidden) return;
+      detail.textContent = '加载中…';
+      const full = await (await fetch('/api/history/' + r.idx)).json();
+      if (!full.ok) { detail.textContent = full.error || '读取失败'; return; }
+      const rec = full.record;
+      let txt = '';
+      for (const ev of rec.events || []) {
+        const t = ev.type;
+        if (t === 'tool') txt += `→ ${ev.name} ${ev.args || ''}\n`;
+        else if (t === 'tool_result') txt += `↳ ${ev.name}: ${ev.preview || ''}${ev.has_image ? ' 📷' : ''}\n`;
+        else if (t === 'usage') txt += `· tokens +${ev.in}/+${ev.out}\n`;
+        else if (t === 'reply') txt += `回复: ${ev.reply}\n`;
+        else if (t === 'error') txt += `错误: ${ev.error}\n`;
+      }
+      if (rec.error) txt += `错误: ${rec.error}\n`;
+      txt += `\n最终回复: ${rec.reply}\n（xml ${rec.xml.length} 字符）`;
+      detail.textContent = txt;
+      // action buttons
+      const acts = document.createElement('div');
+      acts.className = 'hist-actions';
+      const restore = document.createElement('button');
+      restore.textContent = '恢复此版本';
+      restore.onclick = async (e) => {
+        e.stopPropagation();
+        const r2 = await api('/api/history/' + r.idx + '/restore');
+        if (r2.ok) { log('ok', '✓ 已恢复到该历史版本'); await refreshCanvas(); }
+        else log('error', '恢复失败: ' + (r2.error || ''));
+      };
+      const dl = document.createElement('button');
+      dl.textContent = '导出会话 JSON';
+      dl.onclick = (e) => {
+        e.stopPropagation();
+        const blob = new Blob([JSON.stringify(rec, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `drawio-ctx-${r.idx}.json`;
+        a.click();
+      };
+      acts.append(restore, dl);
+      detail.appendChild(acts);
+    };
+    histLog.appendChild(item);
+  }
+}
+$('hist-btn').onclick = openHistory;
+
+$('ctx-import-btn').onclick = () => $('ctx-file').click();
+$('ctx-file').onchange = async () => {
+  const file = $('ctx-file').files[0];
+  if (!file) return;
+  log('tool-note', `导入会话 ${file.name} …`);
+  try {
+    const resp = await fetch('/api/context/load', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: await file.text(),
+    });
+    const r = await resp.json();
+    if (r.ok) {
+      log('ok', `✓ 会话已加载：${r.cells} 个元素，${r.memory_messages} 条记忆消息`);
+      await refreshCanvas();
+      const st = await (await fetch('/api/state')).json();
+      $('cells').textContent = `${st.cells} 个元素 / ${st.lines} 行`;
+      if (st.session) renderUsage(st.session);
+    } else log('error', '导入失败: ' + (r.error || ''));
+  } catch (e) { log('error', '导入失败: ' + e); }
+  $('ctx-file').value = '';
+};
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}

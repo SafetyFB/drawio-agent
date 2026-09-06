@@ -54,6 +54,11 @@ DRAWIO_LLM_API_KEY=<key> \
 对话中可用 `@cell:svc-a` / `@120-156` / `@demo.drawio:10-12` 精确指到文件
 某一部分；`/sel` 把选中引用附加到下一轮。
 
+REPL 常用命令：`/history`（/history N 看轨迹）`/restore N` `/ctx-save x.json`
+`/ctx-load x.json` `/stop`（打断运行中的任务）；web 右上角 ⚙ 配置模型与
+预算，`历史` 面板查看/恢复每次任务的完整轨迹，聊天实时流式渲染每轮
+工具调用与 token 花费。
+
 ## 代码布局
 
 | 路径 | 内容 |

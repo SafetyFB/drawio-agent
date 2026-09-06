@@ -29,6 +29,7 @@ use tokio_stream::StreamExt;
 use crate::chat::{Chat, OpenAiChat};
 use crate::config::{self, LlmSettings};
 use crate::engine::{EngineEvent, Harness, ProgressFn};
+use crate::history::{self, HistoryRec};
 use crate::refs;
 use crate::tools::Tools;
 use crate::xmlfile::{check_doc, XmlDoc};
@@ -108,6 +109,10 @@ pub async fn serve(path: PathBuf, port: u16) -> Result<(), String> {
         .route("/api/config/test", post(api_config_test))
         .route("/api/chat/stream", post(api_chat_stream))
         .route("/api/chat/cancel", post(api_chat_cancel))
+        .route("/api/history", get(api_history_list))
+        .route("/api/history/:idx", get(api_history_detail))
+        .route("/api/history/:idx/restore", post(api_history_restore))
+        .route("/api/context/load", post(api_context_load))
         .with_state(app_state);
 
     let addr = format!("127.0.0.1:{port}");
@@ -534,13 +539,36 @@ async fn api_chat_stream(
         let ctx = selection_ctx(&req.cell_ids, doc);
         let harness = Harness::default();
         let tx2 = tx.clone();
+        let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let events2 = events.clone();
         let progress: ProgressFn = Arc::new(move |ev: EngineEvent| {
-            let line = event_line(&ev).to_string();
+            let line = event_line(&ev);
+            if let Ok(mut v) = events2.lock() {
+                v.push(line.clone());
+            }
             let _ = tx2.try_send(format!("{line}\n").into_bytes());
         });
         let outcome = harness
             .run(chat, tools, doc, &req.text, &ctx, &opts, usage, &Some(progress))
             .await;
+        let (reply, error, tool_calls) = match &outcome {
+            Ok(o) => (o.reply.clone(), None, o.tool_calls),
+            Err(e) => (String::new(), Some(e.clone()), 0),
+        };
+        // R5: durable per-file history with the full trajectory.
+        let rec = HistoryRec {
+            ts: history::now_secs(),
+            user: req.text.clone(),
+            reply: reply.clone(),
+            tool_calls: tool_calls as u32,
+            usage_in: usage.usage.input_tokens,
+            usage_out: usage.usage.output_tokens,
+            cost_yuan: usage.cost_yuan,
+            events: events.lock().map(|v| v.clone()).unwrap_or_default(),
+            xml: doc.canonical().to_string(),
+            error,
+        };
+        let _ = history::append(&history::history_path(&doc.path), &rec);
         match outcome {
             Ok(o) => {
                 let _ = tx
@@ -598,4 +626,101 @@ async fn api_chat_cancel(
         }
         None => Json(json!({ "ok": false, "error": "当前没有运行中的任务" })),
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// R5: per-file history + session context save/load
+// ---------------------------------------------------------------------------
+
+fn hp(doc: &XmlDoc) -> std::path::PathBuf {
+    history::history_path(&doc.path)
+}
+
+async fn api_history_list(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::Value> {
+    let st = st.lock().await;
+    let recs = history::list(&hp(&st.doc), 50);
+    let list: Vec<serde_json::Value> = recs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            json!({
+                "idx": i,
+                "ts": r.ts,
+                "user": r.user.chars().take(120).collect::<String>(),
+                "tool_calls": r.tool_calls,
+                "usage_in": r.usage_in,
+                "usage_out": r.usage_out,
+                "cost_yuan": r.cost_yuan,
+                "error": r.error,
+                "xml_chars": r.xml.chars().count(),
+            })
+        })
+        .collect();
+    Json(json!({ "records": list, "file": hp(&st.doc).display().to_string() }))
+}
+
+async fn api_history_detail(
+    State(st): State<Arc<Mutex<WebState>>>,
+    axum::extract::Path(idx): axum::extract::Path<usize>,
+) -> Json<serde_json::Value> {
+    let st = st.lock().await;
+    let recs = history::list(&hp(&st.doc), 50);
+    match recs.get(idx) {
+        Some(r) => Json(json!({ "ok": true, "record": r })),
+        None => Json(json!({ "ok": false, "error": format!("没有第 {idx} 条历史记录") })),
+    }
+}
+
+async fn api_history_restore(
+    State(st): State<Arc<Mutex<WebState>>>,
+    axum::extract::Path(idx): axum::extract::Path<usize>,
+) -> Json<serde_json::Value> {
+    let mut st = st.lock().await;
+    let recs = history::list(&hp(&st.doc), 50);
+    let Some(rec) = recs.get(idx) else {
+        return Json(json!({ "ok": false, "error": format!("没有第 {idx} 条历史记录") }));
+    };
+    match XmlDoc::from_text(&rec.xml) {
+        Ok(d) => {
+            st.doc = d;
+            let _ = st.doc.save();
+            Json(json!({ "ok": true, "cells": st.doc.cells.len(), "note": "已恢复到该历史版本的 xml（会话统计不清零）" }))
+        }
+        Err(e) => Json(json!({ "ok": false, "error": format!("历史 xml 无法加载: {e}") })),
+    }
+}
+
+/// Import a SessionBundle (whole-context save/load): replaces the doc with
+/// the bundle's xml and replays its transcript into the rolling memory.
+async fn api_context_load(
+    State(st): State<Arc<Mutex<WebState>>>,
+    body: axum::body::Bytes,
+) -> Json<serde_json::Value> {
+    let bundle: Result<history::SessionBundle, _> = serde_json::from_slice(&body);
+    let bundle = match bundle {
+        Ok(b) => b,
+        Err(e) => {
+            return Json(json!({ "ok": false, "error": format!("不是有效的会话 JSON: {e}") }));
+        }
+    };
+    let mut st = st.lock().await;
+    let doc = match XmlDoc::from_text(&bundle.xml) {
+        Ok(d) => d,
+        Err(e) => return Json(json!({ "ok": false, "error": format!("会话里的 xml 无法加载: {e}") })),
+    };
+    st.doc = doc;
+    let _ = st.doc.save();
+    st.usage.transcript = history::SessionBundle::strip_images(&bundle.messages);
+    st.usage.usage = crate::chat::Usage {
+        input_tokens: bundle.usage_in,
+        output_tokens: bundle.usage_out,
+    };
+    st.usage.cost_yuan = bundle.cost_yuan;
+    Json(json!({
+        "ok": true,
+        "cells": st.doc.cells.len(),
+        "memory_messages": st.usage.transcript.len(),
+        "note": "已加载会话：文档与多轮记忆均已恢复",
+    }))
 }

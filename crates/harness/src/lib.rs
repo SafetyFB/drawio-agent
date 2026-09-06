@@ -8,6 +8,7 @@
 pub mod chat;
 pub mod config;
 pub mod engine;
+pub mod history;
 pub mod refs;
 pub mod tools;
 pub mod web;
@@ -15,7 +16,8 @@ pub mod xmlfile;
 
 pub use chat::{CallOpts, Chat, ChatError, Message, OpenAiChat, Reply, Usage};
 pub use config::{LlmSettings, ThinkingMode, mask_secret, preset_prices, usage_cost};
-pub use engine::{parse_envelope, Harness, RunOpts, SessionStats, TurnOutcome};
+pub use engine::{parse_envelope, EngineEvent, Harness, ProgressFn, RunOpts, SessionStats, TurnOutcome};
+pub use history::{HistoryRec, SessionBundle};
 pub use refs::{resolve_refs, ResolvedRef};
 pub use tools::Tools;
 pub use xmlfile::{CellSpan, CheckReport, EditReport, XmlDoc, XmlError};

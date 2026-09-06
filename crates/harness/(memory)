@@ -1,16 +1,16 @@
-<mxfile host="x">
-  <diagram id="d2">
+<mxfile>
+  <diagram id="d">
     <mxGraphModel>
       <root>
         <mxCell id="0"/>
         <mxCell id="1" parent="0"/>
-        <mxCell id="n1" value="New" vertex="1" parent="1">
+        <mxCell id="a" value="A" vertex="1" parent="1">
           <mxGeometry x="0" y="0" width="100" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="b" value="B v2" vertex="1" parent="1">
+          <mxGeometry x="220" y="0" width="120" height="50" as="geometry"/>
         </mxCell>
       </root>
     </mxGraphModel>
-  </diagram>
-</mxfile>
->
   </diagram>
 </mxfile>

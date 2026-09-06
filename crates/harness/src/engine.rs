@@ -53,16 +53,32 @@ pub struct TurnOutcome {
 }
 
 /// Running totals across asks (kept by the caller: REPL / web session).
+/// Also carries the rolling multi-turn memory (R5): the transcript of past
+/// asks is re-injected into every new ask and trimmed to a token budget.
 #[derive(Debug, Clone, Default)]
 pub struct SessionStats {
     pub usage: Usage,
     pub cost_yuan: f64,
+    /// Past-ask transcript (user asks / assistant envelopes / tool results),
+    /// trimmed to a token cap; images never survive (folded earlier).
+    pub transcript: Vec<Message>,
 }
 
 impl SessionStats {
     pub fn add(&mut self, u: &Usage, cost: f64) {
         self.usage.add(u);
         self.cost_yuan += cost;
+    }
+}
+
+/// Memory cap when no context_length is configured (tokens, estimate).
+const DEFAULT_MEMORY_TOKENS: usize = 24_000;
+
+/// Trim `stats.transcript` to fit the memory cap: drop oldest messages
+/// until the estimate fits.
+fn trim_memory(stats: &mut SessionStats, cap_tokens: u64) {
+    while estimate_tokens(&stats.transcript) > cap_tokens && stats.transcript.len() > 2 {
+        stats.transcript.remove(0);
     }
 }
 
@@ -153,6 +169,17 @@ fn system_prompt(doc: &XmlDoc) -> String {
     )
 }
 
+/// Strip ```json fences if the model wrapped its answer in a code block.
+fn strip_fences(raw: &str) -> String {
+    let t = raw.trim();
+    let t = t
+        .strip_prefix("```json")
+        .or_else(|| t.strip_prefix("```"))
+        .unwrap_or(t)
+        .trim();
+    t.strip_suffix("```").unwrap_or(t).trim().to_string()
+}
+
 /// Parse a model reply into either a tool call or a final reply.
 pub fn parse_envelope(raw: &str) -> Result<Value, String> {
     let trimmed = raw.trim();
@@ -236,12 +263,30 @@ impl Harness {
             };
         }
         let mut history: Vec<Message> = vec![Message::system(system_prompt(doc))];
+        // R5: re-inject the rolling memory of earlier asks (kept trimmed).
+        for m in &stats.transcript {
+            history.push(m.clone());
+        }
+        let ask_start = history.len(); // where this ask's own messages begin
         let full = if context.trim().is_empty() {
             user_text.to_string()
         } else {
             format!("{user_text}\n{context}")
         };
         history.push(Message::user(full));
+
+        // Commit this ask's tail into memory on every exit path.
+        macro_rules! remember {
+            () => {
+                let tail: Vec<Message> = history.split_off(ask_start);
+                let cap = opts
+                    .context_limit
+                    .map(|l| (l as f64 * 0.7) as u64)
+                    .unwrap_or(DEFAULT_MEMORY_TOKENS as u64);
+                stats.transcript.extend(tail);
+                trim_memory(stats, cap);
+            };
+        }
 
         let mut envelopes = Vec::new();
         let mut tool_calls = 0usize;
@@ -267,6 +312,7 @@ impl Harness {
             // reaches the remaining budget.
             if opts.budget_remaining.is_finite() && spent >= opts.budget_remaining {
                 stats.add(&usage, spent);
+                remember!();
                 return Err(format!(
                     "会话预算已用尽（本次已花 ¥{spent:.4} ≥ 预算 ¥{:.2}）。\
                      可在 ⚙ 设置里调高预算后继续。",
@@ -294,13 +340,30 @@ impl Harness {
                 }
                 Err(e) => {
                     stats.add(&usage, spent);
+                    remember!();
                     return Err(format!("LLM 调用失败（第 {turn} 轮）: {e}"));
                 }
             };
             let env = match parse_envelope(&raw) {
                 Ok(v) => v,
                 Err(e) => {
-                    // One retry with an explicit correction message, then give up.
+                    // Loose fallback: before any tool ran, plain-language
+                    // answers (e.g. "6") are accepted as the reply. Once the
+                    // model has started calling tools we require protocol
+                    // compliance (one correction retry, then give up).
+                    if tool_calls == 0 {
+                        let reply = strip_fences(&raw).trim().to_string();
+                        emit!(EngineEvent::Final { reply: reply.clone() });
+                        stats.add(&usage, spent);
+                        remember!();
+                        return Ok(TurnOutcome {
+                            reply,
+                            tool_calls: 0,
+                            envelopes: vec![raw.clone()],
+                            usage,
+                            cost_yuan: spent,
+                        });
+                    }
                     if last_err.is_none() {
                         last_err = Some(e.clone());
                         history.push(Message::assistant(raw.clone()));
@@ -310,6 +373,7 @@ impl Harness {
                         continue;
                     }
                     stats.add(&usage, spent);
+                    remember!();
                     return Err(e);
                 }
             };
@@ -319,8 +383,10 @@ impl Harness {
 
             if let Some(reply) = env.get("reply").and_then(Value::as_str) {
                 let reply = reply.to_string();
+                history.push(Message::assistant(reply.clone()));
                 emit!(EngineEvent::Final { reply: reply.clone() });
                 stats.add(&usage, spent);
+                remember!();
                 return Ok(TurnOutcome {
                     reply,
                     tool_calls,
@@ -330,10 +396,25 @@ impl Harness {
                 });
             }
 
-            let name = env
-                .get("tool")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "信封缺 tool/reply 字段".to_string())?;
+            let name = match env.get("tool").and_then(Value::as_str) {
+                Some(n) => n,
+                None if tool_calls == 0 => {
+                    // JSON envelope without tool/reply before any tool ran:
+                    // treat the model's raw text as the reply.
+                    let reply = strip_fences(&raw).trim().to_string();
+                    emit!(EngineEvent::Final { reply: reply.clone() });
+                    stats.add(&usage, spent);
+                    remember!();
+                    return Ok(TurnOutcome {
+                        reply,
+                        tool_calls: 0,
+                        envelopes: vec![raw.clone()],
+                        usage,
+                        cost_yuan: spent,
+                    });
+                }
+                None => return Err("信封缺 tool/reply 字段".to_string()),
+            };
             // Tool whitelist + fast fail: a model that hallucinates tool
             // names (e.g. `{"tool":"reply"}`) would otherwise loop until
             // max_turns.
@@ -341,6 +422,7 @@ impl Harness {
                 bad_tools += 1;
                 if bad_tools >= 2 {
                     stats.add(&usage, spent);
+                    remember!();
                     return Err(format!(
                         "模型连续输出未知工具 `{name}`，已中止。请检查系统提示中的工具协议是否被遵守。"
                     ));
@@ -380,6 +462,7 @@ impl Harness {
             fold_old_images(&mut history);
         }
         stats.add(&usage, spent);
+        remember!();
         Err(format!("达到最大轮数 {} 仍未完成", self.max_turns))
     }
 }
@@ -592,6 +675,69 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("context_length"), "{err}");
         assert!(fake.snapshots.is_empty(), "超限时不应发起调用");
+    }
+
+    #[tokio::test]
+    async fn memory_reinjects_prior_asks_across_runs() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        let mut stats = SessionStats::default();
+        // ask 1: user says X; fake replies done without tools.
+        let mut fake = FakeChat::new(vec![r#"{"reply":"收到","done":true}"#]);
+        Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "记住：目标是蓝色主题", "", &RunOpts::default(), &mut stats, &None)
+            .await
+            .unwrap();
+        assert_eq!(stats.transcript.len(), 2, "user ask + assistant reply");
+        // ask 2: the transcript must be visible to the model again.
+        let mut fake2 = FakeChat::new(vec![r#"{"reply":"好","done":true}"#]);
+        Harness::default()
+            .run(&mut fake2, &mut tools, &mut doc, "继续", "", &RunOpts::default(), &mut stats, &None)
+            .await
+            .unwrap();
+        let first_snapshot = &fake2.snapshots[0];
+        let texts: Vec<&str> = first_snapshot
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| match &m.parts[0] {
+                Part::Text(t) => t.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("蓝色主题")),
+            "前一轮的 user 消息应被重新注入: {texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_trim_keeps_newest_when_over_cap() {
+        // Direct trim check: a transcript larger than the cap sheds its
+        // oldest messages but keeps the newest ask intact.
+        let mut stats = SessionStats::default();
+        for i in 0..10 {
+            let long = format!(
+                "第 {i} 轮：{}",
+                "这是一段很长的记忆内容，用来撑大 token 估算值。" .repeat(300)
+            );
+            stats.transcript.push(Message::user(long));
+            stats.transcript.push(Message::assistant("好。"));
+        }
+        let before = estimate_tokens(&stats.transcript);
+        assert!(before > 10_000, "setup too small: {before}");
+        trim_memory(&mut stats, 3_000);
+        let after = estimate_tokens(&stats.transcript);
+        // Either the cap is met, or we kept only the newest ask (user+reply)
+        // because a single ask alone still exceeds the cap.
+        assert!(after <= 3_000 || stats.transcript.len() <= 2, "trim failed: {after}");
+        let newest_kept = stats.transcript.iter().any(|m| {
+            matches!(&m.parts[0], Part::Text(t) if t.contains("第 9 轮"))
+        });
+        assert!(newest_kept, "最新一轮应保留");
+        let oldest_gone = !stats.transcript.iter().any(|m| {
+            matches!(&m.parts[0], Part::Text(t) if t.contains("第 0 轮"))
+        });
+        assert!(oldest_gone, "最老一轮应被裁剪");
     }
 
     #[tokio::test]

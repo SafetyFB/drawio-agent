@@ -5,6 +5,7 @@ use std::io::{BufRead, Write};
 use std::sync::Arc;
 use std::path::PathBuf;
 use drawio_harness::chat::{Chat, OpenAiChat};
+use drawio_harness::history::{self, HistoryRec, SessionBundle};
 use drawio_harness::engine::Harness;
 use drawio_harness::refs;
 use drawio_harness::tools::Tools;
@@ -203,7 +204,13 @@ fn main() {
             let rest = parts.next().unwrap_or("").trim();
             match cmd {
                 "help" => println!("{HELP}"),
-                "quit" | "q" | "exit" => break,
+                "quit" | "q" | "exit" => {
+                    if running {
+                        eprintln!("任务运行中——先 /stop 再退出。");
+                    } else {
+                        break;
+                    }
+                }
                 "view" => {
                     let st = repl.clone();
                     let r = rt.block_on(async move {
@@ -310,6 +317,162 @@ fn main() {
                         }
                     });
                 }
+                "history" => {
+                    let st = repl.clone();
+                    let detail = rest.parse::<usize>().ok();
+                    rt.block_on(async move {
+                        let r = st.lock().await;
+                        let p = history::history_path(&r.doc.path);
+                        let recs = history::list(&p, 50);
+                        if recs.is_empty() {
+                            println!("还没有历史记录（文件: {}）", p.display());
+                            return;
+                        }
+                        match detail {
+                            None => {
+                                println!("最近 {} 条（{}）:", recs.len(), p.display());
+                                for (i, rec) in recs.iter().enumerate() {
+                                    println!("[{}] {}", i, rec.summary());
+                                }
+                                println!("查看详情: /history <序号>；恢复: /restore <序号>");
+                            }
+                            Some(i) => match recs.get(i) {
+                                Some(rec) => {
+                                    println!("时间: {}", rec.summary());
+                                    println!("轨迹:");
+                                    for ev in &rec.events {
+                                        let t = ev.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+                                        match t {
+                                            "tool" => println!(
+                                                "  → {} {}",
+                                                ev.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                                                ev.get("args").and_then(|v| v.as_str()).unwrap_or("")
+                                            ),
+                                            "tool_result" => println!(
+                                                "  ↳ {}: {}",
+                                                ev.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                                                ev.get("preview").and_then(|v| v.as_str()).unwrap_or("")
+                                            ),
+                                            "usage" => println!(
+                                                "  · tokens +{}/+{}",
+                                                ev.get("in").and_then(|v| v.as_u64()).unwrap_or(0),
+                                                ev.get("out").and_then(|v| v.as_u64()).unwrap_or(0)
+                                            ),
+                                            "reply" => println!(
+                                                "  回复: {}",
+                                                ev.get("reply").and_then(|v| v.as_str()).unwrap_or("")
+                                            ),
+                                            "error" => println!(
+                                                "  错误: {}",
+                                                ev.get("error").and_then(|v| v.as_str()).unwrap_or("")
+                                            ),
+                                            _ => {}
+                                        }
+                                    }
+                                    println!("（xml {} 字符，可用 /restore {i} 恢复）", rec.xml.chars().count());
+                                }
+                                None => eprintln!("没有第 {i} 条"),
+                            },
+                        }
+                    });
+                }
+                "restore" => {
+                    let st = repl.clone();
+                    let idx = rest.parse::<usize>();
+                    rt.block_on(async move {
+                        let mut r = st.lock().await;
+                        let Ok(idx) = idx else {
+                            eprintln!("用法: /restore <序号>（/history 查看）");
+                            return;
+                        };
+                        let p = history::history_path(&r.doc.path);
+                        let recs = history::list(&p, 50);
+                        match recs.get(idx) {
+                            Some(rec) => match XmlDoc::from_text(&rec.xml) {
+                                Ok(d) => {
+                                    r.doc = d;
+                                    let _ = r.doc.save();
+                                    println!("已恢复到历史 #{}（{} cells）", idx, r.doc.cells.len());
+                                }
+                                Err(e) => eprintln!("恢复失败: {e}"),
+                            },
+                            None => eprintln!("没有第 {idx} 条"),
+                        }
+                    });
+                }
+                "ctx-save" => {
+                    let st = repl.clone();
+                    let target = rest.to_string();
+                    rt.block_on(async move {
+                        let r = st.lock().await;
+                        let path = std::path::PathBuf::from(&target);
+                        let bundle = SessionBundle {
+                            version: 1,
+                            file: r.doc.path.display().to_string(),
+                            saved_at: history::now_secs(),
+                            messages: SessionBundle::strip_images(&r.usage.transcript),
+                            usage_in: r.usage.usage.input_tokens,
+                            usage_out: r.usage.usage.output_tokens,
+                            cost_yuan: r.usage.cost_yuan,
+                            xml: r.doc.canonical().to_string(),
+                        };
+                        match serde_json::to_string_pretty(&bundle)
+                            .map_err(|e| e.to_string())
+                            .and_then(|json| std::fs::write(&path, json).map_err(|e| e.to_string()))
+                        {
+                            Ok(()) => println!(
+                                "已保存会话上下文 -> {}（{} 条记忆消息，xml {} 字符）",
+                                path.display(),
+                                bundle.messages.len(),
+                                bundle.xml.chars().count()
+                            ),
+                            Err(e) => eprintln!("保存失败: {e}"),
+                        }
+                    });
+                }
+                "ctx-load" => {
+                    let st = repl.clone();
+                    let target = rest.to_string();
+                    rt.block_on(async move {
+                        let mut r = st.lock().await;
+                        let raw = match std::fs::read_to_string(&target) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                eprintln!("读取失败: {e}");
+                                return;
+                            }
+                        };
+                        let bundle: SessionBundle = match serde_json::from_str(&raw) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("不是有效的会话 JSON: {e}");
+                                return;
+                            }
+                        };
+                        match XmlDoc::from_text(&bundle.xml) {
+                            Ok(d) => {
+                                r.doc = d;
+                                let _ = r.doc.save();
+                            }
+                            Err(e) => {
+                                eprintln!("会话 xml 无法加载: {e}");
+                                return;
+                            }
+                        }
+                        r.usage.transcript = SessionBundle::strip_images(&bundle.messages);
+                        r.usage.usage = drawio_harness::chat::Usage {
+                            input_tokens: bundle.usage_in,
+                            output_tokens: bundle.usage_out,
+                        };
+                        r.usage.cost_yuan = bundle.cost_yuan;
+                        println!(
+                            "已加载会话 {}（{} cells，{} 条记忆消息）",
+                            target,
+                            r.doc.cells.len(),
+                            r.usage.transcript.len()
+                        );
+                    });
+                }
                 other => println!("未知命令 /{other}（/help 查看）"),
             }
             continue;
@@ -371,33 +534,73 @@ async fn run_one_ask(
     if r.chat.is_none() {
         return Err("LLM 未配置".into());
     }
-    let progress: Option<drawio_harness::engine::ProgressFn> = if trace {
-        Some(Arc::new(|ev: EngineEvent| match ev {
-            EngineEvent::Turn { index } => eprintln!("  · 模型轮次 {} …", index + 1),
-            EngineEvent::ModelOutput { .. } => {}
-            EngineEvent::Tool { name, args } => {
-                let a: String = args.chars().take(160).collect();
-                eprintln!("  → {name} {a}");
+    let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let events_cb = events.clone();
+    let progress: Option<drawio_harness::engine::ProgressFn> = Some(Arc::new(move |ev: EngineEvent| {
+        let evj = match &ev {
+            EngineEvent::Turn { index } => serde_json::json!({ "type": "turn", "index": index }),
+            EngineEvent::ModelOutput { raw } => serde_json::json!({ "type": "model", "preview": raw.chars().take(300).collect::<String>() }),
+            EngineEvent::Tool { name, args } => serde_json::json!({ "type": "tool", "name": name, "args": args.chars().take(200).collect::<String>() }),
+            EngineEvent::ToolResult { name, text, has_image } => serde_json::json!({
+                "type": "tool_result", "name": name,
+                "preview": text.lines().next().unwrap_or("").chars().take(200).collect::<String>(),
+                "has_image": has_image,
+            }),
+            EngineEvent::Usage { usage: u, cost_yuan } => serde_json::json!({
+                "type": "usage", "in": u.input_tokens, "out": u.output_tokens, "cost_yuan": cost_yuan,
+            }),
+            EngineEvent::Final { reply } => serde_json::json!({ "type": "reply", "reply": reply }),
+        };
+        if let Ok(mut v) = events_cb.lock() {
+            v.push(evj.clone());
+        }
+        if trace {
+            match ev {
+                EngineEvent::Turn { index } => eprintln!("  · 模型轮次 {} …", index + 1),
+                EngineEvent::ModelOutput { .. } => {}
+                EngineEvent::Tool { name, args } => {
+                    let a: String = args.chars().take(160).collect();
+                    eprintln!("  → {name} {a}");
+                }
+                EngineEvent::ToolResult { name, text, has_image } => {
+                    let first = text.lines().next().unwrap_or("");
+                    let t: String = first.chars().take(200).collect();
+                    eprintln!("  ↳ {name}: {t}{}", if has_image { " 📷" } else { "" });
+                }
+                EngineEvent::Usage { usage, cost_yuan } => eprintln!(
+                    "  · tokens +{}/+{} ≈ ¥{:.4}",
+                    usage.input_tokens, usage.output_tokens, cost_yuan
+                ),
+                EngineEvent::Final { .. } => {}
             }
-            EngineEvent::ToolResult { name, text, has_image } => {
-                let first = text.lines().next().unwrap_or("");
-                let t: String = first.chars().take(200).collect();
-                eprintln!("  ↳ {name}: {t}{}", if has_image { " 📷" } else { "" });
-            }
-            EngineEvent::Usage { usage, cost_yuan } => eprintln!(
-                "  · tokens +{}/+{} ≈ ¥{:.4}",
-                usage.input_tokens, usage.output_tokens, cost_yuan
-            ),
-            EngineEvent::Final { .. } => {}
-        }))
-    } else {
-        None
-    };
+        }
+    }));
     let ReplSession { harness, tools, doc, usage, chat, .. } = &mut *r;
     let chat: &mut dyn Chat = chat.as_mut().expect("checked above").as_mut();
-    harness
+    let outcome = harness
         .run(chat, tools, doc, &line, &ctx, &opts, usage, &progress)
-        .await
+        .await;
+    // R5: durable per-file history with the trajectory.
+    let (reply, error, tool_calls) = match &outcome {
+        Ok(o) => (o.reply.clone(), None, o.tool_calls),
+        Err(e) => (String::new(), Some(e.clone()), 0),
+    };
+    let rec = HistoryRec {
+        ts: history::now_secs(),
+        user: line.clone(),
+        reply,
+        tool_calls: tool_calls as u32,
+        usage_in: usage.usage.input_tokens,
+        usage_out: usage.usage.output_tokens,
+        cost_yuan: usage.cost_yuan,
+        events: events.lock().map(|v| v.clone()).unwrap_or_default(),
+        xml: doc.canonical().to_string(),
+        error,
+    };
+    if let Err(e) = history::append(&history::history_path(&doc.path), &rec) {
+        eprintln!("警告: 写入历史失败: {e}");
+    }
+    outcome
 }
 
 fn print_turn_result(res: &Result<drawio_harness::TurnOutcome, String>) {

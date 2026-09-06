@@ -15,6 +15,9 @@
   <span id="usage" class="chip dim">–</span>
   <span class="spacer"></span>
   <button id="settings-btn" class="tool" title="LLM 设置">⚙</button>
+  <button id="hist-btn" class="tool" title="任务历史 / 轨迹">历史</button>
+  <button id="ctx-import-btn" class="tool" title="导入会话 JSON">导入</button>
+  <input type="file" id="ctx-file" accept=".json" hidden>
   <button id="mode-select" class="tool active">框选</button>
   <button id="mode-pan" class="tool">平移</button>
   <button id="check" class="tool">检查</button>
@@ -107,6 +110,7 @@
     <div id="hint">拖动空白处框选；选中 cell 会随下一条消息一起发送（@file 引用语义）。</div>
   </div>
   <aside id="side">
+    <div id="histlog" hidden></div>
     <div id="chatlog"></div>
     <div id="sel-chip" class="sel-chip" hidden></div>
     <form id="chatform">
