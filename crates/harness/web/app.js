@@ -168,12 +168,19 @@ canvasEl.addEventListener('pointerdown', (e) => {
   }
   // select 模式
   if (cell) {
-    currentGraph.setSelectionCell(cell);
+    if (e.shiftKey) {
+      // Shift 点选：切换该 cell 的选中状态
+      const already = currentGraph.getSelectionCells().some((c) => c === cell);
+      if (already) currentGraph.removeSelectionCell(cell);
+      else currentGraph.addSelectionCell(cell);
+    } else {
+      currentGraph.setSelectionCell(cell);
+    }
     e.preventDefault();
     return;
   }
-  // 空白处 → 开始框选
-  rubberBand = { x1: e.clientX, y1: e.clientY, x2: e.clientX, y2: e.clientY };
+  // 空白处 → 开始框选（Shift 拉框 = 追加到现有选择）
+  rubberBand = { x1: e.clientX, y1: e.clientY, x2: e.clientX, y2: e.clientY, additive: !!e.shiftKey };
   rubberBandEl = document.createElement('div');
   rubberBandEl.className = 'rubber-band';
   canvasEl.appendChild(rubberBandEl);
@@ -196,9 +203,13 @@ canvasEl.addEventListener('pointerdown', (e) => {
       width: Math.abs(p2.x - p1.x), height: Math.abs(p2.y - p1.y),
     };
     const cells = hitTestCells(g);
+    const additive = rect.additive;
     cancelRubberBand();
-    try { currentGraph.setSelectionCells(cells); } catch (err) { console.warn(err); }
-    if (cells.length) setSelection(cells.filter((c) => c.id).map((c) => c.id));
+    try {
+      if (additive) currentGraph.addSelectionCells(cells);
+      else currentGraph.setSelectionCells(cells);
+    } catch (err) { console.warn(err); }
+    if (cells.length) setSelection(currentGraph.getSelectionCells().filter((c) => c.id && c.id !== '0' && c.id !== '1').map((c) => c.id));
   };
   window.addEventListener('pointermove', onMove);
   window.addEventListener('pointerup', onUp);
