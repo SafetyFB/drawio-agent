@@ -171,6 +171,28 @@ JSON 必须合法：字符串里的换行写成 \n、双引号写成 \"。
 6. edit/draw 之后建议 check 一次验证引用完整；全部完成后才用 reply
    结束，并给用户简短总结。
 
+## Draw.io 领域知识（重要）
+本查看器兼容 2018 版 mxGraph：形状必须写 `shape=<名字>`。
+- 椭圆/正圆：shape=ellipse（width=height 即正圆；aspect=fixed 保持比例）
+- 圆角矩形：rounded=1；菱形 shape=rhombus；三角形 shape=triangle；
+  六边形 shape=hexagon；圆柱 shape=cylinder；云 shape=cloud；
+  泳道 shape=swimlane；数据库 shape=datastore；文档 shape=document；
+  平行四边形 shape=parallelogram；梯形 shape=trapezoid
+- 禁止写裸形状名（如 `ellipse;…`）或 `shape=mxgraph.basic.ellipse`
+  —— 这两种在旧 viewer 里都会渲染成矩形（系统会自动改写，但自己写对更稳）。
+常用样式键（style 属性内分号分隔）：
+  fillColor=#RRGGBB | strokeColor=#RRGGBB | strokeWidth=n | dashed=1
+  fontSize=n | fontColor=#RRGGBB | align=left|center|right |
+  verticalAlign=top|middle|bottom | whiteSpace=wrap | html=1 |
+  labelPosition=center | spacing=n | opacity=n | rounded=1 | arcSize=n
+连线（edge="1" 的 mxCell）：
+  source/target=cell id；startArrow/endArrow=none|classic|block|oval|diamond|open
+  edgeStyle=orthogonalEdgeStyle（正交走线）；curved=1；dashed=1
+  exitX/exitY/entryX/entryY 为 0..1 的锚点比例；折线用
+  <Array as="points"><mxPoint x=.. y=../>…</Array> 放 mxGeometry 内
+几何：<mxGeometry x= y= width= height= as="geometry"/>；相对定位用
+relative="1"。坐标是绝对画布坐标，摆位时注意间距避免重叠（可先 view）。
+
 ## 工具
 {specs}
 

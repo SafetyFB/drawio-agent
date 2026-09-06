@@ -189,6 +189,83 @@ fn build_node(
     }
 }
 
+/// 形状名 → 2018-viewer 支持的裸名（核心 mxShape + 2018 drawio 扩展）。
+/// 现代 drawio 的 `mxgraph.basic.X` 命名空间在本 bundle 里不存在，会渲染成
+/// 矩形；基础形状一律归一化为核心裸名。
+fn basic_shape_alias(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "ellipse" => "ellipse",
+        "rectangle" | "rect" => "rectangle",
+        "rounded" => "rounded",
+        "rhombus" => "rhombus",
+        "triangle" => "triangle",
+        "hexagon" => "hexagon",
+        "cylinder" => "cylinder",
+        "actor" => "actor",
+        "cloud" => "cloud",
+        "swimlane" => "swimlane",
+        "process" => "process",
+        "step" => "step",
+        "document" => "document",
+        "note" => "note",
+        "parallelogram" => "parallelogram",
+        "trapezoid" => "trapezoid",
+        "cube" => "cube",
+        "delay" => "delay",
+        "tee" => "tee",
+        "cross" => "cross",
+        "xor" => "xor",
+        "or" => "or",
+        "plus" => "plus",
+        "tape" => "tape",
+        "waypoint" => "waypoint",
+        "link" => "link",
+        "card" => "card",
+        "folder" => "folder",
+        "message" => "message",
+        "datastore" => "datastore",
+        "doubleEllipse" => "doubleEllipse",
+        _ => return None,
+    })
+}
+
+/// 归一化 mxCell 的 style 属性，使形状写法与本仓库 vendored 的 2018 版
+/// mxGraph viewer 兼容（它只认 `shape=<裸名>`）：
+/// - 裸首键简写：`ellipse;whiteSpace=wrap;…` → `shape=ellipse;…`
+/// - 命名空间：`shape=mxgraph.basic.ellipse` → `shape=ellipse`
+/// - 其余条目（含 mxgraph.er.* / bpmn.* 等 bundle 支持的扩展名）原样保留。
+fn normalize_style(style: &str) -> String {
+    let parts: Vec<&str> = style
+        .split(';')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return style.to_string();
+    }
+    let mut out: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
+    // 1) shape=mxgraph.basic.X -> shape=X
+    for part in out.iter_mut() {
+        if let Some(rest) = part.strip_prefix("shape=mxgraph.basic.") {
+            if let Some(alias) = basic_shape_alias(rest) {
+                *part = format!("shape={alias}");
+            }
+        }
+    }
+    // 2) 裸首键是已知形状名 -> shape=<名>
+    if !out[0].contains('=') {
+        if let Some(alias) = basic_shape_alias(out[0].as_str()) {
+            out[0] = format!("shape={alias}");
+        }
+    }
+    let mut joined = out.join(";");
+    // 保留原样的尾分号（drawio 惯例）
+    if style.ends_with(';') && !joined.ends_with(';') {
+        joined.push(';');
+    }
+    joined
+}
+
 /// Node from a Start/Empty event, with unescaped attribute values.
 fn elem_node(e: &quick_xml::events::BytesStart<'_>) -> Result<Node, XmlError> {
     let tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
@@ -196,10 +273,14 @@ fn elem_node(e: &quick_xml::events::BytesStart<'_>) -> Result<Node, XmlError> {
     for a in e.attributes() {
         let a = a.map_err(|e| XmlError::Xml(format!("bad attribute: {e}")))?;
         let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
-        let value = a
+        let mut value = a
             .unescape_value()
             .map_err(|e| XmlError::Xml(format!("bad entity in `{key}`: {e}")))?
             .into_owned();
+        // mxCell 的 style 属性做 shape 归一化（viewer 兼容）
+        if tag == "mxCell" && key == "style" {
+            value = normalize_style(&value);
+        }
         attrs.push((key, value));
     }
     Ok(Node::Elem {
@@ -967,6 +1048,48 @@ mod tests {
     fn canonical_is_idempotent() {
         let c1 = canonicalize(SAMPLE).unwrap();
         assert_eq!(canonicalize(&c1).unwrap(), c1);
+    }
+
+    #[test]
+    fn style_shapes_normalized_for_2018_viewer() {
+        assert_eq!(
+            normalize_style("ellipse;whiteSpace=wrap;html=1;fillColor=#FFFF00;"),
+            "shape=ellipse;whiteSpace=wrap;html=1;fillColor=#FFFF00;"
+        );
+        assert_eq!(
+            normalize_style("shape=mxgraph.basic.ellipse;whiteSpace=wrap;html=1;"),
+            "shape=ellipse;whiteSpace=wrap;html=1;"
+        );
+        assert_eq!(
+            normalize_style("shape=mxgraph.basic.rect;perimeter=rectanglePerimeter;"),
+            "shape=rectangle;perimeter=rectanglePerimeter;"
+        );
+        // 未建模的扩展名原样保留
+        assert_eq!(
+            normalize_style("shape=mxgraph.er.entity;html=1;"),
+            "shape=mxgraph.er.entity;html=1;"
+        );
+        assert_eq!(
+            normalize_style("shape=hexagon;perimeter=hexagonPerimeter2;"),
+            "shape=hexagon;perimeter=hexagonPerimeter2;"
+        );
+        // 普通键不受影响
+        assert_eq!(
+            normalize_style("rounded=1;whiteSpace=wrap;html=1;"),
+            "rounded=1;whiteSpace=wrap;html=1;"
+        );
+        // 空样式
+        assert_eq!(normalize_style(""), "");
+    }
+
+    #[test]
+    fn canonicalize_converts_modern_shape_forms() {
+        let xml = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="c" value="" style="ellipse;whiteSpace=wrap;html=1;" vertex="1" parent="1"><mxGeometry x="0" y="0" width="40" height="40" as="geometry"/></mxCell><mxCell id="d2" value="" style="shape=mxgraph.basic.ellipse;whiteSpace=wrap;html=1;" vertex="1" parent="1"><mxGeometry x="60" y="0" width="40" height="40" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+        let c = canonicalize(xml).unwrap();
+        assert!(c.contains(r#"style="shape=ellipse;whiteSpace=wrap;html=1;""#), "{c}");
+        assert!(!c.contains("mxgraph.basic"), "{c}");
+        // 幂等
+        assert_eq!(canonicalize(&c).unwrap(), c);
     }
 
     #[test]
