@@ -196,9 +196,16 @@
     canvasToolSelect.classList.toggle('active', mode === 'select');
     canvasToolPan.setAttribute('aria-pressed', String(mode === 'pan'));
     canvasToolSelect.setAttribute('aria-pressed', String(mode === 'select'));
-    // Select mode turns panning off so a drag draws a box instead of panning;
-    // returning to pan mode re-enables it.
-    if (currentGraph) currentGraph.setPanning(mode === 'pan');
+    if (!currentGraph) return;
+    if (mode === 'pan') {
+      // Pure navigation: panning on, no cell-selection side-effects.
+      currentGraph.setPanning(true);
+      currentGraph.setCellsSelectable(false);
+    } else {
+      // Select mode: panning off so a drag draws a marquee; cells selectable.
+      currentGraph.setPanning(false);
+      currentGraph.setCellsSelectable(true);
+    }
     cancelRubberBand();
   }
 
@@ -304,6 +311,39 @@
     return result;
   }
 
+  /// All cells in the model, pre-order (later = drawn on top in mxGraph).
+  function collectAllCells(graph) {
+    const model = graph.getModel();
+    const root = model.getRoot();
+    const out = [];
+    const walk = (c) => {
+      if (!c) return;
+      out.push(c);
+      for (let i = 0; i < model.getChildCount(c); i++) walk(model.getChildAt(c, i));
+    };
+    walk(root);
+    return out;
+  }
+
+  /// Point-in-bounding-box hit test. `graph.getCellAt` misses white-fill cells
+  /// whose visible fill is transparent, and nested/group cells; this walks the
+  /// whole model and checks the rendered state bounds instead. Topmost first.
+  function getCellAtBbox(graph, x, y) {
+    const cells = collectAllCells(graph);
+    for (let i = cells.length - 1; i >= 0; i--) {
+      const cell = cells[i];
+      if (!cell || !cell.id || cell.id === '0' || cell.id === '1') continue;
+      const state = graph.view.getState(cell);
+      if (!state) continue;
+      // Skip cells without rendered bounds (e.g. edges with no waypoints).
+      if (typeof state.x !== 'number' || typeof state.width !== 'number') continue;
+      const inside = x >= state.x && x <= state.x + state.width
+                  && y >= state.y && y <= state.y + state.height;
+      if (inside) return cell;
+    }
+    return null;
+  }
+
   /// The vendored bundle is a draw.io fork whose selection/handle handlers call
   /// Graph.prototype methods the base mxGraph lacks (isTableCell, isTableRow,
   /// isTable, getLinksForState). Without them setSelectionCells throws mid-
@@ -382,8 +422,10 @@
         }, { passive: false });
       }
 
-      // Keep the toolbar in sync with a fresh graph and reset to pan mode.
-      setCanvasMode('pan');
+      // Re-apply the current canvas mode (pan/select) to the fresh graph. On the
+      // first load canvasMode is 'pan' (the default); on later rebuilds the
+      // user's chosen mode is preserved.
+      setCanvasMode(canvasMode);
 
       graph.getSelectionModel().addListener(window.mxEvent.SELECTION_CHANGED, () => {
         const selected = graph.getSelectionCells();
@@ -764,13 +806,33 @@
     canvasToolPan.addEventListener('click', () => setCanvasMode('pan'));
     canvasToolSelect.addEventListener('click', () => setCanvasMode('select'));
 
-    // Marquee drag: only in select mode, left button, on empty canvas. The
-    // container element survives graph rebuilds, so one listener is enough.
+    // Mode-aware canvas interaction. Pan mode = pure navigation (no selection);
+    // select mode = click a cell to select, drag on empty canvas to marquee.
+    // The container element survives graph rebuilds, so one listener is enough.
     drawioContainer.addEventListener('pointerdown', (e) => {
-      if (canvasMode !== 'select' || e.button !== 0 || !currentGraph) return;
-      const p = mxUtils.convertPoint(currentGraph.container, e.clientX, e.clientY);
-      const cell = currentGraph.getCellAt(p.x, p.y);
-      if (startRubberBand(e.clientX, e.clientY, cell)) {
+      if (e.button !== 0 || !currentGraph) return;
+      const graphPt = mxUtils.convertPoint(currentGraph.container, e.clientX, e.clientY);
+      // Try the bundle's hit-test first; fall back to a bbox walk for
+      // white-fill cells and nested groups that getCellAt misses.
+      let cell = currentGraph.getCellAt(graphPt.x, graphPt.y);
+      if (!cell) cell = getCellAtBbox(currentGraph, graphPt.x, graphPt.y);
+
+      if (canvasMode === 'pan') {
+        // Pure navigation — setCellsSelectable(false) already prevents any
+        // selection side-effect; just let mxGraph pan.
+        return;
+      }
+
+      // canvasMode === 'select' from here.
+      if (cell) {
+        // Click landed on a cell → single-select it directly (not through
+        // mxGraph's click handler, which the fork's stubs only partially fix).
+        currentGraph.setSelectionCell(cell);
+        e.preventDefault();
+        return;
+      }
+      // Empty area → start marquee.
+      if (startRubberBand(e.clientX, e.clientY, null)) {
         e.preventDefault();
         const onMove = (ev) => updateRubberBand(ev.clientX, ev.clientY);
         const onUp = () => {
