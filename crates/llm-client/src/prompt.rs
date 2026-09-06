@@ -227,6 +227,9 @@ DIFF OUTPUT RULE (critical for cost and safety):
   Descendants and edges referencing a removed cell are cleaned up
   automatically, but you may list edges explicitly too.
 - A document containing just one changed cell is a perfectly valid answer.
+- The document structure may be minimal but MUST include the synthetic
+  root and the default layer, or the server rejects it:
+  <mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/>{changed cells here}</root></mxGraphModel></diagram></mxfile>
 
 Respond with ONLY this JSON object (no commentary, no markdown fences):
 {"done": true|false, "xml": "<mxfile>...</mxfile>", "removed": ["cell_id", ...],
