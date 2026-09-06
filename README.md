@@ -5,8 +5,6 @@
 pretty-print 的 `.drawio` 文件。局部性靠「文件 + 行区间文本编辑 + @file
 式引用」实现，不引入 typed XML 模型与分阶段协议。
 
-设计文档：[`docs/harness-refactor.md`](./docs/harness-refactor.md)
-
 ## 概念
 
 - **一个 xml 文件**：加载时压缩 payload 自动展开，重排为规范格式（每个
