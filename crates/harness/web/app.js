@@ -619,6 +619,27 @@ function setupDebugHud() {
   hud.id = 'debug-hud';
   hud.style.cssText = 'position:fixed;top:70px;right:360px;z-index:99;background:rgba(0,0,0,.85);color:#8f8;font:11px/1.5 monospace;padding:8px 10px;border-radius:8px;white-space:pre;';
   document.body.appendChild(hud);
+  // cell 状态矩形 vs SVG 实际屏幕矩形（视觉/状态是否分叉的诊断核心）
+  const cellRects = () => {
+    if (!currentGraph) return '';
+    const model = currentGraph.getModel();
+    const cells = [];
+    const walk = (c) => { if (c.id && c.id !== '0' && c.id !== '1' && c.geometry) cells.push(c); for (let i=0;i<model.getChildCount(c);i++) walk(model.getChildAt(c,i)); };
+    walk(model.getRoot());
+    const rows = [];
+    for (const c of cells) {
+      const st = currentGraph.view.getState(c);
+      if (!st) continue;
+      // 找该 cell 的 SVG 节点屏幕矩形
+      const el = currentGraph.container.querySelector('[id*="' + c.id + '"]') || null;
+      const dr = el && el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+      rows.push(
+        c.id + ': state(' + st.x.toFixed(0) + ',' + st.y.toFixed(0) + ' ' + st.width.toFixed(0) + 'x' + st.height.toFixed(0) + ')' +
+        (dr ? ' dom(' + dr.left.toFixed(0) + ',' + dr.top.toFixed(0) + ' ' + dr.width.toFixed(0) + 'x' + dr.height.toFixed(0) + ')' : ' dom=none')
+      );
+    }
+    return rows.join('\n');
+  };
   const upd = (e) => {
     if (!currentGraph) return;
     const v = currentGraph.view;
@@ -628,8 +649,19 @@ function setupDebugHud() {
     let hit = currentGraph.getCellAt(gx, gy);
     const bbox = !hit ? getCellAtBbox(currentGraph, gx, gy) : null;
     const sel = currentGraph.getSelectionCells().map((c) => c.id).join(',');
-    hud.textContent = `client  (${e.clientX.toFixed(1)}, ${e.clientY.toFixed(1)})\ncontainer(${(e.clientX - rect.left).toFixed(1)}, ${(e.clientY - rect.top).toFixed(1)})\ngraph   (${gx.toFixed(1)}, ${gy.toFixed(1)})\ntranslate(${v.translate.x.toFixed(1)}, ${v.translate.y.toFixed(1)}) scale=${v.scale}\ngetCellAt=${hit ? hit.id : 'null'} bbox=${bbox ? bbox.id : 'null'}\nselection=[${sel}]`;
+    hud.textContent = `client  (${e.clientX.toFixed(1)}, ${e.clientY.toFixed(1)})\ncontainer(${(e.clientX - rect.left).toFixed(1)}, ${(e.clientY - rect.top).toFixed(1)})\ngraph   (${gx.toFixed(1)}, ${gy.toFixed(1)})\ntranslate(${v.translate.x.toFixed(1)}, ${v.translate.y.toFixed(1)}) scale=${v.scale}\ngetCellAt=${hit ? hit.id : 'null'} bbox=${bbox ? bbox.id : 'null'}\nselection=[${sel}]\n--- cells ---\n${cellRects()}`;
   };
+  // 点击日志：每次 pointerdown 记录命中
+  document.addEventListener('pointerdown', (e) => {
+    if (!currentGraph) return;
+    const v = currentGraph.view;
+    const rect = currentGraph.container.getBoundingClientRect();
+    const gx = (e.clientX - rect.left) / v.scale - v.translate.x;
+    const gy = (e.clientY - rect.top) / v.scale - v.translate.y;
+    let hit = currentGraph.getCellAt(gx, gy);
+    const bbox = !hit ? getCellAtBbox(currentGraph, gx, gy) : null;
+    console.log('[click] graph(' + gx.toFixed(1) + ',' + gy.toFixed(1) + ') shift=' + e.shiftKey + ' getCellAt=' + (hit ? hit.id : 'null') + ' bbox=' + (bbox ? bbox.id : 'null'));
+  }, true);
   currentGraph ? currentGraph.container.addEventListener('pointermove', upd) : null;
   document.addEventListener('pointermove', upd);
 }
