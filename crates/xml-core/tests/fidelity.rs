@@ -180,3 +180,45 @@ fn entity_codec_is_symmetric() {
         "serialized value must re-encode entities exactly once:\n{out}"
     );
 }
+
+#[test]
+fn duplicate_cell_ids_are_deduplicated_last_wins() {
+    // Regression: real GLM fix outputs occasionally re-emit an earlier
+    // definition, producing two <mxCell> with the same id. mxCodec then
+    // throws "Duplicate ID" and the browser canvas falls back to XML text.
+    // Parsing must keep the LAST definition and drop the earlier shell.
+    let xml = r#"<mxfile><diagram name="p1"><mxGraphModel>
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="a" value="first" style="old;" vertex="1" parent="1">
+          <mxGeometry x="0" y="0" width="100" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="a" value="second" style="new;" vertex="1" parent="1">
+          <mxGeometry x="300" y="200" width="220" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="b" value="B" vertex="1" parent="1">
+          <mxGeometry x="10" y="10" width="50" height="50" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel></diagram></mxfile>"#;
+
+    let file = MxFile::parse(xml.as_bytes()).expect("parse");
+    let model = file.diagrams[0].model.as_ref().expect("model");
+    let a = model.get("a").expect("cell a");
+
+    // Last definition wins (value/style/geometry of the second emission).
+    assert_eq!(a.value.as_deref(), Some("second"));
+    assert_eq!(a.style.as_deref(), Some("new;"));
+    let geom = a.geometry.as_ref().expect("geometry");
+    assert_eq!(geom.x, 300.0);
+    assert_eq!(geom.y, 200.0);
+    assert_eq!(geom.width, 220.0);
+    assert_eq!(geom.height, 80.0);
+
+    // Serializing back must produce exactly one id="a".
+    let out = file.to_xml().unwrap_or_else(|e| panic!("serialize: {e}"));
+    let count = out.matches("id=\"a\"").count();
+    assert_eq!(count, 1, "expected one id=\"a\" in output:\n{out}");
+    assert!(out.contains("new;"), "output must carry the kept definition");
+}

@@ -436,7 +436,7 @@
 
     // TODO: replace with mxGraph embed once CDN load is reliable.
     if (typeof window.mxGraph === 'undefined' || typeof window.mxUtils === 'undefined' || typeof window.mxCodec === 'undefined') {
-      drawioContainer.innerHTML = `<pre class="xml-fallback"><code>${syntaxHighlightXml(xml)}</code></pre>`;
+      renderXmlFallback(xml, 'drawio viewer bundle (viewer-static.min.js) 未加载：typeof mxGraph undefined');
       return;
     }
 
@@ -451,6 +451,7 @@
       codec.decode(models[0], model);
 
       const graph = new window.mxGraph(drawioContainer, model);
+      drawioContainer.dataset.rendered = 'mxgraph';
       currentGraph = graph;
       patchGraphForBundle(graph);
       graph.setEnabled(true);
@@ -503,8 +504,21 @@
       graph.refresh();
     } catch (err) {
       console.warn('mxGraph render failed, falling back to XML:', err);
-      drawioContainer.innerHTML = `<pre class="xml-fallback"><code>${syntaxHighlightXml(xml)}</code></pre>`;
+      renderXmlFallback(xml, `mxGraph 渲染抛错：${err && err.message ? err.message : err}`);
     }
+  }
+
+  /** Visible XML-source fallback with the reason on screen. The old code
+   *  fell back silently (no console error when the bundle was missing),
+   *  which made 'why is my diagram text?' impossible to diagnose. */
+  function renderXmlFallback(xml, reason) {
+    console.warn('xml fallback reason:', reason);
+    drawioContainer.dataset.rendered = 'xml';
+    drawioContainer.innerHTML = `
+      <div class="xml-fallback-banner" title="${escapeHtml(String(reason))}">
+        ⚠ 图形渲染不可用，正在显示 XML 源码 —— ${escapeHtml(String(reason))}
+      </div>
+      <pre class="xml-fallback"><code>${syntaxHighlightXml(xml)}</code></pre>`;
   }
 
   async function loadSessionList() {

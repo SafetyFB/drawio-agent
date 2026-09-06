@@ -1196,6 +1196,14 @@ fn parse_mxgraphmodel(xml: &[u8]) -> Result<MxGraphModel, ParseError> {
         buf.clear();
     }
 
+    // Defensive: models sometimes contain duplicate ids (a later re-
+    // emission of an earlier definition — real GLM outputs did this and
+    // mxCodec throws 'Duplicate ID' in the browser, forcing the canvas to
+    // the XML fallback). Keep the LAST occurrence so coordinates/attrs from
+    // the final definition win; children are flat siblings keyed by parent
+    // id, so dropping the earlier shells never orphans the tree.
+    dedupe_cells_by_id(&mut cells);
+
     // Convention: cell id="0" is the synthetic root.
     let root_idx = cells
         .iter()
@@ -1237,6 +1245,33 @@ fn parse_mxgraphmodel(xml: &[u8]) -> Result<MxGraphModel, ParseError> {
         root,
         extra_attrs: model_attrs,
     })
+}
+
+/// Remove duplicate cell ids from a flat cell list (see
+/// [`parse_mxgraphmodel`]), keeping the last occurrence of each id.
+/// Returns the ids that were dropped (first occurrences).
+fn dedupe_cells_by_id(cells: &mut Vec<Cell>) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut dropped: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<Cell> = Vec::with_capacity(cells.len());
+    // Walk backwards so the last occurrence survives in original order.
+    for cell in cells.drain(..).rev() {
+        if seen.contains(&cell.id) {
+            dropped.push(cell.id.clone());
+        } else {
+            seen.insert(cell.id.clone());
+            out.push(cell);
+        }
+    }
+    out.reverse();
+    if !dropped.is_empty() {
+        // No tracing dep in this leaf crate: report via eprintln (server
+        // crates log it anyway when they record the sanitized result).
+        eprintln!("xml-core: dropped duplicate cell id(s): {dropped:?}");
+    }
+    *cells = out;
+    dropped
 }
 
 /// Collect every attribute of a start/empty tag into source order,
