@@ -25,8 +25,7 @@
   const runStatusText = $('run-status-text');
   const errorBox = $('error-box');
   const activityLog = $('activity-log');
-  const previewArea = $('preview-area');
-  const renderMeta = $('render-meta');
+  const btnExportPng = $('export-png-btn');
   const downloadSvgBtn = $('download-svg-btn');
   const copyXmlUrlBtn = $('copy-xml-url-btn');
 
@@ -90,6 +89,15 @@
     canvasOverlayText.textContent = text;
   }
 
+  function updateActionButtons() {
+    const hasSession = !!currentSessionId;
+    const hasXml = !!(currentXml && currentXml.trim());
+    const enabled = hasSession && hasXml;
+    btnExportPng.disabled = !enabled;
+    downloadSvgBtn.disabled = !enabled;
+    copyXmlUrlBtn.disabled = !enabled;
+  }
+
   function setRunLoading(on, text = 'running…') {
     isRunning = on;
     generateBtn.disabled = on;
@@ -115,6 +123,7 @@
   function loadXmlIntoCanvas(xml) {
     currentXml = xml;
     drawioContainer.innerHTML = '';
+    updateActionButtons();
     if (!xml || !xml.trim()) {
       drawioContainer.style.display = 'none';
       canvasPlaceholder.style.display = 'flex';
@@ -188,7 +197,7 @@
     try {
       const session = await api('GET', `/api/sessions/${encodeURIComponent(id)}`);
       loadXmlIntoCanvas(session.current_xml || '');
-      await renderPng();
+      updateActionButtons();
       connectWs(id);
     } catch (err) {
       showError(`Failed to load session: ${err.message}`);
@@ -281,17 +290,37 @@
     reconnectTimer = setTimeout(() => connectWs(id), delay);
   }
 
-  async function renderPng() {
+  async function exportPng() {
     if (!currentSessionId) return;
+    setLoading(true, 'exporting PNG…');
     try {
       const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}/render`);
-      previewArea.innerHTML = `<img src="data:image/png;base64,${result.png_base64}" alt="render preview">`;
-      renderMeta.textContent = result.bytes ? `${(result.bytes / 1024).toFixed(1)} KB` : '';
+      const base64 = result.png_base64 || '';
+      if (!base64) throw new Error('server returned empty PNG');
+
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      const blob = new Blob([bytes], { type: 'image/png' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `drawio-agent-${currentSessionId.slice(0, 8)}.png`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      btnExportPng.disabled = false;
       downloadSvgBtn.disabled = false;
       copyXmlUrlBtn.disabled = false;
+      addActivity('StateTransition', { from: 'export', to: 'PNG downloaded' });
     } catch (err) {
-      previewArea.innerHTML = `<p class="preview-empty">⚠ render failed: ${escapeHtml(err.message)}</p>`;
-      renderMeta.textContent = '';
+      showError(`PNG export failed: ${err.message}`);
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -305,7 +334,6 @@
     try {
       const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}/generate`, { prompt });
       loadXmlIntoCanvas(result.xml || '');
-      await renderPng();
       await loadSessionList();
     } catch (err) {
       showError(`Generate failed: ${err.message}`);
@@ -326,7 +354,6 @@
     try {
       const result = await api('POST', `/api/sessions/${encodeURIComponent(currentSessionId)}/agent-loop`, { prompt });
       loadXmlIntoCanvas(result.xml || '');
-      await renderPng();
       await loadSessionList();
       if (result.converged) {
         addActivity('StateTransition', { from: 'loop', to: `converged · ${result.iterations} iterations` });
@@ -467,6 +494,7 @@
     newSessionBtn.addEventListener('click', createSession);
     generateBtn.addEventListener('click', runGenerate);
     loopBtn.addEventListener('click', runLoop);
+    btnExportPng.addEventListener('click', exportPng);
     downloadSvgBtn.addEventListener('click', downloadSvg);
     copyXmlUrlBtn.addEventListener('click', copyXmlUrl);
 
