@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use drawio_agent_renderer::MockDriver;
 use drawio_agent_server::{
-    build_app_state_with_renderer, run_server, shutdown_signal, LlmSettings, ServerConfig,
+    build_app_state_with_renderer, run_server, LlmSettings, ServerConfig,
 };
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
