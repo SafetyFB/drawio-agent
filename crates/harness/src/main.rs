@@ -72,18 +72,29 @@ fn main() {
         return;
     }
 
-    let mut path = PathBuf::from(&args[0]);
-    let one_shot = args.len() > 1;
-
-    if path.to_string_lossy() == "new" && args.len() >= 3 {
-        path = PathBuf::from(&args[2]);
+    let (mut path, one_shot_args) = if args[0] == "new" {
+        // drawio-harness new <file> [one-shot 消息…]
+        let Some(file) = args.get(1) else {
+            eprintln!("用法: drawio-harness new <file>");
+            std::process::exit(2);
+        };
+        let path = PathBuf::from(file);
         if !path.exists() {
             std::fs::write(&path, EMPTY_TEMPLATE).expect("写文件失败");
             println!("已创建空图 {}", path.display());
         }
-    }
+        (path, args[2..].to_vec())
+    } else {
+        (PathBuf::from(&args[0]), args[1..].to_vec())
+    };
+    let one_shot = !one_shot_args.is_empty();
+
     if !path.exists() {
-        eprintln!("文件不存在: {}（用 `drawio-harness new {}` 创建空图）", path.display(), path.display());
+        eprintln!(
+            "文件不存在: {}。\n  先创建空图: cargo run -p drawio-harness -- new {}",
+            path.display(),
+            path.display()
+        );
         std::process::exit(2);
     }
 
@@ -117,7 +128,7 @@ fn main() {
     let mut chat = chat.map(|c| Box::new(c) as Box<dyn Chat>);
 
     let single_msg = if one_shot {
-        Some(args[1..].join(" "))
+        Some(one_shot_args.join(" "))
     } else {
         None
     };
