@@ -12,8 +12,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
+pub mod asset_fetch;
 pub mod checksum;
+pub mod drawio_app;
 pub mod driver;
+
+pub use drawio_app::{
+    drawio_app_cached, drawio_app_dir, ensure_drawio_app, PINNED_DRAWIO_VERSION,
+};
 
 pub use driver::{
     bundled_chromium_path, find_chromium, HeadlessChromiumDriver, MockDriver,

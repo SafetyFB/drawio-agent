@@ -844,6 +844,98 @@ async function syncNow() {
 }
 
 // ---------------------------------------------------------------------------
+// drawio iframe 编辑器（自托管 webapp，最新原生编辑 + sel 插件桥）
+// ---------------------------------------------------------------------------
+
+let drawioMode = false;
+let drawioFrame = null;
+let drawioXmlDirty = false;
+let drawioSyncTimer = 0;
+
+function enableDrawioMode() {
+  drawioMode = true;
+  drawioFrame = $('drawio-frame');
+  $('canvas').style.display = 'none';
+  $('canvas-modes').style.display = 'none'; // 缩放/框选/导出按钮由 drawio 原生 UI 接管
+  // 插件注册：iframe 与本页同源，localStorage 共享——先把 sel 桥插件写进
+  // drawio 的配置，再加载应用（插件走 settings/localStorage 通道，同域 +
+  // ALLOW_CUSTOM_PLUGINS 才放行；p= 参数只认内置注册表）。
+  try {
+    const key = '.drawio-config';
+    let cfg = {};
+    try { cfg = JSON.parse(localStorage.getItem(key) || '{}'); } catch (e) {}
+    const plugins = (cfg.plugins || []).filter((u) => u !== '/drawio-plugin.js');
+    plugins.push('/drawio-plugin.js');
+    localStorage.setItem(key, JSON.stringify(Object.assign({}, cfg, { plugins })));
+  } catch (e) { /* localStorage 不可用时插件缺失，仅失去 sel 桥 */ }
+  drawioFrame.hidden = false;
+  drawioFrame.src =
+    '/drawio/index.html?embed=1&proto=json&spin=1&autosave=1&modified=unsavedChanges' +
+    '&keepmodified=1&noSaveBtn=1&saveAndExit=0';
+  window.addEventListener('message', onDrawioMessage);
+}
+
+function onDrawioMessage(e) {
+  // iframe 内页面（同源）与外部的消息都走这里——只认 drawio 事件
+  let d = e.data;
+  try { if (typeof d === 'string') d = JSON.parse(d); } catch (_) {}
+  if (!d || typeof d !== 'object') return;
+  switch (d.event) {
+    case 'init':
+      // 编辑器就绪：载入当前会话 xml
+      if (drawioFrame && drawioFrame.contentWindow) {
+        drawioFrame.contentWindow.postMessage(JSON.stringify({
+          action: 'load', autosave: 1, xml: currentXml,
+        }), '*');
+      }
+      break;
+    case 'autosave':
+      // 手动编辑 → 防抖 → /api/manual（canonicalize 落盘）。不回灌
+      // canonical 到 iframe（会重置 drawio 的 undo 栈与光标）。
+      if (d.xml) {
+        currentXml = d.xml;
+        drawioXmlDirty = true;
+        clearTimeout(drawioSyncTimer);
+        drawioSyncTimer = setTimeout(syncDrawioXml, 600);
+      }
+      break;
+    case 'sel':
+      // sel 插件桥：选中 cell → 复用现有引用管线
+      setSelection(d.ids || []);
+      break;
+  }
+}
+
+async function syncDrawioXml() {
+  if (!drawioXmlDirty) return;
+  if (busy) { drawioSyncTimer = setTimeout(syncDrawioXml, 2000); return; }
+  drawioXmlDirty = false;
+  try {
+    const r = await api('/api/manual', { xml: currentXml });
+    if (r.ok) {
+      currentXml = r.xml; // 服务端 canonical（磁盘真相）
+      const st = await (await fetch('/api/state')).json();
+      $('cells').textContent = `${st.cells} 个元素 / ${st.lines} 行`;
+    } else {
+      log('error', '手动改动同步失败: ' + (r.error || ''));
+      drawioXmlDirty = true;
+      drawioSyncTimer = setTimeout(syncDrawioXml, 3000);
+    }
+  } catch (e) {
+    drawioXmlDirty = true;
+    drawioSyncTimer = setTimeout(syncDrawioXml, 3000);
+  }
+}
+
+function drawioLoad(xml) {
+  if (drawioFrame && drawioFrame.contentWindow) {
+    drawioFrame.contentWindow.postMessage(JSON.stringify({
+      action: 'load', autosave: 1, xml,
+    }), '*');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Sessions (会话 = 一个 .drawio 文件)
 // ---------------------------------------------------------------------------
 
@@ -965,8 +1057,12 @@ async function refreshCanvas(keepView) {
   const xml = await resp.text();
   currentXml = xml;
   hidePlaceholder();
-  canvasEl.style.display = '';
-  loadXmlIntoCanvas(xml);
+  if (drawioMode) {
+    drawioLoad(xml);
+  } else {
+    canvasEl.style.display = '';
+    loadXmlIntoCanvas(xml);
+  }
   if (keepView) restoreView();
   setSelection([]);
 }
@@ -1252,6 +1348,11 @@ setupDebugHud();
     $('placeholder-msg').textContent = '连接服务器失败：' + (e && e.message ? e.message : e);
   }
   $('input').focus();
+  // drawio webapp 可用则切换到 iframe 编辑器（离线回退旧 mxGraph 画布）
+  try {
+    const st = await (await fetch('/api/state')).json();
+    if (st && st.drawio_app) enableDrawioMode();
+  } catch (e) { /* 保持旧画布 */ }
 })();
 
 // ---------------------------------------------------------------------------

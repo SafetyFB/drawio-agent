@@ -45,6 +45,9 @@ pub struct CancelSlot {
 struct AppState {
     big: Arc<Mutex<WebState>>,
     cancel: Arc<CancelSlot>,
+    /// 解压好的 drawio webapp 目录（编辑器 iframe 与渲染共用）；
+    /// None = 离线且未缓存 → 前端回退到旧 mxGraph 画布。
+    drawio: Option<PathBuf>,
 }
 
 impl FromRef<AppState> for Arc<Mutex<WebState>> {
@@ -134,12 +137,32 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
     }));
 
     let cancel = Arc::new(CancelSlot::default());
-    let app_state = AppState { big: state, cancel };
+    // drawio webapp：首次使用从 GitHub 下载 draw.war（54MB，SHA-256 校验），
+    // 缓存到 ~/.drawio-agent/drawio/<ver>。离线且未缓存 → None（旧画布回退）。
+    let drawio = tokio::task::spawn_blocking(drawio_agent_renderer::ensure_drawio_app)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("drawio webapp 任务失败: {e}");
+            Ok(None)
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("drawio webapp 不可用（回退旧画布）: {e}");
+            None
+        });
+    match &drawio {
+        Some(d) => println!("drawio 编辑器: {}", d.display()),
+        None => println!("drawio 编辑器未启用（离线或下载失败）——使用内置 mxGraph 画布"),
+    }
+    let app_state = AppState { big: state, cancel, drawio };
     let app = Router::new()
         .route("/", get(page))
         .route("/app.css", get(css))
         .route("/app.js", get(js))
         .route("/vendor/viewer-static.min.js", get(viewer_bundle))
+        .route("/drawio", get(drawio_index))
+        .route("/drawio/", get(drawio_index))
+        .route("/drawio/*path", get(drawio_static))
+        .route("/drawio-plugin.js", get(drawio_plugin))
         .route("/api/state", get(api_state))
         .route("/api/sessions", get(api_sessions_list).post(api_sessions_create))
         .route("/api/sessions/switch", post(api_sessions_switch))
@@ -173,6 +196,112 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
 
 async fn page() -> Html<&'static str> {
     Html(include_str!("../web/index.html"))
+}
+
+/// drawio webapp 静态服务：路径消毒后从缓存目录读文件。
+const MIME: &[(&str, &str)] = &[
+    ("html", "text/html"), ("js", "text/javascript"), ("css", "text/css"),
+    ("svg", "image/svg+xml"), ("png", "image/png"), ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"), ("gif", "image/gif"), ("ico", "image/x-icon"),
+    ("json", "application/json"), ("woff", "font/woff"), ("woff2", "font/woff2"),
+    ("ttf", "font/ttf"), ("wasm", "application/wasm"), ("map", "application/json"),
+    ("xml", "application/xml"), ("txt", "text/plain"), ("webp", "image/webp"),
+];
+
+fn drawio_dir_or_404(st: &AppState) -> Result<PathBuf, Response> {
+    match &st.drawio {
+        Some(d) => Ok(d.clone()),
+        None => Err((StatusCode::NOT_FOUND, "drawio webapp 未缓存").into_response()),
+    }
+}
+
+async fn drawio_index(State(st): State<AppState>) -> Response {
+    let dir = match drawio_dir_or_404(&st) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    serve_drawio_file(&dir.join("index.html"), "index.html")
+}
+
+async fn drawio_static(
+    State(st): State<AppState>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> Response {
+    let dir = match drawio_dir_or_404(&st) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    // 路径消毒：拒绝 .. 与绝对路径
+    let rel = std::path::Path::new(&path);
+    if rel.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir)) {
+        return (StatusCode::BAD_REQUEST, "bad path").into_response();
+    }
+    serve_drawio_file(&dir.join(rel), &path)
+}
+
+fn serve_drawio_file(full: &std::path::Path, name: &str) -> Response {
+    match std::fs::read(full) {
+        Ok(bytes) => {
+            let ct = std::path::Path::new(name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(|e| MIME.iter().find(|(k, _)| *k == e).map(|(_, v)| *v))
+                .unwrap_or("application/octet-stream");
+            static_bytes(bytes, ct)
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+/// sel 桥插件：drawio 内运行，选中变化 → 父页 postMessage。
+const DRAWIO_PLUGIN_JS: &str = r#"
+parent.postMessage({ event: 'plugin-ping', stage: 'top' }, '*');
+Draw.loadPlugin(function (ui) {
+  parent.postMessage({ event: 'plugin-ping', stage: 'loaded' }, '*');
+  var g = ui.editor.graph;
+  g.getSelectionModel().addListener(mxEvent.SELECTION_CHANGED, function () {
+    var ids = g.getSelectionCells()
+      .filter(function (c) { return c.id && c.id !== '0' && c.id !== '1'; })
+      .map(function (c) { return c.id; });
+    parent.postMessage({ event: 'sel', ids: ids }, '*');
+  });
+  // 调试/布局探针：父页可查询每个 cell 的屏幕中心（iframe 内部坐标）
+  window.addEventListener('message', function (ev) {
+    var d = ev.data;
+    try { if (typeof d === 'string') d = JSON.parse(d); } catch (e) {}
+    if (d && d.action === 'zoomfit') {
+      g.fit();
+      parent.postMessage({ event: 'zoomfit', ok: true }, '*');
+    }
+    if (d && d.action === 'scrollto' && d.id) {
+      var tc = g.model.getCell(d.id);
+      if (tc) { g.scrollCellToVisible(tc); }
+      parent.postMessage({ event: 'scrollto', ok: !!tc }, '*');
+    }
+    if (d && d.action === 'selprobe') {
+      var out = {};
+      var cr = g.container.getBoundingClientRect();
+      var walk = function (c) {
+        if (c && c.id && c.id !== '0' && c.id !== '1' && g.model.isVertex(c)) {
+          var st = g.view.getState(c);
+          if (st) out[c.id] = {
+            // 视口坐标（iframe 内 client 坐标，含工具栏/面板偏移）
+            x: cr.left + st.getCenterX() - g.container.scrollLeft,
+            y: cr.top + st.getCenterY() - g.container.scrollTop,
+            w: st.width, h: st.height
+          };
+        }
+        if (c) for (var i = 0; i < g.model.getChildCount(c); i++) walk(g.model.getChildAt(c, i));
+      };
+      walk(g.model.getRoot());
+      parent.postMessage({ event: 'selprobe', cells: out }, '*');
+    }
+  });
+});
+"#;
+
+async fn drawio_plugin() -> Response {
+    static_bytes(DRAWIO_PLUGIN_JS.as_bytes().to_vec(), "text/javascript")
 }
 
 async fn css() -> impl IntoResponse {
@@ -216,8 +345,8 @@ fn current_err() -> Json<serde_json::Value> {
     Json(json!({ "ok": false, "error": "还没有打开的会话：先创建一个（新建会话 = 新建 .drawio 文件）" }))
 }
 
-async fn api_state(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::Value> {
-    let st = st.lock().await;
+async fn api_state(State(app): State<AppState>) -> Json<serde_json::Value> {
+    let st = app.big.lock().await;
     // 运行中：用快照即时响应（任务持有 doc，不在 sessions 里）
     if let Some(run) = st.running.clone() {
         let snap = st.snapshot.clone();
@@ -229,6 +358,7 @@ async fn api_state(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::V
             "lines": snap.lines,
             "cells": snap.cells,
             "llm_ready": st.llm_ready(),
+        "drawio_app": app.drawio.is_some(),
             "render": st.tools.render,
             "config_source": config_source_label(),
             "session": json!({
@@ -253,6 +383,7 @@ async fn api_state(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::V
         "lines": ss.doc.canonical().lines().count(),
         "cells": ss.doc.cells.len(),
         "llm_ready": st.llm_ready(),
+        "drawio_app": app.drawio.is_some(),
         "render": st.tools.render,
         "config_source": config_source_label(),
         "session": json!({

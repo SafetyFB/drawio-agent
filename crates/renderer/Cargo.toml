@@ -18,6 +18,9 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
