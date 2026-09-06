@@ -149,12 +149,31 @@ pub async fn build_app_state(
     config: &ServerConfig,
 ) -> Result<AppState, Box<dyn std::error::Error + Send + Sync>> {
     let llm: Arc<dyn LlmProvider> = match &config.llm_provider {
-        LlmProviderKind::Mock => Arc::new(StubLlm),
+        LlmProviderKind::Mock => {
+            info!(target: "llm", provider = "mock", "using stub LLM");
+            Arc::new(StubLlm)
+        }
         LlmProviderKind::OpenAiCompat {
             base_url,
             api_key,
             model,
         } => {
+            // Log the effective endpoint on every start (key masked) so a
+            // misconfigured provider/model is visible in the first log line
+            // instead of surfacing as cryptic upstream errors later.
+            let masked = if api_key.len() > 8 {
+                format!("{}…{}", &api_key[..4], &api_key[api_key.len() - 4..])
+            } else {
+                "***".to_string()
+            };
+            info!(
+                target: "llm",
+                provider = "openai-compat",
+                %base_url,
+                %model,
+                api_key = %masked,
+                "llm provider configured"
+            );
             let transport: Arc<dyn HttpTransport> = Arc::new(ReqwestHttpTransport);
             Arc::new(OpenAiCompatProvider::new(
                 transport,
