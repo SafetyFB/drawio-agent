@@ -137,7 +137,6 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
     let app_state = AppState { big: state, cancel };
     let app = Router::new()
         .route("/", get(page))
-        .route("/minimal", get(minimal_page))
         .route("/app.css", get(css))
         .route("/app.js", get(js))
         .route("/vendor/viewer-static.min.js", get(viewer_bundle))
@@ -174,57 +173,6 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
 
 async fn page() -> Html<&'static str> {
     Html(include_str!("../web/index.html"))
-}
-
-/// spike 专用：无任何自定义 JS 的极简 mxGraph 页（测试官方拖动）
-async fn minimal_page() -> Html<&'static str> {
-    Html(
-        r#"<!doctype html><html><head><meta charset="utf-8"></head><body style="margin:0">
-<div id="c" style="position:absolute;inset:0;overflow:hidden;background:#eee;"></div>
-<script src="/vendor/viewer-static.min.js"></script>
-<script>
-const xml = '<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="boxA" value="A" vertex="1" parent="1"><mxGeometry x="40" y="40" width="120" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>';
-const doc = mxUtils.parseXml(xml);
-const model = new mxGraphModel();
-const codec = new mxCodec(doc);
-codec.decode(doc.getElementsByTagName('mxGraphModel')[0], model);
-const graph = new mxGraph(document.getElementById('c'), model);
-graph.setEnabled(true);
-graph.setPanning(false);
-graph.setCellsMovable(true);
-graph.setCellsResizable(true);
-graph.setCellsEditable(true);
-window.g = graph;
-</script>
-</body></html>"#,
-    )
-}
-async fn css() -> impl IntoResponse {
-    static_text(include_str!("../web/style.css"), "text/css")
-}
-async fn js() -> impl IntoResponse {
-    static_text(include_str!("../web/app.js"), "text/javascript")
-}
-
-/// The 3.4MB draw.io viewer bundle lives in the renderer crate's assets
-/// (single copy, runtime-read — same approach renderer itself uses).
-async fn viewer_bundle() -> Response {
-    let mut path: Option<PathBuf> = std::env::var("DRAWIO_VIEWER_PATH").ok().map(PathBuf::from);
-    if path.is_none() {
-        let guess = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../renderer/assets/viewer-static.min.js");
-        if guess.exists() {
-            path = Some(guess);
-        }
-    }
-    match path.and_then(|p| std::fs::read(p).ok()) {
-        Some(bytes) => static_bytes(bytes, "text/javascript"),
-        None => (
-            StatusCode::NOT_FOUND,
-            "viewer-static.min.js 未找到（设 DRAWIO_VIEWER_PATH）",
-        )
-            .into_response(),
-    }
 }
 
 fn static_text(s: &'static str, ct: &'static str) -> Response {

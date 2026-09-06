@@ -7,8 +7,7 @@ Generate/Review/Patch 循环、sessions/trajectory —— 全部由
 「文件 + 行区间文本编辑 + @file 式引用」替代。
 
 设计文档：[`docs/harness-refactor.md`](./docs/harness-refactor.md)
-原始愿景：[`initial_draft.md`](./initial_draft.md)（旧 6-crate 实现保留在
-`main` 与 `pre-harness-refactor` tag 上）
+原始愿景：[`initial_draft.md`](./initial_draft.md)（旧 6-crate 实现保留在 `pre-harness-refactor` tag / `archive/pre-harness` 分支上）
 
 ## 概念
 
