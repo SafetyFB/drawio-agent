@@ -603,6 +603,15 @@ impl XmlDoc {
         })
     }
 
+    /// Like [`Self::from_text`] but bound to a real file path, so `save()`
+    /// writes where the caller expects (memory-only docs must never save
+    /// into a stray `(memory)` file).
+    pub fn from_text_at(text: &str, path: impl AsRef<Path>) -> Result<Self, XmlError> {
+        let mut d = Self::from_text(text)?;
+        d.path = path.as_ref().to_path_buf();
+        Ok(d)
+    }
+
     pub fn id_to_cell(&self, id: &str) -> Option<&CellSpan> {
         self.cells.iter().find(|c| c.id == id)
     }

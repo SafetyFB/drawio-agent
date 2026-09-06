@@ -36,8 +36,9 @@ cargo test -p drawio-agent-renderer   # chromium 渲染（复用）
 ## 用法
 
 ```bash
-# 浏览器模式：mxGraph 画布 + 框选 + 聊天（http://127.0.0.1:8787）
-cargo run -p drawio-harness -- web demo.drawio
+# 浏览器是主入口：会话 = 一个 .drawio 文件（默认 ~/.drawio-harness/files）
+cargo run -p drawio-harness -- web            # http://127.0.0.1:8787
+cargo run -p drawio-harness -- web --dir ~/diagrams 4000
 
 # 交互 REPL（无 LLM 也能用：/view /check /xml /sel /undo /save /reload）
 cargo run -p drawio-harness -- demo.drawio
@@ -51,13 +52,14 @@ DRAWIO_LLM_API_KEY=<key> \
   cargo run -p drawio-harness -- demo.drawio "把 svc-b 改成绿色，加一条到 svc-a 的连线"
 ```
 
-对话中可用 `@cell:svc-a` / `@120-156` / `@demo.drawio:10-12` 精确指到文件
-某一部分；`/sel` 把选中引用附加到下一轮。
+Web 端：**每个会话绑定一个 .drawio 文件，创建会话 = 创建文件**（下拉切换、
+＋ 新建会话、🗑 删除）。每个会话有独立的图、多轮记忆、用量/预算与
+`<name>.history.jsonl` 轨迹历史；⚙ 配置模型/上下文/价格/预算，`历史`
+面板展开轨迹、恢复版本、导出/导入会话 JSON；聊天实时流式渲染每轮工具
+调用与 token 花费（发送中可「停止」）。
 
-REPL 常用命令：`/history`（/history N 看轨迹）`/restore N` `/ctx-save x.json`
-`/ctx-load x.json` `/stop`（打断运行中的任务）；web 右上角 ⚙ 配置模型与
-预算，`历史` 面板查看/恢复每次任务的完整轨迹，聊天实时流式渲染每轮
-工具调用与 token 花费。
+REPL（单文件模式）常用命令：`/history` `/restore N` `/ctx-save x.json`
+`/ctx-load x.json` `/sel` `/stop`。
 
 ## 代码布局
 

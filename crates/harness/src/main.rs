@@ -22,8 +22,6 @@ const HELP: &str = r#"drawio-harness REPL 命令：
   /help /quit
 其余输入作为对话消息发给模型（需配置 DRAWIO_LLM_* env）。"#;
 
-const EMPTY_TEMPLATE: &str = r#"<mxfile host="app.diagrams.net" agent="drawio-harness"><diagram id="page-1" name="Page-1"><mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="826"><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel></diagram></mxfile>"#;
-
 fn numbered(text: &str, start: usize) -> String {
     let mut out = String::new();
     for (i, l) in text.lines().enumerate() {
@@ -48,7 +46,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!(
-            "用法:\n  drawio-harness <file> [one-shot 消息…]      本地 REPL\n  drawio-harness new <file>                       创建空图\n  drawio-harness web <file> [port]                浏览器画布 + 框选 + 聊天 (默认 8787)\n  drawio-harness config show|set|clear|path      查看/保存 LLM 配置 (~/.drawio-agent/config.json)"
+            "用法:\n  drawio-harness <file> [one-shot 消息…]      本地 REPL\n  drawio-harness new <file>                       创建空图\n  drawio-harness web [--dir 会话目录] [port]      浏览器入口：会话=文件 (默认 8787)\n  drawio-harness config show|set|clear|path      查看/保存 LLM 配置"
         );
         std::process::exit(2);
     }
@@ -58,21 +56,36 @@ fn main() {
     }
 
     if args[0] == "web" {
-        if args.len() < 2 {
-            eprintln!("用法: drawio-harness web <file> [port]");
-            std::process::exit(2);
+        // drawio-harness web [--dir PATH] [port]
+        let mut dir: Option<PathBuf> = None;
+        let mut port = 8787u16;
+        let mut i = 1;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--dir" | "-d" => {
+                    i += 1;
+                    if let Some(v) = args.get(i) {
+                        dir = Some(PathBuf::from(v));
+                    }
+                }
+                other => {
+                    if let Ok(p) = other.parse::<u16>() {
+                        port = p;
+                    } else {
+                        eprintln!("未知参数: {other}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            i += 1;
         }
-        let path = PathBuf::from(&args[1]);
-        if !path.exists() {
-            eprintln!(
-                "文件不存在: {}。\n  先创建空图: cargo run -p drawio-harness -- new {}",
-                path.display(),
-                path.display()
-            );
-            std::process::exit(2);
-        }
-        let port = args.get(2).and_then(|p| p.parse().ok()).unwrap_or(8787);
-        if let Err(e) = rt.block_on(drawio_harness::web::serve(path, port)) {
+        let dir = dir
+            .or_else(|| std::env::var("DRAWIO_DIR").ok().map(PathBuf::from))
+            .unwrap_or_else(|| {
+                let home = std::env::var_os("HOME").unwrap_or_default();
+                PathBuf::from(home).join(".drawio-harness").join("files")
+            });
+        if let Err(e) = rt.block_on(drawio_harness::web::serve(dir, port)) {
             eprintln!("{e}");
             std::process::exit(1);
         }
@@ -87,7 +100,7 @@ fn main() {
         };
         let path = PathBuf::from(file);
         if !path.exists() {
-            std::fs::write(&path, EMPTY_TEMPLATE).expect("写文件失败");
+            std::fs::write(&path, drawio_harness::EMPTY_TEMPLATE).expect("写文件失败");
             println!("已创建空图 {}", path.display());
         }
         (path, args[2..].to_vec())
@@ -388,14 +401,17 @@ fn main() {
                         let p = history::history_path(&r.doc.path);
                         let recs = history::list(&p, 50);
                         match recs.get(idx) {
-                            Some(rec) => match XmlDoc::from_text(&rec.xml) {
-                                Ok(d) => {
-                                    r.doc = d;
-                                    let _ = r.doc.save();
-                                    println!("已恢复到历史 #{}（{} cells）", idx, r.doc.cells.len());
+                            Some(rec) => {
+                                let p = r.doc.path.clone();
+                                match XmlDoc::from_text_at(&rec.xml, &p) {
+                                    Ok(d) => {
+                                        r.doc = d;
+                                        let _ = r.doc.save();
+                                        println!("已恢复到历史 #{}（{} cells）", idx, r.doc.cells.len());
+                                    }
+                                    Err(e) => eprintln!("恢复失败: {e}"),
                                 }
-                                Err(e) => eprintln!("恢复失败: {e}"),
-                            },
+                            }
                             None => eprintln!("没有第 {idx} 条"),
                         }
                     });
@@ -449,7 +465,8 @@ fn main() {
                                 return;
                             }
                         };
-                        match XmlDoc::from_text(&bundle.xml) {
+                        let p = r.doc.path.clone();
+                        match XmlDoc::from_text_at(&bundle.xml, &p) {
                             Ok(d) => {
                                 r.doc = d;
                                 let _ = r.doc.save();

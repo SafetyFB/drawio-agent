@@ -191,6 +191,82 @@ function setSelection(ids) {
 }
 
 // ---------------------------------------------------------------------------
+// Sessions (会话 = 一个 .drawio 文件)
+// ---------------------------------------------------------------------------
+
+const picker = $('session-picker');
+
+function setPlaceholder(mode) {
+  placeholderEl.hidden = false;
+  $('placeholder-msg').textContent = mode === 'loading' ? '加载中…' : '';
+  $('welcome').hidden = mode !== 'welcome';
+  canvasEl.style.display = mode === 'canvas' ? '' : 'none';
+}
+
+async function loadSessions() {
+  const data = await (await fetch('/api/sessions')).json();
+  picker.innerHTML = '';
+  for (const s of data.sessions || []) {
+    const o = document.createElement('option');
+    o.value = s.name;
+    o.textContent = s.name + (s.current ? '（当前）' : '');
+    o.selected = !!s.current;
+    picker.appendChild(o);
+  }
+  return data;
+}
+
+async function switchSession(name, announce) {
+  if (busy) { log('error', '任务运行中——先停止再切换会话'); return false; }
+  const r = await api('/api/sessions/switch', { name });
+  if (!r.ok) { log('error', '切换失败: ' + (r.error || '')); return false; }
+  await refreshCanvas();
+  const st = await (await fetch('/api/state')).json();
+  $('cells').textContent = st.cells != null ? `${st.cells} 个元素 / ${st.lines} 行` : '–';
+  if (st.session) renderUsage(st.session);
+  $('chatlog').innerHTML = '';
+  if (announce) log('tool-note', `已进入会话（文件）: ${name}`);
+  await loadSessions();
+  await openHistory(false);
+  return true;
+}
+
+async function createSession() {
+  const name = window.prompt('新会话名称（留空自动命名；会话 = 新建 .drawio 文件）', '');
+  if (name === null) return;
+  const r = await api('/api/sessions', { name });
+  if (!r.ok) { log('error', '创建失败: ' + (r.error || '')); return; }
+  await switchSession(r.name, true);
+  log('ok', `✓ 新会话 ${r.name} 已创建（${r.note || ''}）`);
+}
+
+$('session-new').onclick = createSession;
+$('welcome-new').onclick = createSession;
+picker.onchange = () => switchSession(picker.value, true);
+$('session-del').onclick = async () => {
+  const name = picker.value;
+  if (!name) return;
+  if (!window.confirm(`删除会话（文件与历史）？\n${name}\n此操作不可撤销。`)) return;
+  const r = await api('/api/sessions/' + encodeURIComponent(name), {}, 'DELETE');
+  if (!r.ok) { log('error', '删除失败: ' + (r.error || '')); return; }
+  log('tool-note', r.note || '已删除');
+  await refreshSessionView();
+};
+
+// 清空当前会话视图回到列表态
+async function refreshSessionView() {
+  const data = await loadSessions();
+  const list = data.sessions || [];
+  if (list.length) {
+    await switchSession(picker.value || list[0].name, false);
+  } else {
+    $('chatlog').innerHTML = '';
+    setPlaceholder('welcome');
+    $('usage').textContent = '–';
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Data + chat
 // ---------------------------------------------------------------------------
 
@@ -204,7 +280,13 @@ function log(kind, text) {
 
 async function refreshCanvas() {
   const resp = await fetch('/api/file');
+  if (resp.status === 404) {
+    setPlaceholder('welcome');
+    return;
+  }
   const xml = await resp.text();
+  hidePlaceholder();
+  canvasEl.style.display = '';
   loadXmlIntoCanvas(xml);
   setSelection([]);
 }
@@ -234,11 +316,12 @@ async function api(path, body, method) {
 
 async function loadState() {
   const st = await (await fetch('/api/state')).json();
-  $('file').textContent = st.file;
-  $('cells').textContent = `${st.cells} 个元素 / ${st.lines} 行`;
+  const cells = $('cells');
+  if (cells) cells.textContent = st.cells != null ? `${st.cells} 个元素 / ${st.lines} 行` : '–';
   $('llm').textContent = st.llm_ready ? 'LLM ✓' : 'LLM ✗';
   $('llm-banner').hidden = st.llm_ready;
   if (st.session) renderUsage(st.session);
+  return st;
 }
 
 $('check').onclick = async () => {
@@ -303,6 +386,7 @@ $('chatform').onsubmit = async (ev) => {
   if (busy) { await cancelJob(); return; }
   const text = $('input').value.trim();
   if (!text) return;
+  if (!picker.value) { log('error', '先创建一个会话（＋ 新建会话）'); return; }
   busy = true;
   $('send').disabled = false;
   $('send').textContent = '停止';
@@ -358,7 +442,17 @@ $('chatform').onsubmit = async (ev) => {
 
 (async () => {
   await loadState();
-  await refreshCanvas();
+  const data = await loadSessions();
+  const list = data.sessions || [];
+  const cur = list.find((x) => x.current);
+  if (cur) {
+    await refreshCanvas();
+  } else if (list.length) {
+    await switchSession(list[0].name, false);
+  } else {
+    setPlaceholder('welcome');
+    $('usage').textContent = '–';
+  }
   $('input').focus();
 })();
 

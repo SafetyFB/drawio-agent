@@ -133,3 +133,11 @@ select.field, .field select {
 .hist-detail .ev.dim { color: var(--dim); }
 .hist-actions { display: flex; gap: 6px; margin-top: 6px; }
 .hist-actions button { font-size: 12px; padding: 2px 8px; }
+
+#session-picker {
+  background: #242836; color: var(--fg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 4px 8px; font: inherit; max-width: 220px;
+}
+#welcome { text-align: center; color: var(--dim); max-width: 380px; }
+#welcome h3 { color: var(--fg); }
+#welcome button { margin-top: 8px; }
