@@ -168,7 +168,10 @@ impl OpenAiChat {
             model: s.model.clone(),
             api_key: s.api_key.clone(),
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(180))
+                // GLM multimodal turns normally run 5-40s; a hard cap keeps
+                // a black-holed connection from freezing the whole web app
+                // (engine retries after a failure anyway).
+                .timeout(Duration::from_secs(90))
                 .build()
                 .map_err(|e| ChatError::Http(e.to_string()))?,
         })

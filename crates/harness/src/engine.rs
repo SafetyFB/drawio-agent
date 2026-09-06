@@ -126,15 +126,17 @@ impl RunOpts {
 #[derive(Debug)]
 pub struct Harness {
     pub max_turns: usize,
+    /// How many times a failed LLM call is retried before the ask aborts
+    /// (providers 500 occasionally on large multimodal contexts).
+    pub max_llm_retries: u32,
 }
-
-// Transcript is kept in memory for the duration of one ask; a new ask
-// starts fresh (system + user + history rollup can come later — the xml
-// file on disk is already the durable state).
 
 impl Default for Harness {
     fn default() -> Self {
-        Self { max_turns: 10 }
+        Self {
+            max_turns: 10,
+            max_llm_retries: 2,
+        }
     }
 }
 
@@ -320,30 +322,61 @@ impl Harness {
                 ));
             }
 
-            let raw = match chat
-                .complete(&history, &CallOpts { no_think: opts.no_think })
-                .await
-            {
-                Ok(reply) => {
-                    usage.add(&reply.usage);
-                    let cost = usage_cost(
-                        reply.usage.input_tokens,
-                        reply.usage.output_tokens,
-                        &price_opts(opts),
-                    );
-                    spent += cost;
-                    emit!(EngineEvent::Usage {
-                        usage: reply.usage,
-                        cost_yuan: cost,
-                    });
-                    reply.text
+            let call_opts = CallOpts { no_think: opts.no_think };
+            let mut reply = None;
+            let mut last_llm_err = None;
+            for attempt in 0..=self.max_llm_retries {
+                match chat.complete(&history, &call_opts).await {
+                    Ok(r) => {
+                        reply = Some(r);
+                        break;
+                    }
+                    Err(e) if attempt < self.max_llm_retries => {
+                        // Providers 500 occasionally (large multimodal
+                        // contexts); retry before giving up on the whole ask.
+                        last_llm_err = Some(format!(
+                            "第 {turn} 轮 LLM 调用失败（重试 {}/{}）: {e}",
+                            attempt + 1,
+                            self.max_llm_retries
+                        ));
+                        if let Some(m) = &last_llm_err {
+                            eprintln!("{m}");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                    }
+                    Err(e) => {
+                        last_llm_err = Some(format!("第 {turn} 轮 LLM 调用失败: {e}"));
+                        break;
+                    }
                 }
-                Err(e) => {
+            }
+            let reply = match reply {
+                Some(r) => r,
+                None => {
                     stats.add(&usage, spent);
                     remember!();
-                    return Err(format!("LLM 调用失败（第 {turn} 轮）: {e}"));
+                    let done = if tool_calls > 0 {
+                        format!(
+                            "；注意：此前 {tool_calls} 次工具改动已应用并保存到文件，可继续对话或 /history 回看"
+                        )
+                    } else {
+                        String::new()
+                    };
+                    return Err(format!(
+                        "{}（已重试 {} 次）{done}",
+                        last_llm_err.unwrap_or_default(),
+                        self.max_llm_retries
+                    ));
                 }
             };
+            let crate::chat::Reply { text: raw, usage: ru } = reply;
+            usage.add(&ru);
+            let cost = usage_cost(ru.input_tokens, ru.output_tokens, &price_opts(opts));
+            spent += cost;
+            emit!(EngineEvent::Usage {
+                usage: ru,
+                cost_yuan: cost,
+            });
             let env = match parse_envelope(&raw) {
                 Ok(v) => v,
                 Err(e) => {
@@ -675,6 +708,59 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("context_length"), "{err}");
         assert!(fake.snapshots.is_empty(), "超限时不应发起调用");
+    }
+
+    /// Fails the first N calls with a provider-style 500, then succeeds.
+    struct FlakyChat {
+        failures_left: u32,
+        calls: u32,
+    }
+
+    #[async_trait::async_trait]
+    impl Chat for FlakyChat {
+        async fn complete(
+            &mut self,
+            _m: &[Message],
+            _o: &CallOpts,
+        ) -> Result<crate::chat::Reply, crate::chat::ChatError> {
+            self.calls += 1;
+            if self.failures_left > 0 {
+                self.failures_left -= 1;
+                Err(crate::chat::ChatError::Api("HTTP 500 Internal Server Error".into()))
+            } else {
+                Ok(crate::chat::Reply {
+                    text: r#"{"reply":"ok","done":true}"#.into(),
+                    usage: Usage::default(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_llm_500_is_retried_and_ask_survives() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        let mut chat = FlakyChat { failures_left: 1, calls: 0 };
+        let outcome = Harness::default()
+            .run(&mut chat, &mut tools, &mut doc, "hi", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.reply, "ok");
+        assert_eq!(chat.calls, 2, "一次失败 + 一次成功");
+    }
+
+    #[tokio::test]
+    async fn llm_retries_exhausted_reports_and_keeps_partial_work() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        let mut chat = FlakyChat { failures_left: 99, calls: 0 };
+        let h = Harness { max_llm_retries: 1, ..Default::default() };
+        let err = h
+            .run(&mut chat, &mut tools, &mut doc, "hi", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("已重试 1 次"), "{err}");
+        assert_eq!(chat.calls, 2, "初始调用 + 1 次重试后放弃");
     }
 
     #[tokio::test]

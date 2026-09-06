@@ -77,6 +77,8 @@ pub struct WebState {
     pub tools: Tools,
     /// ¥ session budget from the config at the last ask (per-session cap).
     pub budget_yuan: Option<f64>,
+    /// One engine job at a time (single user; extra asks fail fast).
+    pub running_job: bool,
 }
 
 impl WebState {
@@ -96,6 +98,7 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
         chat,
         tools: Tools::new(true),
         budget_yuan: None,
+        running_job: false,
     }));
 
     let jobs = Arc::new(JobControl::default());
@@ -261,6 +264,9 @@ async fn api_chat(
     Json(req): Json<ChatReq>,
 ) -> Json<serde_json::Value> {
     let mut st = st.lock().await;
+    if st.running_job {
+        return Json(json!({ "reply": null, "error": "另一个任务正在运行中——先点「停止」或等它完成" }));
+    }
     if st.chat.is_none() {
         return Json(json!({
             "reply": null,
@@ -547,13 +553,25 @@ async fn api_chat_stream(
     State(jobs): State<Arc<JobControl>>,
     Json(req): Json<ChatReq>,
 ) -> Response {
-    let configured = { st.lock().await.chat.is_some() };
-    if !configured {
-        return Json(json!({
-            "type": "error",
-            "error": "LLM 未配置：点右上角 ⚙ 填写并保存"
-        }))
-        .into_response();
+    // One job at a time: fail fast instead of queueing behind the lock
+    // (the UI guards too; this covers second tabs / curl).
+    {
+        let mut st = st.lock().await;
+        if st.running_job {
+            return Json(json!({
+                "type": "error",
+                "error": "另一个任务正在运行中——先点「停止」或等它完成"
+            }))
+            .into_response();
+        }
+        if st.chat.is_none() {
+            return Json(json!({
+                "type": "error",
+                "error": "LLM 未配置：点右上角 ⚙ 填写并保存"
+            }))
+            .into_response();
+        }
+        st.running_job = true;
     }
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
@@ -637,12 +655,17 @@ async fn api_chat_stream(
                     .await;
             }
         }
-        // Clear this job's abort handle (best effort).
+        // Clear this job's abort handle, then release the big lock and
+        // mark the slot free (drop(st) first: we still hold it here).
+        drop(st);
         let mut cur = jobs2.current.lock().await;
         if let Some((id, _)) = cur.as_ref() {
             if *id == job_id {
                 *cur = None;
             }
+        }
+        if let Ok(mut st) = st2.try_lock() {
+            st.running_job = false;
         }
     });
 
@@ -657,13 +680,18 @@ async fn api_chat_stream(
 }
 
 async fn api_chat_cancel(
+    State(st): State<Arc<Mutex<WebState>>>,
     State(jobs): State<Arc<JobControl>>,
 ) -> Json<serde_json::Value> {
     let mut cur = jobs.current.lock().await;
     match cur.take() {
         Some((id, handle)) => {
             handle.abort();
-            Json(json!({ "ok": true, "job": id, "note": "已发送停止信号" }))
+            // The aborted task drops the big lock at its next await; once we
+            // can take it, mark the job slot free.
+            drop(cur);
+            st.lock().await.running_job = false;
+            Json(json!({ "ok": true, "job": id, "note": "已停止" }))
         }
         None => Json(json!({ "ok": false, "error": "当前没有运行中的任务" })),
     }

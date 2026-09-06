@@ -16,6 +16,15 @@ let rubberBand = null;
 let rubberBandEl = null;
 let busy = false;
 
+/// 任务运行中时，其它需要大锁的按钮直接提示，避免请求挂起等待。
+function guardBusy() {
+  if (busy) {
+    log('error', '任务运行中——先点「停止」再操作');
+    return true;
+  }
+  return false;
+}
+
 const $ = (id) => document.getElementById(id);
 
 // ---------------------------------------------------------------------------
@@ -232,6 +241,7 @@ async function switchSession(name, announce) {
 }
 
 async function createSession() {
+  if (guardBusy()) return;
   const name = window.prompt('新会话名称（留空自动命名；会话 = 新建 .drawio 文件）', '');
   if (name === null) return;
   const r = await api('/api/sessions', { name });
@@ -244,6 +254,7 @@ $('session-new').onclick = createSession;
 $('welcome-new').onclick = createSession;
 picker.onchange = () => switchSession(picker.value, true);
 $('session-del').onclick = async () => {
+  if (guardBusy()) return;
   const name = picker.value;
   if (!name) return;
   if (!window.confirm(`删除会话（文件与历史）？\n${name}\n此操作不可撤销。`)) return;
@@ -278,7 +289,25 @@ function log(kind, text) {
   $('chatlog').scrollTop = $('chatlog').scrollHeight;
 }
 
-async function refreshCanvas() {
+let lastView = null;
+function rememberView() {
+  if (!currentGraph) return;
+  const v = currentGraph.view;
+  lastView = { x: v.translate.x, y: v.translate.y, s: v.scale };
+}
+function restoreView() {
+  if (lastView && currentGraph) {
+    const v = currentGraph.view;
+    v.translate.x = lastView.x;
+    v.translate.y = lastView.y;
+    v.scale = lastView.s;
+    currentGraph.refresh();
+  }
+  lastView = null;
+}
+
+async function refreshCanvas(keepView) {
+  if (keepView) rememberView();
   const resp = await fetch('/api/file');
   if (resp.status === 404) {
     setPlaceholder('welcome');
@@ -288,6 +317,7 @@ async function refreshCanvas() {
   hidePlaceholder();
   canvasEl.style.display = '';
   loadXmlIntoCanvas(xml);
+  if (keepView) restoreView();
   setSelection([]);
 }
 
@@ -324,19 +354,19 @@ async function loadState() {
   return st;
 }
 
-$('check').onclick = async () => {
+$('check').onclick = async () => { if (guardBusy()) return;
   const r = await api('/api/check');
   if (r.ok) log('ok', `✓ 检查通过（cells=${r.cells} edges=${r.edges}）`);
   else {
     log('error', '✗ 检查发现 ' + (r.issues || []).length + ' 个问题：\n' + (r.issues || []).join('\n'));
   }
 };
-$('undo').onclick = async () => {
+$('undo').onclick = async () => { if (guardBusy()) return;
   const r = await api('/api/undo');
   if (r.ok) { log('tool-note', '↩ 已撤销，画布已回滚'); await refreshCanvas(); }
   else log('error', '撤销失败：' + (r.error || ''));
 };
-$('reload').onclick = async () => {
+$('reload').onclick = async () => { if (guardBusy()) return;
   const r = await api('/api/reload');
   log('tool-note', `已从磁盘重新加载（${r.cells || 0} 个元素）`);
   await refreshCanvas();
@@ -358,9 +388,14 @@ async function handleStreamEvent(ev) {
     case 'tool':
       log('tool-note', `→ ${ev.name} ${ev.args || ''}`);
       break;
-    case 'tool_result':
+    case 'tool_result': {
       log('tool-note', `↳ ${ev.name}: ${ev.preview || ''}${ev.has_image ? ' 📷' : ''}`);
+      // 动态更新画布：改动类工具落盘后立即重绘，而不是等整轮结束
+      if (ev.name === 'edit' || ev.name === 'draw' || ev.name === 'undo') {
+        await refreshCanvas(true);
+      }
       break;
+    }
     case 'usage': {
       const c = ev.cost_yuan > 0 ? ' · ' + fmtCost(ev.cost_yuan) : '';
       log('tool-note', `  本轮用量 ${ev.in} in / ${ev.out} out tokens${c}`);
@@ -627,6 +662,7 @@ const histLog = $('histlog');
 let histOpen = false;
 
 async function openHistory(force) {
+  if (busy && typeof force !== 'boolean') { log('error', '任务运行中——先点「停止」再查看历史'); return; }
   if (typeof force === 'boolean') histOpen = force;
   else histOpen = !histOpen;
   histLog.hidden = !histOpen;
@@ -723,7 +759,7 @@ async function openHistory(force) {
 }
 $('hist-btn').onclick = openHistory;
 
-$('ctx-import-btn').onclick = () => $('ctx-file').click();
+$('ctx-import-btn').onclick = () => { if (guardBusy()) return; $('ctx-file').click(); };
 $('ctx-file').onchange = async () => {
   const file = $('ctx-file').files[0];
   if (!file) return;
