@@ -82,6 +82,14 @@ function loadXmlIntoCanvas(xml) {
     graph.container.style.touchAction = 'none';
     patchGraphForBundle(graph);
     currentGraph = graph;
+    // 缩放标签跟随 scale（常驻）
+    const origSat = graph.view.scaleAndTranslate.bind(graph.view);
+    graph.view.scaleAndTranslate = function (a, b, c) {
+      origSat(a, b, c);
+      const el = document.getElementById('mode-zoom-100');
+      if (el) el.textContent = Math.round(a * 100) + '%';
+      if (window.__overlayPaint) window.__overlayPaint();
+    };
     applyMode();
 
     graph.getSelectionModel().addListener(window.mxEvent.SELECTION_CHANGED, () => {
@@ -97,10 +105,21 @@ function loadXmlIntoCanvas(xml) {
     graph.setCellsResizable(true);
     graph.setCellsEditable(false); // fork 编辑器焦点/提交不可靠，自实现
     graph.setConnectable(false);
-    const b = graph.getGraphBounds();
-    graph.view.translate.x = 24 - b.x;
-    graph.view.translate.y = 24 - b.y;
-    graph.refresh();
+    // 初始 fit：模型几何计算，与 scale 无关
+    {
+      const model = graph.getModel();
+      let x0 = Infinity, y0 = Infinity;
+      const walk = (c) => {
+        if (c.geometry && !model.isEdge(c)) {
+          x0 = Math.min(x0, c.geometry.x);
+          y0 = Math.min(y0, c.geometry.y);
+        }
+        for (let i = 0; i < model.getChildCount(c); i++) walk(model.getChildAt(c, i));
+      };
+      walk(model.getRoot());
+      if (x0 === Infinity) { x0 = 0; y0 = 0; }
+      graph.view.scaleAndTranslate(1, 24 - x0, 24 - y0);
+    }
     hidePlaceholder();
   } catch (err) {
     showPlaceholder('mxGraph 渲染失败: ' + (err && err.message ? err.message : err));
@@ -142,10 +161,27 @@ $('mode-zoom-out').onclick = () => {
   const rect = currentGraph.container.getBoundingClientRect();
   zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, 1 / 1.2);
 };
+/// 复位视图：基于模型几何计算 fit（fork 的 getGraphBounds 与 scale 相关，
+/// 从非 1 倍率复位会得到错误 translate，图被摆到画布外）
+function fitView() {
+  const model = currentGraph.getModel();
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const walk = (c) => {
+    if (c.geometry && !model.isEdge(c)) {
+      x0 = Math.min(x0, c.geometry.x);
+      y0 = Math.min(y0, c.geometry.y);
+      x1 = Math.max(x1, c.geometry.x + (c.geometry.width || 0));
+      y1 = Math.max(y1, c.geometry.y + (c.geometry.height || 0));
+    }
+    for (let i = 0; i < model.getChildCount(c); i++) walk(model.getChildAt(c, i));
+  };
+  walk(model.getRoot());
+  if (x0 === Infinity) { x0 = 0; y0 = 0; x1 = 0; y1 = 0; }
+  currentGraph.view.scaleAndTranslate(1, 24 - x0, 24 - y0);
+}
 $('mode-zoom-100').onclick = () => {
   if (!currentGraph) return;
-  const b = currentGraph.getGraphBounds();
-  currentGraph.view.scaleAndTranslate(1, 24 - b.x, 24 - b.y);
+  fitView();
 };
 
 /// 点内 bbox 命中检测：bundle 的 getCellAt 会漏掉白填充 cell 与嵌套组。
@@ -180,10 +216,11 @@ function getCellAtBbox(graph, x, y) {
 /// x≈340 的图在加载时 translate≈-316，直接偏出 300+px）。
 function clientToGraph(clientX, clientY) {
   const rect = currentGraph.container.getBoundingClientRect();
-  const v = currentGraph.view;
+  // 本 fork 的 state = (模型 + translate) × scale = 容器像素，
+  // getCellAt/hitTest 都在这个空间比较——client 减容器原点即可，不除 scale。
   return {
-    x: (clientX - rect.left) / v.scale,
-    y: (clientY - rect.top) / v.scale,
+    x: clientX - rect.left,
+    y: clientY - rect.top,
   };
 }
 
@@ -855,13 +892,8 @@ function setupDebugHud() {
   };
   paintStateOverlay();
   // 平移/重绘后刷新叠加层
-  const origScaleAndTranslate = currentGraph ? currentGraph.view.scaleAndTranslate.bind(currentGraph.view) : null;
-  if (origScaleAndTranslate) {
-    currentGraph.view.scaleAndTranslate = function (a, b, c) {
-      origScaleAndTranslate(a, b, c);
-      paintStateOverlay();
-    };
-  }
+  window.__overlayPaint = paintStateOverlay;
+
   const origLoad = window.loadXmlIntoCanvas;
   window.loadXmlIntoCanvas = function (xml) {
     origLoad(xml);
