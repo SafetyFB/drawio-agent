@@ -1440,29 +1440,6 @@ function logMsg(kind, text) {
   $('chatlog').appendChild(div);
 }
 
-$('ctx-import-btn').onclick = () => { if (guardBusy()) return; $('ctx-file').click(); };
-$('ctx-file').onchange = async () => {
-  const file = $('ctx-file').files[0];
-  if (!file) return;
-  log('tool-note', `导入会话 ${file.name} …`);
-  try {
-    const resp = await fetch('/api/context/load', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: await file.text(),
-    });
-    const r = await resp.json();
-    if (r.ok) {
-      log('ok', `✓ 会话已加载：${r.cells} 个元素，${r.memory_messages} 条记忆消息`);
-      await refreshCanvas();
-      const st = await (await fetch('/api/state')).json();
-      $('cells').textContent = `${st.cells} 个元素 / ${st.lines} 行`;
-      if (st.session) renderUsage(st.session);
-    } else log('error', '导入失败: ' + (r.error || ''));
-  } catch (e) { log('error', '导入失败: ' + e); }
-  $('ctx-file').value = '';
-};
-
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',

@@ -154,7 +154,6 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
         .route("/api/chat/cancel", post(api_chat_cancel))
         .route("/api/history", get(api_history_list))
         .route("/api/history/:idx", get(api_history_detail))
-        .route("/api/context/load", post(api_context_load))
         .route("/api/manual", post(api_manual))
         .route("/api/export/png", get(api_export_png))
         .with_state(app_state);
@@ -809,45 +808,6 @@ async fn api_history_detail(
         None => Json(json!({ "ok": false, "error": format!("没有第 {idx} 条历史记录") })),
     }
 }
-
-/// Import a SessionBundle (whole-context save/load): replaces the doc with
-/// the bundle's xml and replays its transcript into the rolling memory.
-async fn api_context_load(
-    State(st): State<Arc<Mutex<WebState>>>,
-    body: axum::body::Bytes,
-) -> Json<serde_json::Value> {
-    let bundle: Result<history::SessionBundle, _> = serde_json::from_slice(&body);
-    let bundle = match bundle {
-        Ok(b) => b,
-        Err(e) => {
-            return Json(json!({ "ok": false, "error": format!("不是有效的会话 JSON: {e}") }));
-        }
-    };
-    let mut st = st.lock().await;
-    let Some(cur) = st.current.clone() else { return current_err() };
-    let Some(ss) = st.sessions.get_mut(&cur) else { return busy_err() };
-    let save_path = ss.doc.path.clone();
-    let doc = match XmlDoc::from_text_at(&bundle.xml, &save_path) {
-        Ok(d) => d,
-        Err(e) => return Json(json!({ "ok": false, "error": format!("会话里的 xml 无法加载: {e}") })),
-    };
-    ss.doc = doc;
-    let _ = ss.doc.save();
-    ss.stats.transcript = history::SessionBundle::strip_images(&bundle.messages);
-    ss.stats.usage = crate::chat::Usage {
-        input_tokens: bundle.usage_in,
-        output_tokens: bundle.usage_out,
-    };
-    ss.stats.cost_yuan = bundle.cost_yuan;
-    let _ = history::save_session_state(&ss.doc.path, &ss.stats);
-    Json(json!({
-        "ok": true,
-        "cells": ss.doc.cells.len(),
-        "memory_messages": ss.stats.transcript.len(),
-        "note": "已导入到当前会话：文档与多轮记忆均已恢复",
-    }))
-}
-
 
 // ---------------------------------------------------------------------------
 // Sessions: 会话 = 一个 .drawio 文件（创建会话 = 创建文件）
