@@ -146,6 +146,7 @@ fn config(prompt: &str, initial_xml: Option<&str>, max_iterations: u32) -> Agent
         max_iterations,
         patch_cell_ids: vec![],
         review_checks: vec![],
+        no_think: false,
         memory: vec![],
         progress_cb: None,
     }

@@ -50,6 +50,10 @@ pub struct AgentLoop {
     /// Optional reviewer focus checks, forwarded to every fix round.
     /// Default: empty (the model decides what to look for).
     pub review_checks: Vec<String>,
+    /// Fast path: every LLM call in the loop asks the provider to disable
+    /// internal reasoning (`thinking: disabled`). Deep mode leaves it false
+    /// so the model can reason about its edits.
+    pub no_think: bool,
     /// Session memory (R2): summaries of earlier turns, injected into every
     /// fix round as background context so follow-up runs remember what the
     /// user already asked and what was already done. Kept stable across
@@ -84,6 +88,7 @@ impl AgentLoop {
             max_iterations: 5,
             patch_cell_ids: Vec::new(),
             review_checks: Vec::new(),
+            no_think: false,
             memory: Vec::new(),
             progress_cb: None,
         }

@@ -228,6 +228,7 @@ async fn patch_extracts_subgraph_and_calls_llm_with_scope() {
         &sid,
         PatchReq {
             cell_ids: vec!["2".into()],
+            no_think: false,
             instruction: "rename to Modified".into(),
             json_mode: false,
         },
@@ -259,6 +260,7 @@ async fn patch_returns_404_for_unknown_session() {
         "no-such",
         PatchReq {
             cell_ids: vec!["2".into()],
+            no_think: false,
             instruction: "x".into(),
             json_mode: false,
         },
@@ -300,6 +302,7 @@ async fn patch_returns_400_when_session_has_no_current_xml() {
         &sid,
         PatchReq {
             cell_ids: vec!["2".into()],
+            no_think: false,
             instruction: "x".into(),
             json_mode: false,
         },
@@ -321,6 +324,7 @@ async fn patch_returns_502_when_llm_errors() {
         &sid,
         PatchReq {
             cell_ids: vec!["2".into()],
+            no_think: false,
             instruction: "x".into(),
             json_mode: false,
         },
@@ -340,6 +344,7 @@ async fn patch_preserves_unrelated_cells() {
         &sid,
         PatchReq {
             cell_ids: vec!["2".into()],
+            no_think: false,
             instruction: "x".into(),
             json_mode: false,
         },
@@ -384,6 +389,7 @@ async fn patch_appends_new_version_with_kind_patch() {
         &sid,
         PatchReq {
             cell_ids: vec!["2".into()],
+            no_think: false,
             instruction: "x".into(),
             json_mode: false,
         },
@@ -422,6 +428,7 @@ async fn patch_propagates_multiple_cell_ids_to_scope() {
         &sid,
         PatchReq {
             cell_ids: vec!["2".into(), "3".into()],
+            no_think: false,
             instruction: "color both".into(),
             json_mode: false,
         },

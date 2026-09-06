@@ -191,6 +191,7 @@ async fn generate(
         scope: None,
         feedback: None,
         json_mode: req.json_mode,
+        no_think: req.no_think,
         memory,
     };
 
@@ -402,6 +403,7 @@ async fn patch(
         scope: Some(scope_xml),
         feedback: None,
         json_mode: req.json_mode,
+        no_think: req.no_think,
         memory,
     };
 
@@ -772,6 +774,7 @@ async fn run_agent_loop(
         max_iterations: req.max_iterations,
         patch_cell_ids: req.patch_cell_ids,
         review_checks: req.review_checks,
+        no_think: req.no_think,
         memory,
         progress_cb: Some(std::sync::Arc::new(move |evt| {
             let _ = tx.send(evt);
@@ -1005,7 +1008,7 @@ async fn test_llm_config(
         "max_tokens": 5,
     });
     let started = Instant::now();
-    let transport = crate::run::ReqwestHttpTransport;
+    let transport = crate::run::ReqwestHttpTransport::with_timeout(30_000);
     match transport
         .post_json(
             &url,

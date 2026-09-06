@@ -30,6 +30,8 @@ pub struct FixRequest {
     /// Session memory (R2): summaries of earlier turns, rendered as stable
     /// background context for this round.
     pub memory: Vec<String>,
+    /// Fast path: ask the provider to skip its internal reasoning pass.
+    pub no_think: bool,
 }
 
 /// Result of one fix round, already merged/validated by the deps impl so

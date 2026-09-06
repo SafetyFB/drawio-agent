@@ -325,8 +325,33 @@ impl LlmProvider for StubLlm {
 
 /// Thin [`HttpTransport`] wrapper around reqwest for the OpenAI-compat
 /// provider when `DRAWIO_AGENT_LLM_PROVIDER=openai_compat`.
+///
+/// The underlying client carries a TOTAL request timeout (connect + headers +
+/// body). Without it a stalled gateway leaves the run spinning forever —
+/// real-model runs have shown hangs of 10+ minutes with no response at all.
 #[derive(Debug)]
-pub struct ReqwestHttpTransport;
+pub struct ReqwestHttpTransport {
+    client: reqwest::Client,
+}
+
+impl ReqwestHttpTransport {
+    /// `request_timeout_ms` bounds the whole LLM call (the configured
+    /// provider may legitimately need 60-120s: reasoning + long XML out).
+    pub fn with_timeout(request_timeout_ms: u64) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_millis(request_timeout_ms))
+            .build()
+            .expect("reqwest client build");
+        Self { client }
+    }
+}
+
+impl Default for ReqwestHttpTransport {
+    fn default() -> Self {
+        Self::with_timeout(180_000)
+    }
+}
 
 #[async_trait::async_trait]
 impl HttpTransport for ReqwestHttpTransport {
@@ -337,14 +362,19 @@ impl HttpTransport for ReqwestHttpTransport {
         body: &serde_json::Value,
     ) -> Result<drawio_agent_llm_client::HttpResponse, drawio_agent_llm_client::TransportError>
     {
-        let mut req = reqwest::Client::new()
-            .post(url)
-            .json(body);
+        let mut req = self.client.post(url).json(body);
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
         let resp = req.send().await.map_err(|e| {
-            drawio_agent_llm_client::TransportError::Network(e.to_string())
+            let note = if e.is_timeout() {
+                " (timed out after the configured request budget — the provider or "
+                    .to_string()
+                    + "gateway may be stalled; check the model endpoint or retry)"
+            } else {
+                String::new()
+            };
+            drawio_agent_llm_client::TransportError::Network(format!("{e}{note}"))
         })?;
         let status = resp.status().as_u16();
         let body: serde_json::Value = resp.json().await.map_err(|e| {

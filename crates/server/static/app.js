@@ -886,7 +886,9 @@
     updateRefineHint();
 
     try {
-      const body = { prompt };
+      // Fast = no internal model reasoning (thinking disabled): the model
+      // skips its deliberation pass (~4x faster on GLM 4.6); 深度 keeps it.
+      const body = { prompt, no_think: currentDepth === 'fast' };
       if (route.endpoint === '/agent-loop') {
         body.max_iterations = maxIter;
         if (currentXml && currentXml.trim()) body.initial_xml = currentXml;

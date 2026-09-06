@@ -181,6 +181,7 @@ async fn patch_sends_subgraph_scope_not_full_xml() {
                         cell_ids: vec!["2".into()],
                         instruction: "make it red".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -233,6 +234,7 @@ async fn patch_still_applies_subgraph_back() {
                         cell_ids: vec!["2".into()],
                         instruction: "make it red".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))

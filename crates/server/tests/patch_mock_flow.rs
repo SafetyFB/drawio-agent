@@ -79,7 +79,8 @@ async fn mock_patch_returns_valid_xml_not_an_error() {
                 .body(Body::from(
                     serde_json::to_vec(&drawio_agent_server::PatchRequest {
                         cell_ids: vec!["2".into()],
-                        instruction: "make it bigger".into(),
+                        no_think: false,
+            instruction: "make it bigger".into(),
                         json_mode: false,
                     })
                     .unwrap(),

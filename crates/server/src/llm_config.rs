@@ -129,21 +129,31 @@ pub fn build_provider(settings: &LlmSettings) -> Arc<dyn LlmProvider> {
     match settings.kind {
         LlmKind::Unconfigured => Arc::new(UnconfiguredLlm),
         LlmKind::Mock => Arc::new(StubLlm),
-        LlmKind::OpenAiCompat => {
-            let transport: Arc<dyn drawio_agent_llm_client::HttpTransport> =
-                Arc::new(crate::run::ReqwestHttpTransport);
-            Arc::new(OpenAiCompatProvider::new(
-                transport,
-                ProviderConfig {
-                    base_url: settings.base_url.trim_end_matches('/').to_string(),
-                    api_key: settings.api_key.clone(),
-                    model: settings.model.clone(),
-                    request_timeout_ms: 60_000,
-                    max_retries: 0,
-                },
-            ))
-        }
+        LlmKind::OpenAiCompat => build_openai_provider(settings, None)
     }
+}
+
+/// Shared openai-compat construction (startup, UI hot-swap, connection
+/// test). `timeout_ms`: request budget for a whole LLM call; GLM reasoning
+/// plus a full diagram can legitimately take 60-120s, but a stalled gateway
+/// must fail loudly instead of hanging the run forever.
+pub fn build_openai_provider(
+    settings: &LlmSettings,
+    timeout_ms: Option<u64>,
+) -> Arc<dyn LlmProvider> {
+    let request_timeout_ms = timeout_ms.unwrap_or(150_000);
+    let transport: Arc<dyn drawio_agent_llm_client::HttpTransport> =
+        Arc::new(crate::run::ReqwestHttpTransport::with_timeout(request_timeout_ms));
+    Arc::new(OpenAiCompatProvider::new(
+        transport,
+        ProviderConfig {
+            base_url: settings.base_url.trim_end_matches('/').to_string(),
+            api_key: settings.api_key.clone(),
+            model: settings.model.clone(),
+            request_timeout_ms,
+            max_retries: 0,
+        },
+    ))
 }
 
 /// Config file shape on disk.

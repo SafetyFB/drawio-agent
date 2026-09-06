@@ -88,6 +88,7 @@ pub async fn run<D: AgentDeps + ?Sized>(
                     scope: None,
                     feedback: None,
                     json_mode: false,
+                    no_think: config.no_think,
                     memory: config.memory.clone(),
                 })
                 .await
@@ -200,6 +201,7 @@ pub async fn run<D: AgentDeps + ?Sized>(
             cell_ids: scope_cells,
             prior_issues: pending_issues.clone(),
             checks: config.review_checks.clone(),
+            no_think: config.no_think,
             memory: config.memory.clone(),
         };
         match deps.fix(&fix_req).await {

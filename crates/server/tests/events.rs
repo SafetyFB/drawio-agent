@@ -298,6 +298,7 @@ async fn generate_emits_version_created_after_success() {
                     serde_json::to_vec(&GenReq {
                         prompt: "x".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -345,6 +346,7 @@ async fn generate_emits_error_on_llm_failure() {
                     serde_json::to_vec(&GenReq {
                         prompt: "x".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -395,6 +397,7 @@ async fn patch_emits_version_created_after_success() {
                         cell_ids: vec!["2".into()],
                         instruction: "x".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -550,6 +553,7 @@ async fn trajectory_events_streamed_on_ws_after_generate() {
                     serde_json::to_vec(&GenReq {
                         prompt: "x".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -604,6 +608,7 @@ async fn trajectory_events_streamed_on_ws_after_patch() {
                         cell_ids: vec!["2".into()],
                         instruction: "x".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))

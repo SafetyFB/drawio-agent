@@ -216,6 +216,7 @@ async fn generate_records_llm_started_and_completed() {
                     serde_json::to_vec(&GenReq {
                         prompt: "draw a box".into(),
                         json_mode: true,
+                        no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -266,6 +267,7 @@ async fn generate_records_error_event_on_llm_failure() {
                     serde_json::to_vec(&GenReq {
                         prompt: "x".into(),
                         json_mode: false,
+                        no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -307,6 +309,7 @@ async fn patch_records_llm_started_and_completed() {
                         cell_ids: vec!["2".into()],
                         instruction: "recolor".into(),
                         json_mode: false,
+                        no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -486,6 +489,7 @@ async fn trajectory_endpoint_at_is_i64_milliseconds_for_js() {
                     serde_json::to_vec(&GenReq {
                         prompt: "draw".into(),
                         json_mode: false,
+                        no_think: false,
                     })
                     .unwrap(),
                 ))

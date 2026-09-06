@@ -97,6 +97,7 @@ impl AgentDeps for ServerAgentDeps {
                 scope_xml: scope_xml.clone(),
                 issues: prior_issues,
                 checks: req.checks.clone(),
+                no_think: req.no_think,
                 image_png: if text_only { Vec::new() } else { req.image_png.clone() },
                 memory: req.memory.clone(),
             })
@@ -121,6 +122,7 @@ impl AgentDeps for ServerAgentDeps {
                         scope_xml,
                         issues: req.prior_issues.clone(),
                         checks: req.checks.clone(),
+                        no_think: req.no_think,
                         image_png: Vec::new(), // text-only fallback
                         memory: req.memory.clone(),
                     })

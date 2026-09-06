@@ -144,6 +144,10 @@ pub struct GenerateRequest {
     pub prompt: String,
     #[serde(default)]
     pub json_mode: bool,
+    /// Fast path: ask the model to skip its internal reasoning
+    /// (`thinking: disabled` on providers that support it).
+    #[serde(default)]
+    pub no_think: bool,
 }
 
 /// Response body for `POST /api/sessions/:id/generate`.
@@ -160,6 +164,8 @@ pub struct PatchRequest {
     pub instruction: String,
     #[serde(default)]
     pub json_mode: bool,
+    #[serde(default)]
+    pub no_think: bool,
 }
 
 /// Response body for `POST /api/sessions/:id/patch`.
@@ -208,6 +214,9 @@ pub struct AgentLoopRequest {
     /// Optional reviewer checks.
     #[serde(default)]
     pub review_checks: Vec<String>,
+    /// Fast path: every LLM call in the loop skips model reasoning.
+    #[serde(default)]
+    pub no_think: bool,
 }
 
 fn default_max_iterations() -> u32 {

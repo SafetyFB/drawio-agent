@@ -160,6 +160,7 @@ async fn generate_calls_llm_and_returns_versioned_xml() {
                     serde_json::to_vec(&GenReq {
                         prompt: "draw a box".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -197,6 +198,7 @@ async fn generate_xml_becomes_current_session_xml() {
                     serde_json::to_vec(&GenReq {
                         prompt: "x".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -239,6 +241,7 @@ async fn generate_appends_to_version_history() {
                     serde_json::to_vec(&GenReq {
                         prompt: "first".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -256,6 +259,7 @@ async fn generate_appends_to_version_history() {
                     serde_json::to_vec(&GenReq {
                         prompt: "second".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -299,6 +303,7 @@ async fn generate_passes_json_mode_to_llm() {
                     serde_json::to_vec(&GenReq {
                         prompt: "structured".into(),
                         json_mode: true,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -325,6 +330,7 @@ async fn generate_returns_404_for_unknown_session() {
                     serde_json::to_vec(&GenReq {
                         prompt: "x".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -353,6 +359,7 @@ async fn generate_returns_502_when_llm_errors() {
                     serde_json::to_vec(&GenReq {
                         prompt: "x".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -381,6 +388,7 @@ async fn generate_records_summary_in_version_history() {
                     serde_json::to_vec(&GenReq {
                         prompt: "a long prompt that should be truncated because it exceeds eighty chars".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -434,6 +442,7 @@ async fn generate_trajectory_carries_real_duration_and_finish_reason() {
                     serde_json::to_vec(&GenReq {
                         prompt: "draw".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))

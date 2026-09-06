@@ -45,6 +45,11 @@ pub struct GenerateRequest {
     pub json_mode: bool,
     /// Session memory (R2): summaries of earlier turns rendered as context.
     pub memory: Vec<String>,
+    /// Fast path: request the provider to disable its internal reasoning
+    /// (`thinking: {"type": "disabled"}`, GLM 4.6+). Measured ~4x faster
+    /// for diagram generation; deep mode leaves it off so the model can
+    /// reason about edits.
+    pub no_think: bool,
 }
 
 /// A single issue found during visual review.
@@ -98,6 +103,8 @@ pub struct FixRequest {
     pub image_png: Vec<u8>,
     /// Session memory (R2): summaries of earlier turns rendered as context.
     pub memory: Vec<String>,
+    /// Fast path: disable internal model reasoning (see [`GenerateRequest::no_think`]).
+    pub no_think: bool,
 }
 
 /// Parsed JSON envelope returned by the fix step:
@@ -335,6 +342,9 @@ impl LlmProvider for OpenAiCompatProvider {
         if req.json_mode {
             body["response_format"] = json!({"type": "json_object"});
         }
+        if req.no_think {
+            disable_thinking(&mut body);
+        }
         let raw = self.post(&body).await?;
         // Measure provider-side wall-clock time so the trajectory reflects
         // the actual LLM call latency regardless of who records it.
@@ -388,6 +398,9 @@ impl LlmProvider for OpenAiCompatProvider {
         });
         if req.json_mode {
             body["response_format"] = json!({"type": "json_object"});
+        }
+        if req.no_think {
+            disable_thinking(&mut body);
         }
 
         let raw = self.post(&body).await?;
@@ -478,6 +491,9 @@ impl LlmProvider for OpenAiCompatProvider {
         // The envelope ({"done", "xml", "issues"}) is required for the loop
         // to gate convergence, so always request structured JSON output.
         body["response_format"] = json!({"type": "json_object"});
+        if req.no_think {
+            disable_thinking(&mut body);
+        }
         let raw = self.post(&body).await?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -493,6 +509,14 @@ impl LlmProvider for OpenAiCompatProvider {
             finish_reason,
         })
     }
+}
+
+/// GLM 4.6+ honors `thinking: {"type": "disabled"}` to skip the internal
+/// reasoning pass (a request-level "/nothink"). Unknown fields are ignored
+/// by other OpenAI-compatible endpoints, so it is safe to always send when
+/// the caller asks for the fast path.
+fn disable_thinking(body: &mut serde_json::Value) {
+    body["thinking"] = serde_json::json!({"type": "disabled"});
 }
 
 /// Extract `choices[0].message.content` as a string.

@@ -291,6 +291,7 @@ async fn generate_returns_501_for_unknown_session() {
                     serde_json::to_vec(&GenReq {
                         prompt: "x".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -315,6 +316,7 @@ async fn patch_returns_501_for_unknown_session() {
                         cell_ids: vec!["2".into()],
                         instruction: "recolor".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
@@ -422,6 +424,7 @@ async fn list_sessions_orders_newest_first_and_titles_from_latest_version() {
                     serde_json::to_vec(&GenReq {
                         prompt: "draw a tiny box".into(),
                         json_mode: false,
+            no_think: false,
                     })
                     .unwrap(),
                 ))
