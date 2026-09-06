@@ -99,17 +99,22 @@ button.secondary:hover { background:#252a36; }
 .bubble.pending .spinner { width:.8rem; height:.8rem; }
 .bubble .inline-chip { display:inline-flex; align-items:center; gap:.3rem; padding:.1rem .5rem; border-radius:999px; background:rgba(10,124,185,.15); border:1px solid rgba(10,124,185,.35); color:#7dd3fc; font-size:.72rem; font-weight:600; }
 
-.activity-region { flex:none; max-height:130px; display:flex; flex-direction:column; min-height:0; margin-top:.25rem; }
-.activity-log { list-style:none; margin:0; padding:.5rem 0; overflow-y:auto; display:flex; flex-direction:column; gap:.35rem; font-size:.8rem; font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; }
-.activity-log li { display:flex; align-items:center; gap:.4rem; padding:.25rem .4rem; border-radius:4px; }
-.activity-log li.newest { background:var(--surface-2); }
-.activity-chip { padding:.1rem .35rem; border-radius:999px; font-size:.65rem; font-weight:700; text-transform:uppercase; }
+.activity-chip { padding:.1rem .35rem; border-radius:999px; font-size:.62rem; font-weight:700; text-transform:uppercase; letter-spacing:.02em; flex:none; }
 .activity-chip.llm { background:rgba(10,124,185,.18); color:#38bdf8; }
 .activity-chip.render { background:rgba(124,58,237,.18); color:#c4b5fd; }
 .activity-chip.review { background:rgba(245,158,11,.18); color:#fcd34d; }
 .activity-chip.patch { background:rgba(34,197,94,.18); color:#86efac; }
 .activity-chip.state { background:rgba(148,163,184,.18); color:#cbd5e1; }
 .activity-chip.error { background:rgba(239,68,68,.18); color:#fca5a5; }
+
+/* ---------- live per-run trace inside the agent bubble ---------- */
+.bubble .bubble-main-row { display:flex; align-items:center; gap:.55rem; }
+.bubble .bubble-trace { display:flex; flex-direction:column; gap:.2rem; margin-top:.4rem; padding-top:.4rem; border-top:1px dashed var(--border); max-height:96px; overflow-y:auto; font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:.72rem; }
+.bubble .bubble-trace:empty { display:none; }
+.bubble .trace-row { display:flex; align-items:baseline; gap:.45rem; color:var(--text-dim); }
+.bubble .trace-row .trace-text { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.bubble .trace-row.live { color:var(--text); }
+.bubble .trace-row .spinner { width:.7rem; height:.7rem; border-width:1.5px; flex:none; align-self:center; }
 
 .action-bar { display:flex; align-items:center; justify-content:space-between; gap:1rem; padding:.75rem 1.25rem; background:var(--surface); border-top:1px solid var(--border); box-shadow:0 -4px 20px rgba(0,0,0,.25); }
 .action-bar__title { font-size:.8rem; font-weight:600; text-transform:uppercase; letter-spacing:.08em; color:var(--text-dim); }

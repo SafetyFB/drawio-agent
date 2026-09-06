@@ -26,7 +26,6 @@
   const runStatus = $('run-status');
   const runStatusText = $('run-status-text');
   const errorBox = $('error-box');
-  const activityLog = $('activity-log');
   const chatThread = $('chat-thread');
   const promptAttachments = $('prompt-attachments');
   const regenBtn = $('regen-btn');
@@ -42,7 +41,10 @@
   let currentSessionId = null;
   let currentXml = null;
   let isRunning = false;
-  let activityEntries = [];
+  // Live-run state: while a request is in flight, WS trajectory events are
+  // traced into the agent bubble's status area (the old standalone Activity
+  // panel is gone). `finished` stops late events from mutating a resolved bubble.
+  let runCtx = null;
   // Canvas cells attached to the NEXT message as a selection reference
   // (the drawing canvas analogue of @File in a coding agent). When present,
   // Send routes to /patch (scope mode) instead of /generate or /agent-loop.
@@ -540,41 +542,72 @@
     }
   }
 
-  function summarizeEvent(kind, payload) {
-    // TrajectoryEvent kinds arrive over WS snake_cased ("llm_call_started");
-    // normalize to the camel-case labels used by the cases below.
+  /** Legacy name kept for call sites outside a run (exports, clipboard…):
+   *  with the Activity panel merged into agent bubbles there is nothing to
+   *  append outside an active run, so this is a no-op there. */
+  function addActivity(kind, payload) {
+    if (runCtx && !runCtx.finished) pushTrace(kind, payload || {});
+  }
+
+  /** Append one live status row to the running agent bubble. Stage words
+   *  (Drawing / Viewing / Patching / Refining) are derived from the event
+   *  stream plus the route the request took. */
+  function pushTrace(kind, payload) {
+    if (!runCtx || runCtx.finished) return;
+    const traceEl = runCtx.el.querySelector('.bubble-trace');
+    if (!traceEl) return;
+    const row = document.createElement('div');
+    row.className = 'trace-row live';
+    const line = describeTraceLine(kind, payload);
+    if (!line) return;
+    row.innerHTML = `<span class="activity-chip ${ACTIVITY_COLORS[line.cls] || 'state'}">${escapeHtml(line.chip)}</span><span class="trace-text">${escapeHtml(line.text)}</span>`;
+    // Only the newest row stays highlighted.
+    const liveRows = traceEl.querySelectorAll('.trace-row.live');
+    for (let i = 0; i < liveRows.length - 1; i += 1) liveRows[i].classList.remove('live');
+    traceEl.appendChild(row);
+    traceEl.scrollTop = traceEl.scrollHeight;
+    scrollChat();
+  }
+
+  /** Map a trajectory/WS event to a human stage line. */
+  function describeTraceLine(kind, payload) {
     const k = typeof kind === 'string'
       ? kind.replace(/_([a-z])/g, (_, c) => c.toUpperCase()).replace(/^[a-z]/, c => c.toUpperCase())
-      : kind;
+      : String(kind);
     switch (k) {
-      case 'LlmCallStarted': return { stage: 'llm', text: `call started · ${payload.prompt_chars ?? '?'} chars` };
-      case 'LlmCallCompleted': return { stage: 'llm', text: `${payload.input_tokens ?? 0}+${payload.output_tokens ?? 0} tok · ${payload.finish_reason ?? 'done'}` };
-      case 'RenderStarted': return { stage: 'render', text: 'render started' };
-      case 'RenderCompleted': return { stage: 'render', text: `ok · ${((payload.bytes || 0) / 1024).toFixed(1)} KB · ${(payload.duration_ms / 1000).toFixed(1)}s` };
-      case 'Error': return { stage: 'error', text: `${payload.stage}: ${payload.message}` };
-      case 'StateTransition': return { stage: 'state', text: `${payload.from ?? '∅'} → ${payload.to}` };
-      default: return { stage: 'state', text: kind };
+      case 'LlmCallStarted': {
+        if (runCtx.sawRender) {
+          const scoped = runCtx.scoped;
+          return scoped
+            ? { cls: 'patch', chip: 'patch', text: `✂ Patching… 第 ${runCtx.round} 轮：查看渲染图并修改选中的 ${runCtx.cellCount} 个 cell` }
+            : { cls: 'review', chip: 'refine', text: `🧠 Refining… 第 ${runCtx.round} 轮：查看渲染图并修改` };
+        }
+        return { cls: 'llm', chip: 'draw', text: '🎨 Drawing… 生成/思考 XML' };
+      }
+      case 'LlmCallCompleted': {
+        const secs = ((payload.duration_ms || 0) / 1000).toFixed(1);
+        return { cls: 'llm', chip: 'done', text: `✓ 模型返回 · ${payload.input_tokens ?? '?'}+${payload.output_tokens ?? '?'} tok · ${secs}s${payload.finish_reason ? ` · ${payload.finish_reason}` : ''}` };
+      }
+      case 'RenderStarted': {
+        runCtx.round += 1;
+        runCtx.sawRender = true;
+        return { cls: 'render', chip: 'view', text: `👁 Viewing… 渲染第 ${runCtx.round} 张图` };
+      }
+      case 'RenderCompleted': {
+        const secs = ((payload.duration_ms || 0) / 1000).toFixed(1);
+        return { cls: 'render', chip: 'done', text: `✓ 渲染完成 · ${((payload.bytes || 0) / 1024).toFixed(1)} KB · ${secs}s` };
+      }
+      case 'Error': {
+        const msg = String(payload.message || 'unknown').slice(0, 180);
+        return { cls: 'error', chip: 'error', text: `⚠ ${payload.stage || 'server'}: ${msg}` };
+      }
+      case 'StateTransition': {
+        const from = payload.from ? `${payload.from} → ` : '';
+        return { cls: 'state', chip: 'v', text: `${from}${payload.to}` };
+      }
+      default:
+        return null;
     }
-  }
-
-  function addActivity(kind, payload, newest = true) {
-    const summary = summarizeEvent(kind, payload || {});
-    const li = document.createElement('li');
-    if (newest) li.className = 'newest';
-    li.innerHTML = `<span class="activity-chip ${ACTIVITY_COLORS[summary.stage] || 'state'}">${summary.stage}</span><span>${escapeHtml(summary.text)}</span>`;
-    activityLog.appendChild(li);
-    activityEntries.push(li);
-    if (activityEntries.length > 20) {
-      const old = activityEntries.shift();
-      if (old) old.remove();
-    }
-    activityLog.scrollTop = activityLog.scrollHeight;
-    setTimeout(() => li.classList.remove('newest'), 800);
-  }
-
-  function clearActivity() {
-    activityLog.innerHTML = '';
-    activityEntries = [];
   }
 
   // -------------------------------------------------------------------------
@@ -591,6 +624,7 @@
 
   function clearChat() {
     chatThread.innerHTML = '';
+    runCtx = null;
   }
 
   function scrollChat() {
@@ -620,8 +654,9 @@
     scrollChat();
   }
 
-  /** Append (or resolve) an agent bubble. Pass an existing element as
-   *  `pendingEl` to turn a running placeholder into the final message. */
+  /** Append (or resolve) an agent bubble. A bubble is
+   *  [kind row][main content][live trace]; resolving a pending bubble keeps
+   *  its trace (the run's trajectory) and swaps the main content. */
   let pendingTimer = null;
 
   function addAgentBubble(kind, text, opts = {}) {
@@ -631,19 +666,41 @@
     }
     const el = opts.pendingEl || document.createElement('div');
     el.className = `bubble agent${opts.isError ? ' error' : ''}${opts.pending ? ' pending' : ''}`;
-    el.innerHTML = '';
-    const kindEl = document.createElement('div');
-    kindEl.className = 'bubble-kind';
+    let kindEl = el.querySelector ? el.querySelector('.bubble-kind') : null;
+    let mainEl = el.querySelector ? el.querySelector('.bubble-main') : null;
+    let traceEl = el.querySelector ? el.querySelector('.bubble-trace') : null;
+    if (!kindEl) {
+      kindEl = document.createElement('div');
+      kindEl.className = 'bubble-kind';
+      el.appendChild(kindEl);
+      mainEl = document.createElement('div');
+      mainEl.className = 'bubble-main';
+      el.appendChild(mainEl);
+      traceEl = document.createElement('div');
+      traceEl.className = 'bubble-trace';
+      el.appendChild(traceEl);
+    }
     kindEl.textContent = KIND_LABEL[kind] || kind;
-    el.appendChild(kindEl);
+    mainEl.innerHTML = '';
     if (opts.pending) {
+      const row = document.createElement('div');
+      row.className = 'bubble-main-row';
       const spinner = document.createElement('span');
       spinner.className = 'spinner';
-      el.appendChild(spinner);
+      row.appendChild(spinner);
       const txt = document.createElement('span');
       txt.className = 'bubble-text';
       txt.textContent = text;
-      el.appendChild(txt);
+      row.appendChild(txt);
+      mainEl.appendChild(row);
+      const wait = document.createElement('span');
+      wait.className = 'bubble-meta';
+      mainEl.appendChild(wait);
+      const t0 = Date.now();
+      pendingTimer = setInterval(() => {
+        const secs = Math.round((Date.now() - t0) / 1000);
+        wait.textContent = `⏱ ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
+      }, 1000);
       chatThread.appendChild(el);
       scrollChat();
       return el;
@@ -651,18 +708,18 @@
     const body = document.createElement('div');
     body.className = 'bubble-text';
     body.textContent = text;
-    el.appendChild(body);
+    mainEl.appendChild(body);
     if (opts.reasoning) {
       const r = document.createElement('blockquote');
       r.className = 'bubble-reason';
       r.textContent = opts.reasoning;
-      el.appendChild(r);
+      mainEl.appendChild(r);
     }
     if (opts.meta) {
       const m = document.createElement('div');
       m.className = 'bubble-meta';
       m.textContent = opts.meta;
-      el.appendChild(m);
+      mainEl.appendChild(m);
     }
     if (opts.pendingEl) {
       el.classList.remove('pending');
@@ -674,26 +731,17 @@
   }
 
   function runningBubble(text) {
-    const el = addAgentBubble('system', text, { pending: true });
-    const wait = document.createElement('span');
-    wait.className = 'bubble-meta';
-    el.appendChild(wait);
-    const t0 = Date.now();
-    pendingTimer = setInterval(() => {
-      const secs = Math.round((Date.now() - t0) / 1000);
-      wait.textContent = `⏱ ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
-    }, 1000);
-    return el;
+    return addAgentBubble('system', text, { pending: true });
   }
 
   function handleWsMessage(data) {
     if (!data || typeof data !== 'object') return;
     if (data.type === 'trajectory' && data.event) {
-      addActivity(data.event.kind, data.event);
+      pushTrace(data.event.kind, data.event);
     } else if (data.type === 'version_created') {
-      addActivity('StateTransition', { from: null, to: `version ${data.version_id}` });
+      pushTrace('StateTransition', { from: '', to: `📌 version ${data.version_id}` });
     } else if (data.type === 'error') {
-      addActivity('Error', { stage: 'server', message: data.message || 'unknown' });
+      pushTrace('Error', { stage: 'server', message: data.message || 'unknown' });
     }
   }
 
@@ -810,6 +858,8 @@
     const chipLabel = cellIds.length ? `◎ ${cellIds.length} selected` : null;
     addUserBubble(prompt, chipLabel);
     const pendingBubble = runningBubble(loadingText);
+    // Trace WS trajectory events into this bubble until the run resolves.
+    runCtx = { el: pendingBubble, scoped: isScoped, cellCount: cellIds.length, sawRender: false, round: 0, finished: false };
     promptEl.value = '';
     if (cellIds.length && currentGraph) currentGraph.clearSelection(); // clears currentSelection via listener
     currentSelection = [];
@@ -871,6 +921,8 @@
         isError: true,
       });
     } finally {
+      if (runCtx) runCtx.finished = true;
+      runCtx = null;
       setRunLoading(false);
       setLoading(false);
     }
