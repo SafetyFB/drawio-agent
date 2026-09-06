@@ -1,9 +1,9 @@
-# drawio-harness（`refactor/harness-cli` 分支）
+# drawio-harness
 
-一个"普通 agent harness"风格的 Draw.io 编辑工具：本地 chat 入口 + 工具调用
-（read / locate / edit / draw / check / view），唯一工件是磁盘上一个规范
-pretty-print 的 xml 文件。不再有 typed XML 模型、scope 子图协议、分阶段
-Generate/Review/Patch 循环、sessions/trajectory —— 全部由
+一个"普通 agent harness"风格的 Draw.io AI 画图工具：**浏览器是主入口**，
+本地 chat + 工具调用（read / locate / edit / draw / check / view），唯一
+工件是磁盘上一个规范 pretty-print 的 `.drawio` 文件。没有 typed XML 模型、
+scope 子图协议、分阶段 Generate/Review/Patch 循环——全部由
 「文件 + 行区间文本编辑 + @file 式引用」替代。
 
 设计文档：[`docs/harness-refactor.md`](./docs/harness-refactor.md)
@@ -20,25 +20,82 @@ Generate/Review/Patch 循环、sessions/trajectory —— 全部由
   added/removed/changed 精确到 cell。
 - **模型驱动**：每轮一个 JSON 信封 `{"tool": ..., "args": ...}` 或
   `{"reply": ..., "done": true}`；工具结果回填下一轮。`view` 会把渲染截图
-  作为图像消息直接发给模型（视觉闭环在一条对话里完成，不再有独立的
-  VLM review 阶段）。任意的 OpenAI-compatible 端点即可接入（需支持视觉
-  时用多模态模型）。
+  作为图像消息直接发给模型（视觉闭环在一条对话里完成）。任意的
+  OpenAI-compatible 端点即可接入（需支持视觉时用多模态模型）。
 
-## 构建与测试
+## 构建
 
 ```bash
 cargo build
-cargo test -p drawio-harness          # 27 tests
-cargo test -p drawio-agent-renderer   # chromium 渲染（复用）
 ```
 
-## 用法
+构建时自动下载钉住版本的 `chrome-headless-shell`（chrome-for-testing CDN，
+SHA-256 校验后缓存在 `~/Library/Caches/drawio-agent/`（macOS）），供渲染与
+画布截图使用。离线环境用 `DRAWIO_AGENT_OFFLINE=1 cargo build` 跳过
+（渲染/截图功能随之停用）。
 
 ```bash
-# 浏览器是主入口：会话 = 一个 .drawio 文件（默认 ~/.drawio-harness/files）
-cargo run -p drawio-harness -- web            # http://127.0.0.1:8787
-cargo run -p drawio-harness -- web --dir ~/diagrams 4000
+cargo test -p drawio-harness          # 50 tests
+cargo test -p drawio-agent-renderer   # 校验/渲染测试
+```
 
+## 用法：Web（主入口）
+
+```bash
+cargo run -p drawio-harness -- web                  # http://127.0.0.1:8787
+cargo run -p drawio-harness -- web --dir ~/diagrams 4000   # 自定义会话目录与端口
+```
+
+打开浏览器地址即可。**会话 = 一个 `.drawio` 文件**：创建会话就是新建文件
+（默认 `~/.drawio-harness/files/`），下拉切换、＋ 新建、🗑 删除。
+
+### 首次配置（⚙ 面板或 CLI）
+
+配置 OpenAI-compatible 端点（示例为智谱 GLM）：
+
+```bash
+cargo run -p drawio-harness -- config set \
+  --base-url https://open.bigmodel.cn/api/paas/v4 \
+  --model glm-4.6v \
+  --api-key <你的 key>
+```
+
+也可直接用环境变量 `DRAWIO_LLM_BASE_URL` / `DRAWIO_LLM_MODEL` /
+`DRAWIO_LLM_API_KEY`，或编辑 `~/.drawio-agent/config.json`；`config show`
+查看（key 打码）、`config path` 打印路径。页内 ⚙ 面板可改模型、上下文上限、
+输入/输出价格与预算。
+
+### 聊天（AI 画图）
+
+- 输入消息回车发送；模型自主调用 read / locate / edit / draw / check / view
+  工具闭环改图，每轮工具调用与 token 花费**实时流式**渲染，发送中可「停止」。
+- **多轮记忆**：每轮随上下文注入（超限自动裁剪），随会话持久化，重启/切换
+  会话恢复。
+- **选中即引用**：在画布上点选 / 框选 / Shift 追加选中的 cell 会随下一条
+  消息自动附带（`@cell:boxA`），历史消息附带当时的选中信息。
+- **用量与预算**：每个会话独立统计 token 与花费，超出预算拒绝执行；页面
+  底部实时显示，历史轨迹存 `<name>.history.jsonl`。
+- **历史 = 聊天流**：重新打开或切换会话时，上次对话、工具轨迹、用量按时间
+  顺序以聊天样式重放，与实时消息同款，无感恢复。
+
+### 画布（mini editor，手动改图）
+
+| 操作 | 方式 |
+|---|---|
+| 选中 cell | 单击；Shift 追加/取消；空白处拉框多选 |
+| 移动 | 按住选中 cell 拖动（含子元素，edge 跟随端点） |
+| 缩放画布 | Ctrl/Cmd + 滚轮（围绕光标）；右下 −/100%/＋ 按钮；中间按钮点击复位视图，标签实时显示当前百分比 |
+| 平移 | 切到「平移」模式拖动（拖完一次提交，不误选） |
+| **缩放 cell** | 单选 cell 后拖角/边上的手柄（最小 20px） |
+| **旋转 cell** | 单选 cell 后拖顶部圆圈手柄（Shift 吸附 15°；顶边靠上缘时手柄自动翻到底边） |
+| 改文字 | 双击 cell → 覆盖输入框，Enter/失焦提交、Esc 取消 |
+| 落盘 | 手动改动防抖 600ms 自动同步到服务端并写回文件（任务运行中暂缓） |
+
+手动编辑不写聊天历史，只更新文件与状态；模型后续操作都基于磁盘文件。
+
+### CLI（辅助）
+
+```bash
 # 交互 REPL（无 LLM 也能用：/view /check /xml /sel /undo /save /reload）
 cargo run -p drawio-harness -- demo.drawio
 
@@ -46,18 +103,10 @@ cargo run -p drawio-harness -- demo.drawio
 cargo run -p drawio-harness -- new demo.drawio
 
 # one-shot 对话（模型自主调用工具闭环）
-DRAWIO_LLM_BASE_URL=<endpoint> DRAWIO_LLM_MODEL=<model> \
-DRAWIO_LLM_API_KEY=<key> \
-  cargo run -p drawio-harness -- demo.drawio "把 svc-b 改成绿色，加一条到 svc-a 的连线"
+cargo run -p drawio-harness -- demo.drawio "把 svc-b 改成绿色，加一条到 svc-a 的连线"
 ```
 
-Web 端：**每个会话绑定一个 .drawio 文件，创建会话 = 创建文件**（下拉切换、
-＋ 新建会话、🗑 删除）。每个会话有独立的图、多轮记忆、用量/预算与
-`<name>.history.jsonl` 轨迹历史；⚙ 配置模型/上下文/价格/预算，`历史`
-历史以聊天记录形式直接铺在对话区（无单独面板）：重新打开/切换会话时，上次的对话、工具轨迹、用量按时间顺序重放，与实时聊天同款样式，做到无感恢复。会话的记忆与用量随 `<name>.state.json` 持久化，重启后完整恢复；聊天实时流式渲染每轮工具
-调用与 token 花费（发送中可「停止」）。
-
-REPL（单文件模式）常用命令：`/history`（/history N 看轨迹）`/ctx-save x.json`
+REPL 常用命令：`/history`（`/history N` 看轨迹）`/ctx-save x.json`
 `/ctx-load x.json` `/sel` `/stop`。
 
 ## 代码布局
@@ -68,7 +117,7 @@ REPL（单文件模式）常用命令：`/history`（/history N 看轨迹）`/ct
 | `crates/harness/src/refs.rs` | @ 引用解析与上下文注入 |
 | `crates/harness/src/tools.rs` | read locate edit draw check view |
 | `crates/harness/src/chat.rs` | OpenAI-compatible chat（text + image parts） |
-| `crates/harness/web/` + `web.rs` | 浏览器画布：mxGraph 渲染、框选 → cell ids、聊天 |
-| `crates/harness/src/engine.rs` | JSON 信封循环 |
-| `crates/harness/src/main.rs` | REPL + one-shot |
-| `crates/renderer` | 保留的 chromium CDP 渲染 |
+| `crates/harness/web/` + `web.rs` | Web 入口：多会话、流式进度/打断、历史重放、mxGraph 画布 + mini editor（点选/框选/拖动/缩放/旋转/文字编辑/手动同步） |
+| `crates/harness/src/engine.rs` | JSON 信封循环、用量/预算/上下文守卫 |
+| `crates/harness/src/main.rs` | CLI 入口（web / REPL / one-shot / new / config） |
+| `crates/renderer` | chromium CDP 渲染（headless-shell 自动拉取 + SHA-256 校验） |
