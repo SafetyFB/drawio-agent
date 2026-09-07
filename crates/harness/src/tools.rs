@@ -89,11 +89,16 @@ impl Tools {
    用来把用户说的概念（"订单服务那个框"）映射到文件位置。
 
 3. edit   {"range": "120-156" | "cell:svc-a", "text": "<完整 XML 片段>"}
+          或批量 {"ranges": [{"range": "...", "text": "..."}, ...]}
    把 range 覆盖的行整体替换为 text。text 必须是**完整自洽的 XML**：
    开闭标签齐全、属性完整（如 mxGeometry 要带 as="geometry"、
    mxCell 要带 parent/vertex），新增 cell 用新的唯一 id，连线要有
    source/target。只改目标 cell，其余必须字节不变——系统校验后回报
    added/changed/removed 清单，出现越界改动会被警告。
+   **批量（ranges 数组）**：一次提交多个不重叠的区间（行号都按当前
+   文件），全部通过才落盘、任一失败整体不动（全或无）。
+   规则：需要改动 2 个及以上 cell 时**必须**用批量一次提交，禁止逐个
+   cell 单独 edit（那会浪费大量轮次——已有实测反馈）。
 
 4. draw   {"xml": "<mxfile>…</mxfile>"}
    整图重建（新画一张图或大改布局时用）。xml 必须是完整 mxfile。
@@ -255,34 +260,66 @@ impl Tools {
     }
 
     fn edit(&mut self, doc: &mut XmlDoc, args: &Value, whole: bool) -> Result<ToolOutput, String> {
-        let (range_spec, text) = if whole {
+        if whole {
             let xml = args
                 .get("xml")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "draw 需要参数 xml".to_string())?;
-            ("1-end".to_string(), xml.to_string())
+            let (start, end) = (1usize, total_lines(doc.canonical()));
+            return match doc.apply_edit(start, end, xml) {
+                Ok(report) if report.noop => {
+                    Ok(ToolOutput::text("no-op：内容与当前文件相同，未修改。"))
+                }
+                Ok(report) => {
+                    doc.save().map_err(|e| format!("保存失败: {e}"))?;
+                    Ok(ToolOutput::text(format!(
+                        "编辑已应用并保存。{}",
+                        report_summary(&report)
+                    )))
+                }
+                Err(e) => Err(format!("编辑被拒绝（文件未改动）: {e}")),
+            };
+        }
+        // 批量：ranges=[{range,text},...] 一次全做（全或无）；兼容旧单区间
+        let batch: Vec<(usize, usize, String)> = if let Some(ranges) = args.get("ranges") {
+            let arr = ranges
+                .as_array()
+                .ok_or_else(|| "ranges 需要是数组".to_string())?;
+            if arr.is_empty() {
+                return Err("ranges 不能为空".to_string());
+            }
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let spec = item
+                    .get("range")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "批量项需要 range".to_string())?;
+                let text = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "批量项需要 text".to_string())?;
+                let (start, end) = resolve_arg(doc, spec)?;
+                out.push((start, end, text.to_string()));
+            }
+            out
         } else {
             let spec = args
                 .get("range")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "edit 需要参数 range".to_string())?;
+                .ok_or_else(|| "edit 需要参数 range 或 ranges".to_string())?;
             let text = args
                 .get("text")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "edit 需要参数 text".to_string())?;
-            (spec.to_string(), text.to_string())
+            let (start, end) = resolve_arg(doc, spec)?;
+            vec![(start, end, text.to_string())]
         };
 
-        let (start, end) = if whole {
-            (1usize, total_lines(doc.canonical()))
-        } else {
-            resolve_arg(doc, &range_spec)?
-        };
-        match doc.apply_edit(start, end, &text) {
+        // 全或无：内存内一次应用 + 单次校验，通过才原子落盘
+        match doc.apply_edits(&batch) {
             Ok(report) if report.noop => Ok(ToolOutput::text("no-op：内容与当前文件相同，未修改。")),
             Ok(report) => {
-                doc.save()
-                    .map_err(|e| format!("保存失败: {e}"))?;
+                doc.save().map_err(|e| format!("保存失败: {e}"))?;
                 Ok(ToolOutput::text(format!(
                     "编辑已应用并保存。{}",
                     report_summary(&report)
@@ -445,6 +482,72 @@ mod tests {
     fn doc() -> XmlDoc {
         let s = r#"<mxfile host="app.diagrams.net"><diagram id="d1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="svc-a" value="Order Service" vertex="1" parent="1"><mxGeometry x="40" y="60" width="160" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
         XmlDoc::from_text(s).unwrap()
+    }
+
+    fn two_cell_doc() -> XmlDoc {
+        let s = r#"<mxfile host="app.diagrams.net"><diagram id="d1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="svc-a" value="A" vertex="1" parent="1"><mxGeometry x="40" y="60" width="160" height="60" as="geometry"/></mxCell><mxCell id="svc-b" value="B" vertex="1" parent="1"><mxGeometry x="260" y="60" width="160" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+        XmlDoc::from_text(s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn batch_edit_applies_all_cells_atomically() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        let l = d.id_to_cell("svc-a").unwrap();
+        let r = d.id_to_cell("svc-b").unwrap();
+        let before = d.canonical().to_string();
+        let args = serde_json::json!({
+            "ranges": [
+                {"range": format!("{}-{}", l.start_line, l.end_line),
+                 "text": r#"<mxCell id="svc-a" value="PA" vertex="1" parent="1"><mxGeometry x="40" y="60" width="200" height="60" as="geometry"/></mxCell>"#},
+                {"range": format!("{}-{}", r.start_line, r.end_line),
+                 "text": r#"<mxCell id="svc-b" value="PB" vertex="1" parent="1"><mxGeometry x="260" y="60" width="200" height="60" as="geometry"/></mxCell>"#}
+            ]
+        });
+        let out = t.run(&mut d, "edit", &args).await.unwrap();
+        assert!(out.text.contains("changed=[svc-a, svc-b]"), "{}", out.text);
+        assert!(d.canonical().contains("PA") && d.canonical().contains("PB"));
+        assert_ne!(d.canonical(), before);
+    }
+
+    #[tokio::test]
+    async fn batch_edit_failure_keeps_file_untouched() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        let l = d.id_to_cell("svc-a").unwrap();
+        let r = d.id_to_cell("svc-b").unwrap();
+        let before = d.canonical().to_string();
+        let args = serde_json::json!({
+            "ranges": [
+                {"range": format!("{}-{}", l.start_line, l.end_line),
+                 "text": r#"<mxCell id="svc-a" value="PA" vertex="1" parent="1"><mxGeometry x="40" y="60" width="200" height="60" as="geometry"/></mxCell>"#},
+                {"range": format!("{}-{}", r.start_line, r.end_line),
+                 "text": r#"<mxCell id="svc-a" value="DUP" vertex="1" parent="1"><mxGeometry x="260" y="60" width="200" height="60" as="geometry"/></mxCell>"#}
+            ]
+        });
+        let out = t.run(&mut d, "edit", &args).await;
+        assert!(out.is_err(), "应整体失败");
+        assert_eq!(d.canonical(), before, "内存不应改动");
+    }
+
+    #[tokio::test]
+    async fn batch_edit_rejects_overlapping_ranges() {
+        let mut d = doc();
+        let mut t = Tools::new(false);
+        let l = d.id_to_cell("svc-a").unwrap();
+        let before = d.canonical().to_string();
+        let args = serde_json::json!({
+            "ranges": [
+                {"range": format!("{}-{}", l.start_line, l.end_line),
+                 "text": r#"<mxCell id="svc-a" value="PA" vertex="1" parent="1"><mxGeometry x="40" y="60" width="200" height="60" as="geometry"/></mxCell>"#},
+                {"range": format!("{}-{}", l.start_line, l.end_line),
+                 "text": "x"}
+            ]
+        });
+        let out = t.run(&mut d, "edit", &args).await;
+        assert!(out.is_err());
+        assert!(out.err().unwrap().contains("重叠"));
+        assert_eq!(d.canonical(), before);
     }
 
     #[tokio::test]

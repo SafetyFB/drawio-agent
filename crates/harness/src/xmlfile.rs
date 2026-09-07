@@ -664,7 +664,18 @@ impl XmlDoc {
     }
 
     pub fn save(&self) -> Result<(), XmlError> {
-        std::fs::write(&self.path, &self.text)?;
+        // 原子落盘：临时文件 + rename（批量全或无的最后一环）
+        // 唯一后缀：多线程测试/多会话并行时避免 tmp 路径相撞
+        let nonce: u128 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = self.path.with_extension(format!("drawio.tmp.{nonce:016x}"));
+        std::fs::write(&tmp, &self.text)?;
+        if let Err(e) = std::fs::rename(&tmp, &self.path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(XmlError::from(e));
+        }
         Ok(())
     }
 
@@ -792,6 +803,101 @@ impl XmlDoc {
             }
         }
 
+        self.history.push(std::mem::replace(&mut self.text, canonical));
+        if self.history.len() > 10 {
+            self.history.remove(0);
+        }
+        self.cells = cells;
+        Ok(report)
+    }
+
+    /// 批量行区间编辑（原始文件行号）：内存内一次应用全部并统一校验。
+    ///
+    /// - 每个范围都按**原始文件**行号解释（模型 read 到的行号）；
+    ///   区间按 start 从大到小应用，行号不漂移
+    /// - 区间重叠（含相接）视为非法：批量里模型必须给不相交区间
+    /// - 全部应用后**一次** canonicalize/index/diff（含 off_range 用
+    ///   整个批量的并集区间判定）——磁盘只在调用方 save 时落盘，
+    ///   校验失败时磁盘分毫未动（全或无）
+    pub fn apply_edits(
+        &mut self,
+        edits: &[(usize, usize, String)],
+    ) -> Result<EditReport, XmlError> {
+        let total = total_lines(&self.text);
+        for (start, end, _) in edits {
+            if *start < 1 || *end < *start || *end > total {
+                return Err(XmlError::BadRange(format!(
+                    "{start}-{end} (file has {total} lines)"
+                )));
+            }
+        }
+        // 重叠检测：按 start 升序排，后一个 start <= 前一个 end 即重叠
+        let mut sorted: Vec<&(usize, usize, String)> = edits.iter().collect();
+        sorted.sort_by_key(|(s, _, _)| *s);
+        for w in sorted.windows(2) {
+            if w[1].0 <= w[0].1 {
+                return Err(XmlError::BadRange(format!(
+                    "批量区间重叠或相接: {}-{} 与 {}-{}",
+                    w[0].0, w[0].1, w[1].0, w[1].1
+                )));
+            }
+        }
+        let (lo, hi) = (
+            sorted.first().map(|e| e.0).unwrap_or(1),
+            sorted.last().map(|e| e.1).unwrap_or(0),
+        );
+        // 从大到小应用：先改后面的行，前面的行号不受影响
+        let mut candidate = self.text.clone();
+        let mut desc = sorted;
+        desc.reverse();
+        for (start, end, text) in desc {
+            candidate = replace_lines(&candidate, *start, *end, text);
+        }
+        let canonical = canonicalize(&candidate)?;
+        if canonical == self.text {
+            return Ok(EditReport {
+                noop: true,
+                unchanged: total,
+                ..EditReport::default()
+            });
+        }
+        let cells = index(&canonical)?;
+        let before = content_map(&self.text, &self.cells);
+        let after = content_map(&canonical, &cells);
+        let mut report = EditReport {
+            noop: false,
+            ..EditReport::default()
+        };
+        let mut ids = BTreeSet::new();
+        for id in before.keys() {
+            ids.insert(id.clone());
+        }
+        for id in after.keys() {
+            ids.insert(id.clone());
+        }
+        for id in &ids {
+            match (before.get(id), after.get(id)) {
+                (None, Some(_)) => report.added.push(id.clone()),
+                (Some(_), None) => report.removed.push(id.clone()),
+                (Some(a), Some(b)) => {
+                    if a != b {
+                        report.changed.push(id.clone());
+                    } else {
+                        report.unchanged += 1;
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+        for id in &report.changed {
+            let Some(span) = cells.iter().find(|c| &c.id == id) else {
+                continue;
+            };
+            let touches = !(span.end_line < lo || span.start_line > hi);
+            if !touches {
+                report.off_range.push(id.clone());
+            }
+        }
         self.history.push(std::mem::replace(&mut self.text, canonical));
         if self.history.len() > 10 {
             self.history.remove(0);
