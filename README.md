@@ -27,20 +27,22 @@ cargo test -p drawio-harness          # 50 tests
 cargo test -p drawio-agent-renderer   # 校验/渲染测试
 ```
 
-首次启动 web 时会自动下载两个依赖（均为钉住版本 + SHA-256 校验，缓存于
+首次使用时会按需下载两个依赖（均为钉住版本 + SHA-256 校验，缓存于
 `~/Library/Caches/drawio-agent/`（macOS））：
 
-1. **chrome-headless-shell**（构建期）：chromium CDP 渲染宿主
-2. **drawio webapp**（首次运行 web 时）：官方 GitHub release 的
+1. **drawio webapp**（首次运行 web 时）：官方 GitHub release 的
    `draw.war`（~54MB，解压后完整的最新版 drawio 编辑器），供画布编辑器
    与无头渲染共用
+2. **chrome-headless-shell**（首次 view/导出时，~90MB）：无头渲染宿主。
+   **如果系统已装 Chrome / Chromium / Edge / Brave，则直接复用、完全不
+   下载**（`find_chromium` 按「显式路径 → 已缓存 bundle → 系统浏览器 →
+   按需下载」顺序解析）
 
 > **注意：这两个下载在国内网络下都很慢**（storage.googleapis.com /
-> github.com）。建议开启代理的**增强模式 / TUN 模式**（让 cargo 与运行
-> 时的流量也走代理）后再构建/启动。纯离线环境用
-> `DRAWIO_AGENT_OFFLINE=1 cargo build` 跳过；web 启动时若 war 未缓存，
-> 画布自动回退到内置的简化 mxGraph 画布（编辑能力受限，模型提示词会
-> 同步附上旧版形状约束）。
+> github.com）。建议开启代理的**增强模式 / TUN 模式**（让运行时流量也
+> 走代理）后再启动。纯离线环境用 `DRAWIO_AGENT_OFFLINE=1`；web 启动时
+> 若 war 未缓存，画布自动回退到内置的简化 mxGraph 画布（编辑能力受限，
+> 模型提示词会同步附上旧版形状约束）。
 
 ## 用法（Web 主入口）
 

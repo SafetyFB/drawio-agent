@@ -37,44 +37,13 @@ include!(concat!(env!("OUT_DIR"), "/bundled_chromium.rs"));
 
 /// Resolve the Chromium binary path. Looks at (in order):
 /// 1. `DRAWIO_AGENT_CHROMIUM_PATH` env var (always wins)
-/// 2. Build-time bundled chrome-headless-shell
-/// 3. Common macOS/Linux app locations
-/// 4. `$PATH` via `which()`
+/// Resolve a usable CDP browser binary: explicit override → cached bundled
+/// → system Chrome/Chromium/Edge → lazy download (see chromium_ensure).
 pub fn find_chromium() -> Option<PathBuf> {
-    // 1. Explicit override always wins.
-    if let Ok(p) = std::env::var("DRAWIO_AGENT_CHROMIUM_PATH") {
-        let pb = PathBuf::from(p);
-        if pb.exists() {
-            return Some(pb);
-        }
-    }
-    // 2. Build-time bundled chrome-headless-shell.
-    if let Some(p) = BUNDLED_CHROMIUM_PATH {
-        let pb = PathBuf::from(p);
-        if pb.exists() {
-            return Some(pb);
-        }
-    }
-    // 3. System candidates.
-    let candidates = [
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-    ];
-    for c in candidates {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    // 4. PATH lookup.
-    which("chrome-headless-shell")
-        .or_else(|| which("chromium"))
-        .or_else(|| which("google-chrome"))
+    crate::chromium_ensure::resolve_chromium()
+        .map_err(|e| eprintln!("chromium 解析失败: {e}"))
+        .ok()
+        .flatten()
 }
 
 /// Returns the build-time resolved path to chrome-headless-shell, if any.
@@ -169,11 +138,15 @@ impl Drop for ChromiumInner {
 impl HeadlessChromiumDriver {
     /// Locate a Chromium binary and launch it.
     pub async fn launch() -> Result<Self, RenderError> {
-        let path = find_chromium().ok_or_else(|| {
-            RenderError::Browser(
-                "no chromium binary found (set DRAWIO_AGENT_CHROMIUM_PATH)".into(),
-            )
-        })?;
+        // 解析可能触发首次下载（~90MB），放 blocking 池避免卡住异步运行时
+        let path = tokio::task::spawn_blocking(find_chromium)
+            .await
+            .unwrap_or(None)
+            .ok_or_else(|| {
+                RenderError::Browser(
+                    "no chromium binary found (set DRAWIO_AGENT_CHROMIUM_PATH)".into(),
+                )
+            })?;
         Self::launch_with(path).await
     }
 

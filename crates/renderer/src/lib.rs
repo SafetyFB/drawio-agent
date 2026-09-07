@@ -14,6 +14,7 @@ use thiserror::Error;
 
 pub mod asset_fetch;
 pub mod checksum;
+pub mod chromium_ensure;
 pub mod drawio_app;
 pub mod driver;
 
