@@ -19,26 +19,28 @@ pretty-print 的 `.drawio` 文件。局部性靠「文件 + 行区间文本编�
   作为图像消息直接发给模型（视觉闭环在一条对话里完成）。任意的
   OpenAI-compatible 端点即可接入（需支持视觉时用多模态模型）。
 
-## 构建
+## 构建与首次运行
 
 ```bash
 cargo build
-```
-
-构建时自动下载钉住版本的 `chrome-headless-shell`（chrome-for-testing CDN，
-SHA-256 校验后缓存在 `~/Library/Caches/drawio-agent/`（macOS）），供渲染与
-画布截图使用。
-
-> **注意：这个下载目前很慢**。CDN（storage.googleapis.com）直连在国内
-> 网络环境下经常只有几十 KB/s，一次下载可能要十几分钟甚至超时。
-> 建议开启代理的**增强模式 / TUN 模式**（让 cargo 与构建脚本的流量也走
-> 代理）后再构建，通常一分钟内完成。纯离线环境用
-> `DRAWIO_AGENT_OFFLINE=1 cargo build` 跳过（渲染/截图功能随之停用）。
-
-```bash
 cargo test -p drawio-harness          # 50 tests
 cargo test -p drawio-agent-renderer   # 校验/渲染测试
 ```
+
+首次启动 web 时会自动下载两个依赖（均为钉住版本 + SHA-256 校验，缓存于
+`~/Library/Caches/drawio-agent/`（macOS））：
+
+1. **chrome-headless-shell**（构建期）：chromium CDP 渲染宿主
+2. **drawio webapp**（首次运行 web 时）：官方 GitHub release 的
+   `draw.war`（~54MB，解压后完整的最新版 drawio 编辑器），供画布编辑器
+   与无头渲染共用
+
+> **注意：这两个下载在国内网络下都很慢**（storage.googleapis.com /
+> github.com）。建议开启代理的**增强模式 / TUN 模式**（让 cargo 与运行
+> 时的流量也走代理）后再构建/启动。纯离线环境用
+> `DRAWIO_AGENT_OFFLINE=1 cargo build` 跳过；web 启动时若 war 未缓存，
+> 画布自动回退到内置的简化 mxGraph 画布（编辑能力受限，模型提示词会
+> 同步附上旧版形状约束）。
 
 ## 用法（Web 主入口）
 
@@ -56,9 +58,9 @@ cargo run -p drawio-harness -- web 4000  # 自定义端口
 
 打开页面右上角 ⚙ 设置面板，填好 LLM 接入信息即可开始：
 
-- **Base URL / Model / API Key**：任意 OpenAI-compatible 端点（示例为
-  智谱 GLM：`https://open.bigmodel.cn/api/paas/v4` + `glm-4.6v`）
-- **上下文上限、输入/输出价格、预算**：控制每会话的 token 与花费统计
+- **Base URL / Model / API Key**：任意 OpenAI-compatible 端点
+- **上下文上限、单次最大轮数、输入/输出价格、预算**：控制每次任务的
+  token 统计、轮数上限与花费
 
 保存后立即生效，无需重启；Key 只显示打码形式。
 
@@ -68,20 +70,23 @@ cargo run -p drawio-harness -- web 4000  # 自定义端口
   工具闭环改图，每轮工具调用与 token 花费**实时流式**渲染，发送中可「停止」。
 - **多轮记忆**：每轮随上下文注入（超限自动裁剪），随会话持久化，重启/切换
   会话恢复。
-- **选中即引用**：在画布上点选 / 框选 / Shift 追加选中的 cell 会随下一条
-  消息自动附带（`@cell:boxA`），历史消息附带当时的选中信息。
+- **选中即引用**：画布上点选 / 框选的 cell 会随下一条消息自动附带
+  （`@cell:boxA`），历史消息附带当时的选中信息。
 - **用量与预算**：每个会话独立统计 token 与花费，超出预算拒绝执行；页面
   底部实时显示，历史轨迹存 `<name>.history.jsonl`。
 - **历史 = 聊天流**：重新打开或切换会话时，上次对话、工具轨迹、用量按时间
   顺序以聊天样式重放，与实时消息同款，无感恢复。
 
-### 导出
+### 画布（最新 drawio 原生编辑器）
 
-画布右下角 **PNG / SVG / XML** 三个按钮：
+画布内嵌完整的最新版 drawio：拖动、连线、文字、样式面板、对齐、图库等
+全部原生可用；会话切换与模型编辑后自动加载最新文件。
 
-- **PNG**：服务端 chromium 2x 渲染当前图（白底、带边距）
-- **SVG**：矢量导出（含旋转后的视觉形态），可直接用于报告/文档
-- **XML**：当前 `.drawio` 文件原文（canonical 格式，drawio 应用可直接打开）
+- **手动编辑自动落盘**：改动防抖 600ms 同步到服务端 canonicalize 后写回
+  文件（任务运行中暂缓），不写聊天历史
+- **选中随消息附带**：内置 sel 桥插件，点选/框选即进入下一条消息的引用
+- **导出**：用 drawio 自带的 File → Export（PNG/SVG/XML 原生精确导出）
+- 模型 view 截图与画布同一引擎渲染，所见即所得
 
 ### CLI（辅助）
 
@@ -97,7 +102,8 @@ cargo run -p drawio-harness -- demo.drawio "把 svc-b 改成绿色，加一条�
 ```
 
 REPL 常用命令：`/history`（`/history N` 看轨迹）`/ctx-save x.json`
-`/ctx-load x.json` `/sel` `/stop`。
+`/ctx-load x.json` `/sel` `/stop`。`/view` 用 drawio 原生导出渲染 PNG
+（需要 webapp 已缓存）。
 
 ## 代码布局
 
@@ -107,7 +113,7 @@ REPL 常用命令：`/history`（`/history N` 看轨迹）`/ctx-save x.json`
 | `crates/harness/src/refs.rs` | @ 引用解析与上下文注入 |
 | `crates/harness/src/tools.rs` | read locate edit draw check view |
 | `crates/harness/src/chat.rs` | OpenAI-compatible chat（text + image parts） |
-| `crates/harness/web/` + `web.rs` | Web 入口：多会话、流式进度/打断、历史重放、mxGraph 画布 |
+| `crates/harness/web/` + `web.rs` | Web 入口：多会话、流式进度/打断、历史重放、drawio iframe 编辑器 + sel 插件桥（离线回退 mxGraph 画布） |
 | `crates/harness/src/engine.rs` | JSON 信封循环、用量/预算/上下文守卫 |
 | `crates/harness/src/main.rs` | CLI 入口（web / REPL / one-shot / new / config） |
-| `crates/renderer` | chromium CDP 渲染（headless-shell 自动拉取 + SHA-256 校验） |
+| `crates/renderer` | 无头渲染：drawio webapp 获取（draw.war）+ 原生 export 协议驱动（headless-shell 为宿主） |
