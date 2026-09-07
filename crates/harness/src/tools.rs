@@ -127,8 +127,10 @@ impl Tools {
    画布坐标与 xml 行区间没有 1:1 对应：定位用 read query，几何值用 read。
 
 8. layout {"move": {"ids": [...], "dx": n, "dy": n}}
+         或 {"move": [{"id": "a", "dx": 10, "dy": 0}, {"id": "b", "dx": -20, "dy": 5}]}
          或 {"align": {"ids": [...], "axis": "x"|"y", "mode": "left"|"right"|"center"|"top"|"bottom"|"middle"|"gap"}}
-   几何级工具：批量平移或对齐/等距分布多个 cell。只动 mxGeometry，
+   几何级工具：批量平移/对齐/等距分布多个 cell——涉及位置调整优先用它，
+   支持一次移动多个 cell、每个 cell 不同偏移量。只动 mxGeometry，
    不碰文本/样式/连线（那些用 edit）。整批一次落盘，失败整体回滚。
 
 7. 结束  {"reply": "<给用户的总结>", "done": true}
@@ -198,19 +200,36 @@ impl Tools {
     fn layout(&self, doc: &mut XmlDoc, args: &Value) -> Result<ToolOutput, String> {
         let mut edits: Vec<(usize, usize, String)> = Vec::new();
         if let Some(m) = args.get("move") {
-            let ids: Vec<String> = m
-                .get("ids")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "move 需要 ids 数组".to_string())?
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
-            let dx = m.get("dx").and_then(Value::as_f64).unwrap_or(0.0);
-            let dy = m.get("dy").and_then(Value::as_f64).unwrap_or(0.0);
-            if ids.is_empty() {
-                return Err("move 的 ids 不能为空".to_string());
+            // 两种形态：统一偏移 {"ids":[...], "dx":n, "dy":n}
+            //         逐个偏移 [{"id":..,"dx":..,"dy":..}, ...]
+            let items: Vec<(String, f64, f64)> = if let Some(arr) = m.as_array() {
+                arr.iter()
+                    .map(|v| {
+                        let id = v
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| "move 数组项需要 id".to_string())?;
+                        let dx = v.get("dx").and_then(Value::as_f64).unwrap_or(0.0);
+                        let dy = v.get("dy").and_then(Value::as_f64).unwrap_or(0.0);
+                        Ok((id.to_string(), dx, dy))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+            } else {
+                let ids: Vec<String> = m
+                    .get("ids")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "move 需要 ids 数组或 [{id,dx,dy},...] 数组".to_string())?
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                let dx = m.get("dx").and_then(Value::as_f64).unwrap_or(0.0);
+                let dy = m.get("dy").and_then(Value::as_f64).unwrap_or(0.0);
+                ids.into_iter().map(|id| (id, dx, dy)).collect()
+            };
+            if items.is_empty() {
+                return Err("move 不能为空".to_string());
             }
-            for id in &ids {
+            for (id, dx, dy) in &items {
                 let (x, y, w, h) = doc
                     .geometry_of(id)
                     .ok_or_else(|| format!("cell `{id}` 不存在或其几何不可读"))?;
@@ -692,6 +711,23 @@ mod tests {
         let gb = d.geometry_of("svc-b").unwrap();
         assert_eq!((ga.0, ga.1), (80.0, 70.0));
         assert_eq!((gb.0, gb.1), (300.0, 70.0));
+    }
+
+    #[tokio::test]
+    async fn layout_move_array_supports_per_cell_offsets() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        let out = t.run(&mut d, "layout", &serde_json::json!({
+            "move": [
+                {"id": "svc-a", "dx": 10, "dy": 5},
+                {"id": "svc-b", "dx": -30, "dy": 0}
+            ]
+        })).await.unwrap();
+        assert!(out.text.contains("changed=[svc-a, svc-b]"), "{}", out.text);
+        let ga = d.geometry_of("svc-a").unwrap();
+        let gb = d.geometry_of("svc-b").unwrap();
+        assert_eq!((ga.0, ga.1), (50.0, 65.0), "a 按自己的偏移");
+        assert_eq!((gb.0, gb.1), (230.0, 60.0), "b 按自己的偏移");
     }
 
     #[tokio::test]

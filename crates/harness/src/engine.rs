@@ -393,6 +393,10 @@ impl Harness {
         let mut tool_calls = 0usize;
         let mut last_err: Option<String> = None;
         let mut bad_tools = 0usize;
+        // 自检门槛状态：本轮改过图但没 view 就 reply → 拦一次
+        let mut did_edit = false;
+        let mut did_view = false;
+        let mut view_gate_used = false;
         let mut spent: f64 = 0.0;
         let mut usage = Usage::default();
 
@@ -519,6 +523,17 @@ impl Harness {
             envelopes.push(raw.clone());
 
             if let Some(reply) = env.get("reply").and_then(Value::as_str) {
+                // 自检门槛：本轮改过图（draw/edit 落盘）但从未 view 自检 →
+                // 拦一次让模型先看图再收尾。只拦一次，避免死循环。
+                if did_edit && !did_view && !view_gate_used && tool_calls > 0 {
+                    view_gate_used = true;
+                    history.push(Message::assistant(raw.clone()));
+                    history.push(Message::user(
+                        "你本轮修改了图但还没有用 view 看过成图——先调用一次 view 自检布局/箭头/间距是否符合意图（不必机械追求零瑕疵），再决定收尾或继续修。"
+                            .to_string(),
+                    ));
+                    continue;
+                }
                 let reply = reply.to_string();
                 history.push(Message::assistant(reply.clone()));
                 emit!(EngineEvent::Final { reply: reply.clone() });
@@ -596,6 +611,12 @@ impl Harness {
             }
             bad_tools = 0;
             let args = env.get("args").cloned().unwrap_or(json!({}));
+            if matches!(name, "draw" | "edit") {
+                did_edit = true;
+            }
+            if name == "view" {
+                did_view = true;
+            }
             emit!(EngineEvent::Tool {
                 name: name.to_string(),
                 args: serde_json::to_string(&args).unwrap_or_default(),
@@ -722,6 +743,43 @@ mod tests {
             .await
             .unwrap();
         assert!(!out2.reply.contains("文件没有被修改"), "{}", out2.reply);
+    }
+
+    #[tokio::test]
+    async fn view_gate_intercepts_reply_after_edits_without_view() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let replacement = r#"<mxCell id="b" value="B v2" vertex="1" parent="1"><mxGeometry x="220" y="0" width="120" height="50" as="geometry"/></mxCell>"#;
+        let mut fake = FakeChat::new(vec![
+            r#"{"tool":"edit","args":{"range":"cell:b","text":"<mxCell id=\"b\" value=\"B2\" parent=\"1\"/>"}}"#,
+            r#"{"reply":"改好了","done":true}"#, // 第一次 reply：应被门槛拦截
+            r#"{"tool":"view","args":{}}"#,
+            r#"{"reply":"看过图了，完成","done":true}"#,
+        ]);
+        let mock = drawio_agent_renderer::MockDriver::new()
+            .with_bytes(vec![0x89, b'P', b'N', b'G', 0x0d]);
+        let renderer = drawio_agent_renderer::Renderer::new(std::sync::Arc::new(mock));
+        let mut tools = Tools::with_renderer(renderer);
+        let outcome = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "改 b 的值", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.reply, "看过图了，完成");
+        assert_eq!(outcome.tool_calls, 2, "edit + 被拦后补的 view");
+        // 第二次 reply 不再被拦（view_gate_used）
+        let text: Vec<String> = fake
+            .snapshots
+            .iter()
+            .flat_map(|snap| {
+                snap.iter().filter_map(|m| match &m.parts[0] {
+                    Part::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert!(
+            text.iter().any(|t| t.contains("还没有用 view 看过")),
+            "门槛提醒应出现"
+        );
     }
 
     #[tokio::test]
