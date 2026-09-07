@@ -57,20 +57,6 @@ pub struct Report {
     pub warnings: Vec<Issue>,
     pub info: Vec<Issue>,
     pub stats: Stats,
-    /// id → 显示名（value 优先；无 value 用 id 本身）
-    #[serde(skip)]
-    pub labels: std::collections::HashMap<String, String>,
-}
-
-impl Report {
-    /// id 的人类可读标注：有 value 则 `id（value）`，否则仅 id。
-    /// 用户手动添加的 cell 是 drawio 随机 id，单独看不可读。
-    pub fn display_id(&self, id: &str) -> String {
-        match self.labels.get(id) {
-            Some(v) if !v.trim().is_empty() && v != id => format!("{id}（{v}）"),
-            _ => id.to_string(),
-        }
-    }
 }
 
 /// (cells, page 尺寸) 解析结果。
@@ -361,11 +347,6 @@ fn est_label_width(value: &str, font_size: f64) -> f64 {
 pub fn analyze(xml: &str) -> Result<Report, String> {
     let (cells, page) = parse_geom(xml)?;
     let mut report = Report::default();
-    for c in &cells {
-        report
-            .labels
-            .insert(c.id.clone(), c.value.trim().to_string());
-    }
     let vertices: Vec<&GeomCell> = cells.iter().filter(|c| !c.is_edge).collect();
     let edges: Vec<&GeomCell> = cells.iter().filter(|c| c.is_edge).collect();
     report.stats.vertices = vertices.len();
@@ -655,15 +636,13 @@ pub fn lint_text(report: &Report) -> String {
         return out;
     }
     for e in &report.errors {
-        let ids: Vec<String> = e.ids.iter().map(|i| report.display_id(i)).collect();
-        out.push_str(&format!("\n[error:{}] {} —— {}", e.kind, ids.join(", "), e.detail));
+        out.push_str(&format!("\n[error:{}] {} —— {}", e.kind, e.ids.join(", "), e.detail));
     }
     for w in &report.warnings {
-        let ids: Vec<String> = w.ids.iter().map(|i| report.display_id(i)).collect();
         out.push_str(&format!(
             "\n[warning:{}] {} —— {}",
             w.kind,
-            ids.join(", "),
+            w.ids.join(", "),
             w.detail
         ));
     }
@@ -683,24 +662,6 @@ mod tests {
         format!(
             "<mxCell id=\"{id}\" value=\"{value}\" vertex=\"1\" parent=\"1\"><mxGeometry x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" as=\"geometry\"/></mxCell>"
         )
-    }
-
-    #[test]
-    fn lint_text_annotates_random_ids_with_value() {
-        // drawio 手画 cell 的机器 id 应附 value 展示
-        let xml = doc(&format!(
-            "{}{}",
-            vertex("mATdh3SfDgM2DwkArX0L-1", 0.0, 0.0, 100.0, 100.0, "订单服务"),
-            vertex("yG2q8zUe4LmNc1PwR0-2", 50.0, 50.0, 100.0, 100.0, "支付服务")
-        ));
-        let r = analyze(&xml).unwrap();
-        assert_eq!(r.stats.overlaps, 1);
-        let text = lint_text(&r);
-        assert!(
-            text.contains("订单服务") && text.contains("mATdh3SfDgM2DwkArX0L-1"),
-            "{text}"
-        );
-        assert!(!text.contains("（订单服务）（"), "不应双重标注");
     }
 
     #[test]
