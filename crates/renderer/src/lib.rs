@@ -40,6 +40,8 @@ pub struct RenderOptions {
     pub annotate: bool,
     /// 只导出这些 cell 的包围盒区域（放大视图；空 = 全图）。
     pub focus: Vec<String>,
+    /// 若设置：渲染出的 PNG 另存到该目录（复盘/调试用）。
+    pub trace_dir: Option<String>,
 }
 
 impl Default for RenderOptions {
@@ -50,6 +52,7 @@ impl Default for RenderOptions {
             border: 10,
             annotate: false,
             focus: Vec::new(),
+            trace_dir: None,
         }
     }
 }
@@ -104,6 +107,19 @@ impl Renderer {
         if xml.trim().is_empty() {
             return Err(RenderError::Xml("empty XML input".into()));
         }
-        self.driver.render(xml, opts).await
+        let png = self.driver.render(xml, opts).await?;
+        if let Some(dir) = &opts.trace_dir {
+            let dir = std::path::Path::new(dir);
+            let _ = std::fs::create_dir_all(dir);
+            let name = format!(
+                "trace-{}.png",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            );
+            let _ = std::fs::write(dir.join(name), &png);
+        }
+        Ok(png)
     }
 }

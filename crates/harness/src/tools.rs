@@ -314,6 +314,7 @@ impl Tools {
             }
         };
         let mut opts = drawio_agent_renderer::RenderOptions::default();
+        opts.trace_dir = std::env::var("DRAWIO_RENDER_TRACE_DIR").ok();
         // 可选增强：annotate=id 徽章标注；focus=[cell ids] 局部裁剪放大
         if args.get("annotate").and_then(Value::as_bool) == Some(true) {
             opts.annotate = true;
