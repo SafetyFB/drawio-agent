@@ -102,7 +102,13 @@ impl Tools {
    确定性校验：XML 结构、id 唯一、parent/source/target 引用完整。
    edit/draw 之后建议调用。
 
-6. view   {}
+6. lint   {}
+   确定性布局质量检查：重叠、连线交叉/穿框、标签溢出、越界、断引用。
+   返回分级清单（error/warning + cell id）。edit/draw 之后建议调用，
+   比纯眼睛可靠；warning 阈值化，不必强行全清（0 交叉但布局怪
+   反而更差）。
+
+7. view   {}
    渲染当前文件为截图并作为图像消息发给你——你会真正看到这张图。
    检查：节点重叠、文字溢出框体、连线错位/穿框、箭头方向、布局失衡。
    看完再决定改哪里；不要连续重复调用（上一张图已经在你的上下文里）。
@@ -127,6 +133,11 @@ impl Tools {
             "edit" => self.edit(doc, args, false),
             "draw" => self.edit(doc, args, true),
             "check" => self.check(doc),
+            "lint" => {
+                let report = crate::metrics::analyze(doc.canonical())
+                    .map_err(|e| format!("lint 失败: {e}"))?;
+                Ok(ToolOutput::text(crate::metrics::lint_text(&report)))
+            }
             "view" => {
                 let open = args
                     .get("open")
@@ -134,7 +145,7 @@ impl Tools {
                     .unwrap_or(false);
                 self.view(doc, open).await
             }
-            other => Err(format!("未知工具 `{other}`。可用: read locate edit draw check view")),
+            other => Err(format!("未知工具 `{other}`。可用: read locate edit draw check lint view")),
         }
     }
 

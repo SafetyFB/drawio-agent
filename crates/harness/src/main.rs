@@ -55,6 +55,68 @@ fn main() {
         return;
     }
 
+    if args[0] == "metrics" {
+        let Some(path) = args.get(1) else {
+            eprintln!("用法: drawio-harness metrics <file.drawio>");
+            std::process::exit(2);
+        };
+        match std::fs::read_to_string(path) {
+            Ok(xml) => match drawio_harness::metrics::analyze(&xml) {
+                Ok(report) => {
+                    let mut out = serde_json::json!({
+                        "stats": report.stats,
+                        "errors": report.errors,
+                        "warnings": report.warnings,
+                        "info_count": report.info.len(),
+                    });
+                    // 效率指标：读同目录 <stem>.history.jsonl
+                    let stem = std::path::Path::new(path)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let hist = std::path::Path::new(path)
+                        .with_file_name(format!("{stem}.history.jsonl"));
+                    if let Ok(raw) = std::fs::read_to_string(&hist) {
+                        let mut asks = 0usize;
+                        let mut rounds = 0usize;
+                        let mut tokens_in = 0u64;
+                        let mut failures = 0usize;
+                        for line in raw.lines() {
+                            if let Ok(d) = serde_json::from_str::<serde_json::Value>(line) {
+                                asks += 1;
+                                rounds += d
+                                    .get("events")
+                                    .and_then(|e| e.as_array())
+                                    .map(|e| e.len())
+                                    .unwrap_or(0);
+                                tokens_in += d.get("usage_in").and_then(|v| v.as_u64()).unwrap_or(0);
+                                if d.get("error").and_then(|v| v.as_str()).is_some() {
+                                    failures += 1;
+                                }
+                            }
+                        }
+                        out["efficiency"] = serde_json::json!({
+                            "asks": asks,
+                            "total_events": rounds,
+                            "tokens_in": tokens_in,
+                            "failed_asks": failures,
+                        });
+                    }
+                    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                }
+                Err(e) => {
+                    eprintln!("metrics 失败: {e}");
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                eprintln!("读文件失败: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if args[0] == "web" {
         // drawio-harness web [port]
         // 会话目录不再对外暴露：统一在 ~/.drawio-agent/files（DRAWIO_DIR
