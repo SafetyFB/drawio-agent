@@ -851,6 +851,7 @@ let drawioMode = false;
 let drawioFrame = null;
 let drawioXmlDirty = false;
 let drawioSyncTimer = 0;
+let drawioIgnoreAutosave = 0; // 程序化 load 之后的回显窗口（时间戳）
 
 function enableDrawioMode() {
   drawioMode = true;
@@ -892,7 +893,9 @@ function onDrawioMessage(e) {
     case 'autosave':
       // 手动编辑 → 防抖 → /api/manual（canonicalize 落盘）。不回灌
       // canonical 到 iframe（会重置 drawio 的 undo 栈与光标）。
-      if (d.xml) {
+      // 程序化 load 会触发 autosave 回显（内容=旧 xml）——回显窗口内
+      // 忽略，否则任务期重试队列可能把旧内容写回磁盘覆盖模型编辑。
+      if (d.xml && Date.now() >= drawioIgnoreAutosave) {
         currentXml = d.xml;
         drawioXmlDirty = true;
         clearTimeout(drawioSyncTimer);
@@ -928,6 +931,8 @@ async function syncDrawioXml() {
 }
 
 function drawioLoad(xml) {
+  // 2s 回显忽略窗：本次 load 触发的 autosave 不算用户编辑
+  drawioIgnoreAutosave = Date.now() + 2000;
   if (drawioFrame && drawioFrame.contentWindow) {
     drawioFrame.contentWindow.postMessage(JSON.stringify({
       action: 'load', autosave: 1, xml,
