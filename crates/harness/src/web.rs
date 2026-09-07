@@ -191,7 +191,7 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
         .route("/drawio/", get(drawio_index))
         .route("/drawio/*path", get(drawio_static))
         .route("/drawio-plugin.js", get(drawio_plugin))
-                                .route("/api/state", get(api_state))
+                                        .route("/api/state", get(api_state))
         .route("/api/sessions", get(api_sessions_list).post(api_sessions_create))
         .route("/api/sessions/switch", post(api_sessions_switch))
         .route("/api/sessions/:name", axum::routing::delete(api_sessions_delete))
