@@ -868,8 +868,10 @@ async fn api_chat_stream(
         }
         // 历史记录：只记录真正完成的任务（断开/取消不污染聊天重放）
         if !disconnected {
-            if let Ok(o) = &outcome {
-                let rec = HistoryRec {
+            // 无论成功失败都落盘轨迹（失败时 error 字段携带原因——
+            // 达到最大轮数/预算/连续坏信封等任务死因必须可复盘）。
+            let rec = match &outcome {
+                Ok(o) => HistoryRec {
                     ts: history::now_secs(),
                     user: req.text.clone(),
                     reply: o.reply.clone(),
@@ -880,8 +882,33 @@ async fn api_chat_stream(
                     events: events.lock().map(|v| v.clone()).unwrap_or_default(),
                     xml: doc.canonical().to_string(),
                     error: None,
-                };
-                let _ = history::append(&history::history_path(&doc.path), &rec);
+                },
+                Err(e) => {
+                    let evs = events.lock().map(|v| v.clone()).unwrap_or_default();
+                    let calls = evs
+                        .iter()
+                        .filter(|ev| {
+                            ev.get("name")
+                                .and_then(|v| v.as_str())
+                                .is_some()
+                        })
+                        .count();
+                    HistoryRec {
+                        ts: history::now_secs(),
+                        user: req.text.clone(),
+                        reply: String::new(),
+                        tool_calls: calls as u32,
+                    usage_in: stats.usage.input_tokens,
+                    usage_out: stats.usage.output_tokens,
+                    cost_yuan: stats.cost_yuan,
+                    events: evs,
+                    xml: doc.canonical().to_string(),
+                    error: Some(e.to_string()),
+                    }
+                }
+            };
+            if let Err(e) = history::append(&history::history_path(&doc.path), &rec) {
+                eprintln!("history 落盘失败: {e}");
             }
         }
         // 记忆/用量无论如何落盘
