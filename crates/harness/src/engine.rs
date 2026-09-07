@@ -328,7 +328,7 @@ fn estimate_tokens(msgs: &[Message]) -> u64 {
     for m in msgs {
         for p in &m.parts {
             match p {
-                Part::Text(s) => t += (s.chars().count() as u64 + 1) / 2,
+                Part::Text(s) => t += (s.chars().count() as u64).div_ceil(2),
                 Part::ImagePng(_) => t += 900,
             }
         }
@@ -339,6 +339,7 @@ fn estimate_tokens(msgs: &[Message]) -> u64 {
 impl Harness {
     /// Run one user ask to completion. `stats` accumulates this ask's
     /// usage/cost so the caller keeps session totals across asks.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         chat: &mut dyn Chat,

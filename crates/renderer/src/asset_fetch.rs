@@ -1,9 +1,8 @@
-//! Shared download / checksum / cache-root helpers, used both by build.rs
-//! (headless-shell) and at runtime (drawio webapp war).
+//! 共享下载/校验工具（运行时使用：drawio webapp + headless-shell）。
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use sha2::Digest;
@@ -71,27 +70,3 @@ pub fn sha256_file(p: &Path) -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
-/// Shared agent cache root: DRAWIO_AGENT_CACHE_DIR > XDG_CACHE_HOME >
-/// macOS ~/Library/Caches > windows LOCALAPPDATA > ~/.cache > cwd fallback.
-pub fn cache_root() -> PathBuf {
-    if let Ok(p) = std::env::var("DRAWIO_AGENT_CACHE_DIR") {
-        return PathBuf::from(p);
-    }
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        return PathBuf::from(xdg).join("drawio-agent");
-    }
-    if cfg!(target_os = "macos") {
-        if let Ok(home) = std::env::var("HOME") {
-            return Path::new(&home).join("Library/Caches/drawio-agent");
-        }
-    }
-    if cfg!(target_os = "windows") {
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            return Path::new(&local).join("drawio-agent");
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return Path::new(&home).join(".cache/drawio-agent");
-    }
-    PathBuf::from(".drawio-agent-cache")
-}

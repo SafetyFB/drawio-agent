@@ -35,10 +35,11 @@ include!(concat!(env!("OUT_DIR"), "/bundled_chromium.rs"));
 // Binary discovery
 // ---------------------------------------------------------------------------
 
-/// Resolve the Chromium binary path. Looks at (in order):
+/// Resolve a usable CDP browser binary. Lookup order (see chromium_ensure):
 /// 1. `DRAWIO_AGENT_CHROMIUM_PATH` env var (always wins)
-/// Resolve a usable CDP browser binary: explicit override → cached bundled
-/// → system Chrome/Chromium/Edge → lazy download (see chromium_ensure).
+/// 2. Cached bundled chrome-headless-shell
+/// 3. System Chrome/Chromium/Edge/Brave (no download)
+/// 4. Lazy download of the pinned bundle
 pub fn find_chromium() -> Option<PathBuf> {
     crate::chromium_ensure::resolve_chromium()
         .map_err(|e| eprintln!("chromium 解析失败: {e}"))
@@ -49,24 +50,6 @@ pub fn find_chromium() -> Option<PathBuf> {
 /// Returns the build-time resolved path to chrome-headless-shell, if any.
 pub fn bundled_chromium_path() -> Option<PathBuf> {
     BUNDLED_CHROMIUM_PATH.map(PathBuf::from)
-}
-
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        {
-            let exe = dir.join(format!("{name}.exe"));
-            if exe.is_file() {
-                return Some(exe);
-            }
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------

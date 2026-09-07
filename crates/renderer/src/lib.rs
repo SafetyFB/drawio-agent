@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 pub mod asset_fetch;
+pub mod cache;
 pub mod checksum;
 pub mod chromium_ensure;
 pub mod drawio_app;

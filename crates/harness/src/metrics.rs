@@ -59,13 +59,15 @@ pub struct Report {
     pub stats: Stats,
 }
 
+/// (cells, page 尺寸) 解析结果。
+type ParseGeom = (Vec<GeomCell>, Option<(f64, f64)>);
+
 /// 解析 canonical XML 中的 cell 几何（mxCell + mxGeometry + mxPoint）。
-pub fn parse_geom(xml: &str) -> Result<(Vec<GeomCell>, Option<(f64, f64)>), String> {
+pub fn parse_geom(xml: &str) -> Result<ParseGeom, String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let mut cells: Vec<GeomCell> = Vec::new();
     let mut cur: Option<GeomCell> = None;
-    let mut in_geometry = false;
     let mut in_array = false;
     let mut page: Option<(f64, f64)> = None;
     let mut buf = Vec::new();
@@ -111,13 +113,9 @@ pub fn parse_geom(xml: &str) -> Result<(Vec<GeomCell>, Option<(f64, f64)>), Stri
                                 _ => {}
                             }
                         }
-                        cur = Some(c);
-                        in_geometry = false;
-                        in_array = false;
+                        cur = Some(c);                        in_array = false;
                     }
-                    b"mxGeometry" => {
-                        in_geometry = true;
-                        if let Some(c) = cur.as_mut() {
+                    b"mxGeometry" => {                        if let Some(c) = cur.as_mut() {
                             for attr in e.attributes().flatten() {
                                 let key = attr.key.as_ref();
                                 let val = attr
@@ -137,25 +135,23 @@ pub fn parse_geom(xml: &str) -> Result<(Vec<GeomCell>, Option<(f64, f64)>), Stri
                     }
                     b"Array" => in_array = true,
                     b"mxPoint" => {
-                        if in_array {
-                            if let Some(c) = cur.as_mut() {
-                                let mut px = 0.0;
-                                let mut py = 0.0;
-                                for attr in e.attributes().flatten() {
-                                    let key = attr.key.as_ref();
-                                    let val = attr
-                                        .unescape_value()
-                                        .unwrap_or_default()
-                                        .into_owned();
-                                    let f = val.parse::<f64>().unwrap_or(0.0);
-                                    match key {
-                                        b"x" => px = f,
-                                        b"y" => py = f,
-                                        _ => {}
-                                    }
+                        if let (true, Some(c)) = (in_array, cur.as_mut()) {
+                            let mut px = 0.0;
+                            let mut py = 0.0;
+                            for attr in e.attributes().flatten() {
+                                let key = attr.key.as_ref();
+                                let val = attr
+                                    .unescape_value()
+                                    .unwrap_or_default()
+                                    .into_owned();
+                                let f = val.parse::<f64>().unwrap_or(0.0);
+                                match key {
+                                    b"x" => px = f,
+                                    b"y" => py = f,
+                                    _ => {}
                                 }
-                                c.points.push((px, py));
                             }
+                            c.points.push((px, py));
                         }
                     }
                     _ => {}
@@ -163,7 +159,7 @@ pub fn parse_geom(xml: &str) -> Result<(Vec<GeomCell>, Option<(f64, f64)>), Stri
             }
             Ok(Event::End(e)) => {
                 match e.name().as_ref() {
-                    b"mxGeometry" => in_geometry = false,
+
                     b"Array" => in_array = false,
                     b"mxCell" => {
                         if let Some(mut c) = cur.take() {
@@ -201,25 +197,23 @@ pub fn parse_geom(xml: &str) -> Result<(Vec<GeomCell>, Option<(f64, f64)>), Stri
                         }
                     }
                     b"mxPoint" => {
-                        if in_array {
-                            if let Some(c) = cur.as_mut() {
-                                let mut px = 0.0;
-                                let mut py = 0.0;
-                                for attr in e.attributes().flatten() {
-                                    let key = attr.key.as_ref();
-                                    let val = attr
-                                        .unescape_value()
-                                        .unwrap_or_default()
-                                        .into_owned();
-                                    let f = val.parse::<f64>().unwrap_or(0.0);
-                                    match key {
-                                        b"x" => px = f,
-                                        b"y" => py = f,
-                                        _ => {}
-                                    }
+                        if let (true, Some(c)) = (in_array, cur.as_mut()) {
+                            let mut px = 0.0;
+                            let mut py = 0.0;
+                            for attr in e.attributes().flatten() {
+                                let key = attr.key.as_ref();
+                                let val = attr
+                                    .unescape_value()
+                                    .unwrap_or_default()
+                                    .into_owned();
+                                let f = val.parse::<f64>().unwrap_or(0.0);
+                                match key {
+                                    b"x" => px = f,
+                                    b"y" => py = f,
+                                    _ => {}
                                 }
-                                c.points.push((px, py));
                             }
+                            c.points.push((px, py));
                         }
                     }
                     _ => {}
@@ -413,7 +407,8 @@ pub fn analyze(xml: &str) -> Result<Report, String> {
     report.stats.overlaps = report.warnings.len();
 
     // warnings: 交叉（edge×edge 与 edge×顶点矩形）
-    let segs: Vec<(String, Vec<((f64, f64), (f64, f64))>)> = edges
+    type Seg = (String, Vec<((f64, f64), (f64, f64))>);
+    let segs: Vec<Seg> = edges
         .iter()
         .map(|e| (e.id.clone(), edge_segments(e, &cells)))
         .collect();

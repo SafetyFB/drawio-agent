@@ -97,7 +97,7 @@ pub fn resolve_refs(text: &str, doc: &XmlDoc) -> (Vec<ResolvedRef>, Vec<String>,
 
 fn resolve_one(spec: &str, doc: &XmlDoc) -> Result<ResolvedRef, XmlError> {
     let (start, end) = doc.resolve_range(spec)?;
-    let lines = crate::xmlfile::lines_in(&doc.canonical(), start, end);
+    let lines = crate::xmlfile::lines_in(doc.canonical(), start, end);
     let canonical = if let Some(id) = spec.strip_prefix("cell:") {
         if doc.id_to_cell(id).is_some() {
             format!("@cell:{id}")

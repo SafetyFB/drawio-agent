@@ -8,13 +8,9 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::drawio_app::ensure_drawio_app;
-use crate::RenderOptions;
-
 static PORT: OnceLock<u16> = OnceLock::new();
 
 /// 导出侧插件：徽章标注（碰撞避让）+ 裁剪矩形信息 + overlay XML 回传。

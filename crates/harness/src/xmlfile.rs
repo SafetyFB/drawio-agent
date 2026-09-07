@@ -708,7 +708,6 @@ impl XmlDoc {
             ("width", w),
             ("height", h),
         ] {
-            let re = format!(r#"({attr}=\")[^\"]*(\")"#);
             // 简单手写：找到 attr=" 后到下一个 " 的区间
             let pat = format!("{attr}=\"");
             let Some(starti) = out_line.find(&pat) else {
@@ -803,9 +802,9 @@ impl XmlDoc {
         Err(XmlError::BadRange(spec.into()))
     }
 
-    /// Apply a textual edit over `[start..=end]` lines: validate + canonicalize
-    /// + re-index + diff, then commit. Nothing is written to disk here; the
-    /// caller saves (REPL saves after every applied edit).
+    /// Apply a textual edit over `[start..=end]` lines: validate, canonicalize,
+    /// re-index, diff, then commit. Nothing is written to disk here; the caller
+    /// saves (REPL saves after every applied edit).
     pub fn apply_edit(
         &mut self,
         start: usize,

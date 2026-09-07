@@ -210,10 +210,7 @@ fn main() {
     }
     print_doc_summary(&doc);
 
-    let chat: Option<OpenAiChat> = match OpenAiChat::from_effective() {
-        Ok(c) => Some(c),
-        Err(_) => None,
-    };
+    let chat: Option<OpenAiChat> = OpenAiChat::from_effective().ok();
     if chat.is_none() {
         println!("提示: LLM 未配置。配置方式: drawio-harness config set --base-url … --model …，或用 DRAWIO_LLM_BASE_URL / DRAWIO_LLM_MODEL / DRAWIO_LLM_API_KEY 环境变量。当前进入本地工具模式（/view /check /xml /sel 仍可用）。");
     }

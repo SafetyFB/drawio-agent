@@ -236,17 +236,17 @@ const MIME: &[(&str, &str)] = &[
     ("xml", "application/xml"), ("txt", "text/plain"), ("webp", "image/webp"),
 ];
 
-fn drawio_dir_or_404(st: &AppState) -> Result<PathBuf, Response> {
+fn drawio_dir_or_404(st: &AppState) -> Result<PathBuf, Box<Response>> {
     match &st.drawio {
         Some(d) => Ok(d.clone()),
-        None => Err((StatusCode::NOT_FOUND, "drawio webapp 未缓存").into_response()),
+        None => Err(Box::new((StatusCode::NOT_FOUND, "drawio webapp 未缓存").into_response())),
     }
 }
 
 async fn drawio_index(State(st): State<AppState>) -> Response {
     let dir = match drawio_dir_or_404(&st) {
         Ok(d) => d,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     serve_drawio_file(&dir.join("index.html"), "index.html")
 }
@@ -257,7 +257,7 @@ async fn drawio_static(
 ) -> Response {
     let dir = match drawio_dir_or_404(&st) {
         Ok(d) => d,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     // 路径消毒：拒绝 .. 与绝对路径
     let rel = std::path::Path::new(&path);
@@ -777,8 +777,10 @@ async fn api_chat_stream(
         };
         // Canvas selection -> @cell refs (same as REPL /sel)。
         let ctx = selection_ctx(&req.cell_ids, &doc);
-        let mut harness = Harness::default();
-        harness.max_turns = opts.max_turns.max(1);
+        let harness = Harness {
+            max_turns: opts.max_turns.max(1),
+            ..Default::default()
+        };
         let tx2 = tx.clone();
         let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
         let events2 = events.clone();

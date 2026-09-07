@@ -8,8 +8,8 @@
 use std::env;
 use std::path::PathBuf;
 
-#[path = "src/asset_fetch.rs"]
-mod asset_fetch;
+#[path = "src/cache.rs"]
+mod cache;
 
 fn platform_slug() -> Option<&'static str> {
     let os = env::var("CARGO_CFG_TARGET_OS").ok()?;
@@ -44,7 +44,7 @@ fn main() {
     // 路径照缓存布局发射（运行时按需下载填充；不存在 = 还没拉取过）。
     let path_str = platform_slug().map(|platform| {
         // 与 src/chromium_ensure.rs::PINNED_CHROMIUM_VERSION 保持同步
-        asset_fetch::cache_root()
+        cache::cache_root()
             .join("chrome-headless-shell")
             .join("131.0.6778.85")
             .join(platform)

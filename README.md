@@ -1,7 +1,7 @@
 # drawio-harness
 
 一个 Draw.io AI 画图 agent：**浏览器是主入口**，本地 chat + 工具调用
-（read / locate / edit / draw / check / view），唯一工件是磁盘上一个规范
+（read / edit / draw / check / view / layout），唯一工件是磁盘上一个规范
 pretty-print 的 `.drawio` 文件。局部性靠「文件 + 行区间文本编辑 + @file
 式引用」实现，不引入 typed XML 模型与分阶段协议。
 
@@ -18,12 +18,18 @@ pretty-print 的 `.drawio` 文件。局部性靠「文件 + 行区间文本编�
   `{"reply": ..., "done": true}`；工具结果回填下一轮。`view` 会把渲染截图
   作为图像消息直接发给模型（视觉闭环在一条对话里完成）。任意的
   OpenAI-compatible 端点即可接入（需支持视觉时用多模态模型）。
+- **工具五类**：
+  - 查询 `read`（`range` 读行区间 / `query` 按文本搜 cell）
+  - 内容 `edit`（单区间或批量 `ranges`，全或无原子落盘）、`draw`（整图重建）
+  - 几何 `layout`（`align` 对齐/等距、`move` 批量平移）
+  - 校验 `check`（结构 + 布局 lint 摘要：重叠/交叉/标签溢出/越界/分支平行）
+  - 感知 `view`（截图，`annotate` id 徽章标注、`focus` 局部裁剪放大）
 
 ## 构建与首次运行
 
 ```bash
 cargo build
-cargo test -p drawio-harness          # 50 tests
+cargo test -p drawio-harness          # 66 tests
 cargo test -p drawio-agent-renderer   # 校验/渲染测试
 ```
 
@@ -68,7 +74,7 @@ cargo run -p drawio-harness -- web 4000  # 自定义端口
 
 ### 聊天（AI 画图）
 
-- 输入消息回车发送；模型自主调用 read / locate / edit / draw / check / view
+- 输入消息回车发送；模型自主调用 read / edit / draw / check / view / layout
   工具闭环改图，每轮工具调用与 token 花费**实时流式**渲染，发送中可「停止」。
 - **多轮记忆**：每轮随上下文注入（超限自动裁剪），随会话持久化，重启/切换
   会话恢复。
@@ -113,7 +119,7 @@ REPL 常用命令：`/history`（`/history N` 看轨迹）`/ctx-save x.json`
 |---|---|
 | `crates/harness/src/xmlfile.rs` | 规范化 / 解压 / 校验 / span 索引 / 行区间编辑 |
 | `crates/harness/src/refs.rs` | @ 引用解析与上下文注入 |
-| `crates/harness/src/tools.rs` | read locate edit draw check view |
+| `crates/harness/src/tools.rs` | read edit draw check view layout |
 | `crates/harness/src/chat.rs` | OpenAI-compatible chat（text + image parts） |
 | `crates/harness/web/` + `web.rs` | Web 入口：多会话、流式进度/打断、历史重放、drawio iframe 编辑器 + sel 插件桥（离线回退 mxGraph 画布） |
 | `crates/harness/src/engine.rs` | JSON 信封循环、用量/预算/上下文守卫 |

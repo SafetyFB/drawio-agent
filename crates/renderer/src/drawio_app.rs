@@ -11,7 +11,8 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::asset_fetch::{cache_root, download_with_progress, sha256_file};
+use crate::asset_fetch::{download_with_progress, sha256_file};
+use crate::cache::cache_root;
 
 /// Pinned drawio release. Verified to exist at the GitHub release URL on
 /// 2026-09-07 (v31.4.4).

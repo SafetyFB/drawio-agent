@@ -12,6 +12,10 @@ use crate::xmlfile::{check_doc, lines_in, total_lines, CheckReport, EditReport, 
 /// Result of executing one tool: free-form text fed back to the model,
 /// optionally carrying an image (the `view` tool returns the screenshot so
 /// the engine can send it to a vision-capable model as an image part).
+/// (id, (x, y, w, h)) 几何元组，layout 工具内部用。
+type GeomEntry = (String, (f64, f64, f64, f64));
+
+
 #[derive(Debug, Clone, Default)]
 pub struct ToolOutput {
     pub text: String,
@@ -150,7 +154,7 @@ impl Tools {
                     let ext = crate::metrics::lint_text(&report);
                     // check 文本 + lint 文本去重合并
                     let mut merged = out.text.clone();
-                    merged.push_str("\n");
+                    merged.push('\n');
                     merged.push_str(&ext);
                     out.text = merged;
                 }
@@ -241,7 +245,7 @@ impl Tools {
             if ids.len() < 2 {
                 return Err("align 至少需要 2 个 cell".to_string());
             }
-            let mut geoms = Vec::new();
+            let mut geoms: Vec<GeomEntry> = Vec::new();
             for id in &ids {
                 let g = doc
                     .geometry_of(id)
@@ -274,7 +278,7 @@ impl Tools {
             } else if mode == "gap" {
                 // 等距分布：按轴排序后均匀摆放（间距 = 空隙相等）
                 let horizontal = axis == "x";
-                let mut sorted: Vec<&(String, (f64, f64, f64, f64))> = geoms_ref.iter().collect();
+                let mut sorted: Vec<&GeomEntry> = geoms_ref.iter().collect();
                 if horizontal {
                     sorted.sort_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap());
                 } else {
@@ -302,10 +306,10 @@ impl Tools {
                     }
                 }
             } else {
-                return Err(format!(
-                    "align 支持: axis=x|y × mode=left|right|center|top|bottom|middle|gap（axis 与 mode 需匹配）
-                     示例: {{\"align\": {{\"ids\": [\"a\",\"b\",\"c\"], \"axis\": \"x\", \"mode\": \"left\"}}}}"
-                ));
+                return Err(
+                    "align 支持: axis=x|y × mode=left|right|center|top|bottom|middle|gap（axis 与 mode 需匹配）                     示例: {\"align\": {\"ids\": [\"a\",\"b\",\"c\"], \"axis\": \"x\", \"mode\": \"left\"}}"
+                        .to_string(),
+                );
             }
             for (id, nx, ny) in &targets {
                 let (_, _, w, h) = doc
@@ -500,12 +504,12 @@ impl Tools {
                 r
             }
         };
-        let mut opts = drawio_agent_renderer::RenderOptions::default();
-        opts.trace_dir = std::env::var("DRAWIO_RENDER_TRACE_DIR").ok();
         // 可选增强：annotate=id 徽章标注；focus=[cell ids] 局部裁剪放大
-        if args.get("annotate").and_then(Value::as_bool) == Some(true) {
-            opts.annotate = true;
-        }
+        let mut opts = drawio_agent_renderer::RenderOptions {
+            trace_dir: std::env::var("DRAWIO_RENDER_TRACE_DIR").ok(),
+            annotate: args.get("annotate").and_then(Value::as_bool) == Some(true),
+            ..Default::default()
+        };
         if let Some(f) = args.get("focus").and_then(Value::as_array) {
             opts.focus = f
                 .iter()
