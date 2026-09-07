@@ -49,7 +49,6 @@ Draw.loadPlugin(function (ui) {
                    fx: minX - M, fy: minY - M, fw: maxX - minX + 2 * M, fh: maxY - minY + 2 * M };
         }
       }
-      var overlayXmls = [];
       if (d.annotate) {
         var placed = [];
         var allowed = d.allowed || null;
@@ -76,16 +75,15 @@ Draw.loadPlugin(function (ui) {
               if (placedAt) {
                 placed.push({ x: placedAt[0], y: placedAt[1], w: bw, h: bh });
                 var s = g.view.scale, t = g.view.translate;
+                // 关键：与被标注 cell 同父（getDefaultParent 是图层 cell，
+                // 自带几何偏移——徽章会被整体平移错位）
+                var pcell = cell.parent || g.getDefaultParent();
                 var ov = g.insertVertex(
-                  g.getDefaultParent(), null, label,
+                  pcell, null, label,
                   (placedAt[0] - t.x) / s, (placedAt[1] - t.y) / s, bw / s, bh / s,
                   'text;html=1;align=left;verticalAlign=top;fontSize=9;fontColor=#D32F2F;fillColor=none;strokeColor=none;spacing=0;'
                 );
                 overlays.push(ov);
-                try {
-                  var codec = new mxCodec();
-                  overlayXmls.push(mxUtils.getXml(codec.encode(ov)));
-                } catch (e) {}
               }
             }
           }
@@ -98,7 +96,7 @@ Draw.loadPlugin(function (ui) {
         // 徽章可能高于 gb 顶边，扩出标注区保证裁剪映射正确
         crop.gy -= 16; crop.gh += 16;
       }
-      parent.postMessage({ event: 'export_annotate_ready', crop: crop, overlayXmls: overlayXmls }, '*');
+      parent.postMessage({ event: 'export_annotate_ready', crop: crop }, '*');
     }
     if (d.action === 'export_annotate_clear') {
       for (var i = 0; i < overlays.length; i++) g.model.remove(overlays[i]);
@@ -154,6 +152,10 @@ const WRAPPER_HTML: &str = r#"<!DOCTYPE html><html><body style="margin:0">
       window.__crop = d.crop || null;
       window.__overlayXmls = d.overlayXmls || [];
       diag('annotate_ready: overlays=' + window.__overlayXmls.length + ' crop=' + JSON.stringify(window.__crop));
+      if (d.badgeModels && d.badgeModels.length) {
+        var bm = d.badgeModels[0];
+        diag('badge model=' + bm.x + ',' + bm.y + ' view_s=' + bm.s + ' view_t=' + bm.tx + ',' + bm.ty);
+      }
       if (window.__overlayXmls.length) diag('overlay[0]=' + window.__overlayXmls[0].slice(0, 150));
     }
     if (d.event === 'export') {
@@ -184,19 +186,14 @@ const WRAPPER_HTML: &str = r#"<!DOCTYPE html><html><body style="margin:0">
           allowed: allowed
         }), '*');
         setTimeout(function () {
-          // 徽章 overlay 以 XML 字符串回传后拼进导出 xml（export 协议
-          // 需要 xml 字段，且它导出的是传入的 xml 而非 live model）
-          var exportXml = xml;
-          if (window.__overlayXmls && window.__overlayXmls.length) {
-            var idx = exportXml.indexOf('</root>');
-            if (idx >= 0) {
-              exportXml = exportXml.slice(0, idx) +
-                window.__overlayXmls.join('\n') + exportXml.slice(idx);
-            }
-          }
+          // 导出 live model（徽章 overlay 已插入模型，无需 xml 注入——
+          // 探针实测：无 xml 参数的 export 即导出当前模型，几何精确）。
+          // 无 xml 时协议回退到模型内容，此前 timeout 是 cropToPng
+          // Promise bug 的同期假象。
+          var effBorder = cropNeeded ? 0 : (annotate ? Math.max(border, 24) : border);
           f.contentWindow.postMessage(JSON.stringify({
-            action: 'export', format: 'png', xml: exportXml,
-            scale: scale, border: cropNeeded ? 0 : border, background: background
+            action: 'export', format: 'png',
+            scale: scale, border: effBorder, background: background
           }), '*');
         }, 300);
       }, 600);
