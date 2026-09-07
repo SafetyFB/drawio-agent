@@ -845,6 +845,9 @@ async fn api_chat_stream(
                 e.get("name").and_then(|v| v.as_str()) == Some("view")
             });
             if has_edit && !has_view {
+                if let Ok(mut v) = events.lock() {
+                    v.push(json!({ "type": "ask_sep" }));
+                }
                 let _ = tx
                     .send(
                         format!(
@@ -915,47 +918,67 @@ async fn api_chat_stream(
         }
         // 历史记录：只记录真正完成的任务（断开/取消不污染聊天重放）
         if !disconnected {
-            // 无论成功失败都落盘轨迹（失败时 error 字段携带原因——
-            // 达到最大轮数/预算/连续坏信封等任务死因必须可复盘）。
-            let rec = match &outcome {
-                Ok(o) => HistoryRec {
+            // 无论成功失败都落盘轨迹。事件按 ask_sep 分隔主 ask 与自检轮，
+            // 各自一条记录；用量主条取 outcome.usage，自检条 = 总计 − 主条。
+            let evs_all = events.lock().map(|v| v.clone()).unwrap_or_default();
+            let sep = evs_all.iter().position(|e| e.get("type").and_then(|v| v.as_str()) == Some("ask_sep"));
+            let (evs_main, evs_self): (&[serde_json::Value], &[serde_json::Value]) = match sep {
+                Some(p) => evs_all.split_at(p),
+                None => (&evs_all[..], &[]),
+            };
+            let usage_main = match &outcome {
+                Ok(o) => (o.usage.input_tokens, o.usage.output_tokens),
+                Err(_) => (0, 0),
+            };
+            let mut mk_rec = |user: &str, evs: &[serde_json::Value],
+                              out: &Result<TurnOutcome, String>,
+                              ui: u64, uo: u64| {
+                let (reply, error) = match out {
+                    Ok(o) => (o.reply.clone(), None),
+                    Err(e) => (String::new(), Some(e.to_string())),
+                };
+                let calls = match out {
+                    Ok(o) => o.tool_calls as u32,
+                    Err(_) => evs.iter().filter(|ev| ev.get("name").is_some()).count() as u32,
+                };
+                HistoryRec {
                     ts: history::now_secs(),
-                    user: req.text.clone(),
-                    reply: o.reply.clone(),
-                    tool_calls: o.tool_calls as u32,
-                    usage_in: stats.usage.input_tokens,
-                    usage_out: stats.usage.output_tokens,
+                    user: user.to_string(),
+                    reply,
+                    tool_calls: calls,
+                    usage_in: ui,
+                    usage_out: uo,
                     cost_yuan: stats.cost_yuan,
-                    events: events.lock().map(|v| v.clone()).unwrap_or_default(),
+                    events: evs.to_vec(),
                     xml: doc.canonical().to_string(),
-                    error: None,
-                },
-                Err(e) => {
-                    let evs = events.lock().map(|v| v.clone()).unwrap_or_default();
-                    let calls = evs
-                        .iter()
-                        .filter(|ev| {
-                            ev.get("name")
-                                .and_then(|v| v.as_str())
-                                .is_some()
-                        })
-                        .count();
-                    HistoryRec {
-                        ts: history::now_secs(),
-                        user: req.text.clone(),
-                        reply: String::new(),
-                        tool_calls: calls as u32,
-                    usage_in: stats.usage.input_tokens,
-                    usage_out: stats.usage.output_tokens,
-                    cost_yuan: stats.cost_yuan,
-                    events: evs,
-                    xml: doc.canonical().to_string(),
-                    error: Some(e.to_string()),
-                    }
+                    error,
                 }
             };
-            if let Err(e) = history::append(&history::history_path(&doc.path), &rec) {
+            let rec1 = mk_rec(
+                &req.text,
+                evs_main,
+                &outcome,
+                usage_main.0,
+                usage_main.1,
+            );
+            if let Err(e) = history::append(&history::history_path(&doc.path), &rec1) {
                 eprintln!("history 落盘失败: {e}");
+            }
+            if let Some(o2) = &outcome2 {
+                let self_usage = (
+                    stats.usage.input_tokens.saturating_sub(usage_main.0),
+                    stats.usage.output_tokens.saturating_sub(usage_main.1),
+                );
+                let rec2 = mk_rec(
+                    SELFCHECK_TEXT,
+                    &evs_self[1..], // 跳过 ask_sep
+                    o2,
+                    self_usage.0,
+                    self_usage.1,
+                );
+                if let Err(e) = history::append(&history::history_path(&doc.path), &rec2) {
+                    eprintln!("history 落盘失败: {e}");
+                }
             }
         }
         // 记忆/用量无论如何落盘
