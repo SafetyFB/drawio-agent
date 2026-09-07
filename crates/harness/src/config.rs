@@ -65,7 +65,7 @@ pub struct LlmSettings {
 }
 
 pub fn default_max_turns() -> usize {
-    40
+    30
 }
 
 /// ¥ cost of a usage at the given settings (0 price = 0 cost, token 照常统计).

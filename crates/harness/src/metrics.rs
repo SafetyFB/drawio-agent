@@ -653,15 +653,23 @@ pub fn lint_text(report: &Report) -> String {
     for e in &report.errors {
         out.push_str(&format!("\n[error:{}] {} —— {}", e.kind, e.ids.join(", "), e.detail));
     }
-    for w in &report.warnings {
+    // 截断：警告过多时只列前 5——全量清单会让模型陷入逐条清零循环
+    const SHOW_MAX: usize = 5;
+    for (wi, w) in report.warnings.iter().take(SHOW_MAX).enumerate() {
         out.push_str(&format!(
             "\n[warning:{}] {} —— {}",
             w.kind,
             w.ids.join(", "),
             w.detail
         ));
+        if wi + 1 == SHOW_MAX && report.warnings.len() > SHOW_MAX {
+            out.push_str(&format!(
+                "\n…（另有 {} 条同类警告未列出——修最明显的即可，不要逐条清零）",
+                report.warnings.len() - SHOW_MAX
+            ));
+        }
     }
-    out.push_str("\n修复建议：crossing 报的是坐标位置——先用 view 的 focus 参数放大该区域、加 annotate 看清是哪两条边，再改路由（换 edgeStyle=orthogonalEdgeStyle / 加 exitX/entryX 锚点 / 调整中间点）或挪节点。优先修「连线穿过节点」类（视觉最糟）。改完再 lint 核对。");
+    out.push_str("\n说明：结构错误必须修；布局警告修最明显的 1-2 处即可，残余轻微交叉/重叠可接受并在总结里说明——不要逐条清零（收益极低且烧轮次）。若警告过多，说明布局整体拥挤即可。");
     out
 }
 
