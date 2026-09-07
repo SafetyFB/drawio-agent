@@ -47,6 +47,8 @@ pub struct Stats {
     pub out_of_bounds: usize,
     pub isolated: usize,
     pub near_aligned_pairs: usize,
+    /// 同一源的分支节点未按流向平行摆放（来自人类校准反馈）
+    pub branch_misaligned: usize,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -508,6 +510,85 @@ pub fn analyze(xml: &str) -> Result<Report, String> {
         .filter(|w| w.kind == "out_of_bounds")
         .count();
 
+    // warnings: 分支平行性（人类校准反馈派生；窄启发式——只在
+    // "决策节点 + 后继同侧 + 尺寸相似"的高置信组合下才告警，
+    // 避免径向/瀑布/注脚等合法布局的假阳）
+    {
+        const TOL: f64 = 8.0;
+        for s in &vertices {
+            let targets: Vec<&GeomCell> = edges
+                .iter()
+                .filter(|e| e.source.as_deref() == Some(s.id.as_str()))
+                .filter_map(|e| {
+                    e.target
+                        .as_ref()
+                        .and_then(|t| vertices.iter().find(|v| v.id == *t))
+                })
+                .copied()
+                .collect();
+            if targets.len() < 2 {
+                continue;
+            }
+            // 同侧约束：所有后继中心相对源中心在水平/垂直方向上符号一致
+            let scx = s.x + s.w / 2.0;
+            let scy = s.y + s.h / 2.0;
+            let dxs: Vec<f64> = targets.iter().map(|t| t.x + t.w / 2.0 - scx).collect();
+            let dys: Vec<f64> = targets.iter().map(|t| t.y + t.h / 2.0 - scy).collect();
+            let same_side_x =
+                dxs.iter().all(|d| *d > 0.0) || dxs.iter().all(|d| *d < 0.0);
+            let same_side_y =
+                dys.iter().all(|d| *d > 0.0) || dys.iter().all(|d| *d < 0.0);
+            let vertical = same_side_y
+                && dxs.iter().map(|d| d.abs()).sum::<f64>()
+                    < dys.iter().map(|d| d.abs()).sum::<f64>();
+            let horizontal = same_side_x && !vertical && dys.iter().map(|d| d.abs()).sum::<f64>()
+                < dxs.iter().map(|d| d.abs()).sum::<f64>();
+            if !vertical && !horizontal {
+                continue; // 混合侧/径向/环形——不评判
+            }
+            // 尺寸相似约束：最大/最小面积比 ≤ 2.5（注脚类大小悬殊跳过）
+            let areas: Vec<f64> = targets.iter().map(|t| t.w * t.h).collect();
+            let (min_a, max_a) = areas
+                .iter()
+                .fold((f64::INFINITY, 0.0f64), |(mn, mx), a| (mn.min(*a), mx.max(*a)));
+            if min_a <= 0.0 || max_a / min_a > 2.5 {
+                continue;
+            }
+            for i in 0..targets.len() {
+                for j in (i + 1)..targets.len() {
+                    let (a, b) = (targets[i], targets[j]);
+                    let ay = a.y + a.h / 2.0;
+                    let by = b.y + b.h / 2.0;
+                    let ax = a.x + a.w / 2.0;
+                    let bx = b.x + b.w / 2.0;
+                    let mis = if vertical {
+                        (ay - by).abs() > TOL
+                    } else {
+                        (ax - bx).abs() > TOL
+                    };
+                    if mis {
+                        report.warnings.push(Issue {
+                            severity: "warning",
+                            kind: "branch_not_parallel",
+                            ids: vec![a.id.clone(), b.id.clone()],
+                            detail: format!(
+                                "同源 {} 的分支未按流向平行（{}流向应同 {}；非平行的有意摆法可忽略）",
+                                s.id,
+                                if vertical { "垂直" } else { "水平" },
+                                if vertical { "y" } else { "x" }
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        report.stats.branch_misaligned = report
+            .warnings
+            .iter()
+            .filter(|w| w.kind == "branch_not_parallel")
+            .count();
+    }
+
     // info: 孤立节点（图里有连线时才提示）
     if report.stats.edges >= 2 {
         for v in &vertices {
@@ -546,13 +627,14 @@ pub fn analyze(xml: &str) -> Result<Report, String> {
 /// lint 工具用的紧凑人类可读文本。
 pub fn lint_text(report: &Report) -> String {
     let mut out = format!(
-        "lint 结果: {} errors, {} warnings（重叠 {} · 交叉 {} · 标签溢出 {} · 越界 {}）",
+        "lint 结果: {} errors, {} warnings（重叠 {} · 交叉 {} · 标签溢出 {} · 越界 {} · 分支未平行 {}）",
         report.stats.errors,
         report.warnings.len(),
         report.stats.overlaps,
         report.stats.crossings,
         report.stats.label_overflows,
-        report.stats.out_of_bounds
+        report.stats.out_of_bounds,
+        report.stats.branch_misaligned
     );
     if report.errors.is_empty() && report.warnings.is_empty() {
         out.push_str("\n无硬缺陷与警告。");
@@ -650,6 +732,52 @@ mod tests {
         let xml = doc(&vertex("a", 500.0, 0.0, 200.0, 40.0, "A"));
         let r = analyze(&xml).unwrap();
         assert_eq!(r.stats.out_of_bounds, 1);
+    }
+
+    #[test]
+    fn branch_parallelism_flagged_for_stacked_siblings() {
+        // 垂直流向：verify → success(y=360) / fail(y=460) 堆叠 → 应告警
+        let xml = doc(&format!(
+            "{}{}{}{}",
+            vertex("verify", 390.0, 240.0, 120.0, 60.0, "验证"),
+            vertex("success", 380.0, 360.0, 140.0, 50.0, "成功"),
+            vertex("fail", 380.0, 460.0, 140.0, 50.0, "失败"),
+            "<mxCell id=\"e3\" edge=\"1\" parent=\"1\" source=\"verify\" target=\"success\"><mxGeometry relative=\"1\" as=\"geometry\"/></mxCell>\
+             <mxCell id=\"e4\" edge=\"1\" parent=\"1\" source=\"verify\" target=\"fail\"><mxGeometry relative=\"1\" as=\"geometry\"/></mxCell>"
+        ));
+        let r = analyze(&xml).unwrap();
+        assert!(r.stats.branch_misaligned >= 1);
+        assert!(r.warnings.iter().any(|w| w.kind == "branch_not_parallel"));
+    }
+
+    #[test]
+    fn branch_parallelism_ok_for_side_by_side_siblings() {
+        // 同 y 的平行分支 → 不告警
+        let xml = doc(&format!(
+            "{}{}{}{}",
+            vertex("verify", 350.0, 240.0, 120.0, 60.0, "验证"),
+            vertex("success", 300.0, 360.0, 140.0, 50.0, "成功"),
+            vertex("fail", 480.0, 360.0, 140.0, 50.0, "失败"),
+            "<mxCell id=\"e3\" edge=\"1\" parent=\"1\" source=\"verify\" target=\"success\"><mxGeometry relative=\"1\" as=\"geometry\"/></mxCell>\
+             <mxCell id=\"e4\" edge=\"1\" parent=\"1\" source=\"verify\" target=\"fail\"><mxGeometry relative=\"1\" as=\"geometry\"/></mxCell>"
+        ));
+        let r = analyze(&xml).unwrap();
+        assert_eq!(r.stats.branch_misaligned, 0);
+    }
+
+    #[test]
+    fn mixed_side_branch_skipped() {
+        // "是→右、否→下"式分叉：不同侧 → 不评判
+        let xml = doc(&format!(
+            "{}{}{}{}",
+            vertex("v", 350.0, 240.0, 120.0, 60.0, "决策"),
+            vertex("yes", 520.0, 240.0, 100.0, 50.0, "是"),
+            vertex("no", 350.0, 380.0, 100.0, 50.0, "否"),
+            "<mxCell id=\"e1\" edge=\"1\" parent=\"1\" source=\"v\" target=\"yes\"><mxGeometry relative=\"1\" as=\"geometry\"/></mxCell>\
+             <mxCell id=\"e2\" edge=\"1\" parent=\"1\" source=\"v\" target=\"no\"><mxGeometry relative=\"1\" as=\"geometry\"/></mxCell>"
+        ));
+        let r = analyze(&xml).unwrap();
+        assert_eq!(r.stats.branch_misaligned, 0);
     }
 
     #[test]
