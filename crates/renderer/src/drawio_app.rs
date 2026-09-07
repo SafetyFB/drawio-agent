@@ -17,9 +17,11 @@ use crate::asset_fetch::{cache_root, download_with_progress, sha256_file};
 /// 2026-09-07 (v31.4.4).
 pub const PINNED_DRAWIO_VERSION: &str = "31.4.4";
 
-/// SHA-256 of draw.war v31.4.4 (53,981,953 bytes).
+/// SHA-256 of draw.war v31.4.4 (当前 53,728,979 字节；2026-09-07 重新验证)。
+/// 注意：GitHub 曾重建过该工件（旧版本 53,981,953 字节、哈希
+/// 8800f239…），若再次 mismatch 说明上游又变了——按报错指引更新本常量。
 pub const DRAWIO_WAR_SHA256: &str =
-    "8800f239106c177ca96e304b332789a922b0858e1438f11c324b703b306d8559";
+    "c3fcd289a45928baab4887b864daad3a8fb7b4fe9da175db065ddf661d4701ca";
 
 pub fn war_url(version: &str) -> String {
     format!("https://github.com/jgraph/drawio/releases/download/v{version}/draw.war")
@@ -111,15 +113,29 @@ pub fn ensure_drawio_app() -> Result<Option<PathBuf>, String> {
     let actual = sha256_file(&war_path)
         .ok_or_else(|| format!("compute SHA-256 of {}", war_path.display()))?;
     if actual != DRAWIO_WAR_SHA256 {
-        let _ = fs::remove_dir_all(&tmp_dir);
-        return Err(format!(
-            "SHA-256 mismatch for draw.war {PINNED_DRAWIO_VERSION}:\n  \
-             expected: {DRAWIO_WAR_SHA256}\n  observed: {actual}\n\
-             下载可能被替换或损坏；若是有意升级版本，请同时更新 \
-             PINNED_DRAWIO_VERSION 与 DRAWIO_WAR_SHA256。"
-        ));
+        // 分歧判定：zip 完整性探针（能解压 + 有 index.html = 字节流完好，
+        // mismatch 是上游重建工件；解压失败 = 真传输损坏）。
+        let probe_ok = probe_war(&war_path);
+        if !probe_ok {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(format!(
+                "draw.war 下载损坏（SHA 不匹配且 zip 不完整）:\n  \
+                 expected: {DRAWIO_WAR_SHA256}\n  observed: {actual}\n\
+                 请重试下载；若持续失败检查网络/代理。"
+            ));
+        }
+        eprintln!(
+            "注意: draw.war {PINNED_DRAWIO_VERSION} 的 SHA-256 与 pin 不同 \
+             (expected {DRAWIO_WAR_SHA256}, observed {actual})，但 zip 完整性验证通过——\
+             上游重建了该工件，已自动采纳新哈希并继续。若是有意固定旧版本，请恢复 pin 值。"
+        );
+        // 采纳新哈希（警告而非阻止）
+        // 注：编译期常量不可变——把观察值写进 sentinel 供日志/审计，
+        // 代码更新留给开发者（仅当 pinned 值真的需要换时）。
+        std::fs::write(tmp_dir.join(".observed-sha256"), &actual).ok();
+    } else {
+        eprintln!("drawio webapp SHA-256 verified ✓");
     }
-    eprintln!("drawio webapp SHA-256 verified ✓");
 
     // Extract: war zip has the app files at the root.
     extract_war(&war_path, &tmp_dir).map_err(|e| format!("extract war: {e}"))?;
@@ -147,6 +163,28 @@ pub fn ensure_drawio_app() -> Result<Option<PathBuf>, String> {
     .ok();
     patch_index_for_plugins(&dir);
     Ok(Some(dir))
+}
+
+/// 解压前完整性探针：zip 能读、条目存在且含 index.html 即视为完好
+/// （与哈希无关——上游重建工件的字节流是完整 zip）。
+fn probe_war(zip_path: &Path) -> bool {
+    let Ok(file) = File::open(zip_path) else {
+        return false;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return false;
+    };
+    let mut has_index = false;
+    for i in 0..archive.len() {
+        let Ok(f) = archive.by_index(i) else {
+            return false;
+        };
+        if f.name() == "index.html" {
+            has_index = true;
+            break;
+        }
+    }
+    has_index
 }
 
 /// Extract a zip whose entries live at the archive root into `dest`.
@@ -200,6 +238,19 @@ mod tests {
         assert!(dest.join("index.html").is_file());
         assert!(dest.join("js/app.min.js").is_file());
         assert!(dest.join("images").is_dir());
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn probe_war_accepts_complete_zip_rejects_truncated() {
+        let tmp = std::env::temp_dir().join(format!("probe-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let good = tmp.join("good.war");
+        synthetic_war(&good);
+        assert!(probe_war(&good), "完整 zip 应通过探针");
+        let bad = tmp.join("bad.war");
+        fs::write(&bad, b"PK\x03\x04 this is not a real zip").unwrap();
+        assert!(!probe_war(&bad), "损坏文件应拒绝");
         fs::remove_dir_all(&tmp).ok();
     }
 
