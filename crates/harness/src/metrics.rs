@@ -463,7 +463,8 @@ pub fn analyze(xml: &str) -> Result<Report, String> {
                     kind: "crossing",
                     ids: vec![id_e.clone(), v.id.clone()],
                     detail: format!(
-                        "连线穿过节点内部（区域 {:.0},{:.0} - {:.0},{:.0}）",
+                        "连线 {id_e} 穿过节点 {} 内部（区域 {:.0},{:.0} - {:.0},{:.0}）",
+                        v.id,
                         v.x,
                         v.y,
                         v.x + v.w,
@@ -720,7 +721,7 @@ mod tests {
     #[test]
     fn edge_through_vertex_detail_reports_region() {
         let xml = doc(&format!(
-            "{}{}{}",
+            "{}{}{}{}",
             vertex("a", 0.0, 0.0, 40.0, 40.0, "A"),
             vertex("b", 300.0, 0.0, 40.0, 40.0, "B"),
             vertex("mid", 150.0, -10.0, 60.0, 60.0, "M"),
