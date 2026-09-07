@@ -232,12 +232,13 @@ fn bbox_intersect(a: &GeomCell, b: &GeomCell) -> bool {
     a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
 }
 
+/// 线段相交判定；相交返回交点坐标，否则 None。
 fn seg_intersect(
     (ax, ay): (f64, f64),
     (bx, by): (f64, f64),
     (cx, cy): (f64, f64),
     (dx, dy): (f64, f64),
-) -> bool {
+) -> Option<(f64, f64)> {
     let cross = |(x1, y1): (f64, f64), (x2, y2): (f64, f64), (x3, y3): (f64, f64)| {
         (x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1)
     };
@@ -245,8 +246,18 @@ fn seg_intersect(
     let d2 = cross((ax, ay), (bx, by), (dx, dy));
     let d3 = cross((cx, cy), (dx, dy), (ax, ay));
     let d4 = cross((cx, cy), (dx, dy), (bx, by));
-    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
-        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+    let proper = ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0));
+    if !proper {
+        return None;
+    }
+    // 交点：参数 t = 线1上点 = A + t(B-A)
+    let denom = (ax - bx) * (cy - dy) - (ay - by) * (cx - dx);
+    if denom.abs() < 1e-12 {
+        return None;
+    }
+    let t = ((ax - cx) * (cy - dy) - (ay - cy) * (cx - dx)) / denom;
+    Some((ax + t * (bx - ax), ay + t * (by - ay)))
 }
 
 /// 线段与矩形相交（Liang-Barsky），排除端点接触
@@ -416,21 +427,21 @@ pub fn analyze(xml: &str) -> Result<Report, String> {
         for j in (i + 1)..segs.len() {
             let (id_a, sa) = &segs[i];
             let (id_b, sb) = &segs[j];
-            let mut cross = false;
+            let mut hit: Option<(f64, f64)> = None;
             'outer: for p in sa {
                 for q in sb {
-                    if seg_intersect(p.0, p.1, q.0, q.1) {
-                        cross = true;
+                    if let Some(pt) = seg_intersect(p.0, p.1, q.0, q.1) {
+                        hit = Some(pt);
                         break 'outer;
                     }
                 }
             }
-            if cross {
+            if let Some((hx, hy)) = hit {
                 report.warnings.push(Issue {
                     severity: "warning",
                     kind: "crossing",
                     ids: vec![id_a.clone(), id_b.clone()],
-                    detail: "连线相交".into(),
+                    detail: format!("连线相交于 ({hx:.0},{hy:.0})"),
                 });
             }
         }
@@ -446,15 +457,18 @@ pub fn analyze(xml: &str) -> Result<Report, String> {
                 continue;
             }
             let rect = (v.x, v.y, v.w, v.h);
-            if se
-                .iter()
-                .any(|(p, q)| seg_rect_intersect(*p, *q, rect))
-            {
+            if se.iter().any(|(p, q)| seg_rect_intersect(*p, *q, rect)) {
                 report.warnings.push(Issue {
                     severity: "warning",
                     kind: "crossing",
                     ids: vec![id_e.clone(), v.id.clone()],
-                    detail: "连线穿过节点".into(),
+                    detail: format!(
+                        "连线穿过节点内部（区域 {:.0},{:.0} - {:.0},{:.0}）",
+                        v.x,
+                        v.y,
+                        v.x + v.w,
+                        v.y + v.h
+                    ),
                 });
             }
         }
@@ -646,7 +660,7 @@ pub fn lint_text(report: &Report) -> String {
             w.detail
         ));
     }
-    out.push_str("\n修复建议：先处理 error 与 overlap/crossing；改完可再 lint 核对。");
+    out.push_str("\n修复建议：crossing 报的是坐标位置——先用 view 的 focus 参数放大该区域、加 annotate 看清是哪两条边，再改路由（换 edgeStyle=orthogonalEdgeStyle / 加 exitX/entryX 锚点 / 调整中间点）或挪节点。优先修「连线穿过节点」类（视觉最糟）。改完再 lint 核对。");
     out
 }
 
@@ -684,6 +698,41 @@ mod tests {
         ));
         let r = analyze(&xml).unwrap();
         assert_eq!(r.stats.overlaps, 0);
+    }
+
+    #[test]
+    fn crossing_detail_includes_coordinates() {
+        // X 形交叉：a→d 与 b→c，交点应在图中央附近
+        let xml = doc(&format!(
+            "{}{}{}{}{}",
+            vertex("a", 0.0, 0.0, 80.0, 40.0, "A"),
+            vertex("b", 200.0, 0.0, 80.0, 40.0, "B"),
+            vertex("c", 0.0, 200.0, 80.0, 40.0, "C"),
+            vertex("d", 200.0, 200.0, 80.0, 40.0, "D"),
+            "<mxCell id=\"e1\" edge=\"1\" parent=\"1\" source=\"a\" target=\"d\"><mxGeometry relative=\"1\" as=\"geometry\"/></mxCell>\
+             <mxCell id=\"e2\" edge=\"1\" parent=\"1\" source=\"b\" target=\"c\"><mxGeometry relative=\"1\" as=\"geometry\"/></mxCell>"
+        ));
+        let r = analyze(&xml).unwrap();
+        let crossing = r.warnings.iter().find(|w| w.kind == "crossing").unwrap();
+        assert!(crossing.detail.contains('('), "应含交点坐标: {}", crossing.detail);
+    }
+
+    #[test]
+    fn edge_through_vertex_detail_reports_region() {
+        let xml = doc(&format!(
+            "{}{}{}",
+            vertex("a", 0.0, 0.0, 40.0, 40.0, "A"),
+            vertex("b", 300.0, 0.0, 40.0, 40.0, "B"),
+            vertex("mid", 150.0, -10.0, 60.0, 60.0, "M"),
+            "<mxCell id=\"e1\" edge=\"1\" parent=\"1\" source=\"a\" target=\"b\"><mxGeometry relative=\"1\" as=\"geometry\"/></mxCell>"
+        ));
+        let r = analyze(&xml).unwrap();
+        let crossing = r
+            .warnings
+            .iter()
+            .find(|w| w.kind == "crossing" && w.detail.contains("穿过节点"))
+            .expect("穿节点类应存在");
+        assert!(crossing.detail.contains("区域"), "{}", crossing.detail);
     }
 
     #[test]
