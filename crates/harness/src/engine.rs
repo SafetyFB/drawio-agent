@@ -572,7 +572,7 @@ impl Harness {
             // Tool whitelist + fast fail: a model that hallucinates tool
             // names (e.g. `{"tool":"reply"}`) would otherwise loop until
             // max_turns.
-            if !["read", "locate", "edit", "draw", "check", "view"].contains(&name) {
+            if !["read", "edit", "draw", "check", "view", "layout"].contains(&name) {
                 bad_tools += 1;
                 if bad_tools >= 2 {
                     stats.add(&usage, spent);
@@ -583,7 +583,7 @@ impl Harness {
                 }
                 history.push(Message::assistant(raw.clone()));
                 history.push(Message::user(format!(
-                    "`{name}` 不是可用工具。可用工具: read locate edit draw check view。\
+                    "`{name}` 不是可用工具。可用工具: read edit draw check view layout。\
                      每轮只输出一个 JSON 信封；完成后用 {{\"reply\": \"...\", \"done\": true}} 结束。"
                 )));
                 continue;

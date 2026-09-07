@@ -80,13 +80,11 @@ impl Tools {
 
     /// Tool docs embedded in the system prompt.
     pub fn tool_specs() -> &'static str {
-        r#"1. read   {"range": "120-156" | "cell:svc-a" | "120"}}
+        r#"1. read   {"range": "120-156" | "cell:svc-a" | "120"}
+          或 {"query": "order"}（按文本搜 cell，返回命中 cell 与 @行区间，
+           最多 12 条——把用户说的概念映射到文件位置）
    返回文件中指定区间的原文（带行号）。改之前先读；范围尽量小
    （超长区间会被截断）。行号会随编辑漂移，优先用 cell:id。
-
-2. locate {"query": "order"}
-   按文本/cell id 搜索，返回命中的 cell 与 @行区间（最多 12 条）。
-   用来把用户说的概念（"订单服务那个框"）映射到文件位置。
 
 3. edit   {"range": "120-156" | "cell:svc-a", "text": "<完整 XML 片段>"}
           或批量 {"ranges": [{"range": "...", "text": "..."}, ...]}
@@ -121,7 +119,12 @@ impl Tools {
    - focus=[id...]：只渲染这些 cell 的局部放大图（密集区域看细节用）
    检查：节点重叠、文字溢出框体、连线错位/穿框、箭头方向、布局失衡。
    看完再决定改哪里；不要连续重复调用（上一张图已经在你的上下文里）。
-   画布坐标与 xml 行区间没有 1:1 对应：定位用 locate，几何值用 read。
+   画布坐标与 xml 行区间没有 1:1 对应：定位用 read query，几何值用 read。
+
+8. layout {"move": {"ids": [...], "dx": n, "dy": n}}
+         或 {"align": {"ids": [...], "axis": "x"|"y", "mode": "left"|"right"|"center"|"top"|"bottom"|"middle"|"gap"}}
+   几何级工具：批量平移或对齐/等距分布多个 cell。只动 mxGeometry，
+   不碰文本/样式/连线（那些用 edit）。整批一次落盘，失败整体回滚。
 
 7. 结束  {"reply": "<给用户的总结>", "done": true}
    任务完成时使用；reply 会直接展示给用户。"#
@@ -138,7 +141,6 @@ impl Tools {
     ) -> Result<ToolOutput, String> {
         match name {
             "read" => self.read(doc, args),
-            "locate" => self.locate(doc, args),
             "edit" => self.edit(doc, args, false),
             "draw" => self.edit(doc, args, true),
             "check" => {
@@ -154,21 +156,21 @@ impl Tools {
                 }
                 Ok(out)
             }
-            "lint" => {
-                let report = crate::metrics::analyze(doc.canonical())
-                    .map_err(|e| format!("lint 失败: {e}"))?;
-                Ok(ToolOutput::text(crate::metrics::lint_text(&report)))
-            }
+            "layout" => self.layout(doc, args),
             "view" => self.view(doc, args).await,
-            other => Err(format!("未知工具 `{other}`。可用: read locate edit draw check lint view")),
+            other => Err(format!("未知工具 `{other}`。可用: read edit draw check view layout")),
         }
     }
 
     fn read(&self, doc: &XmlDoc, args: &Value) -> Result<ToolOutput, String> {
+        // 查询模式：read {"query": "..."} 按文本搜索 cell（旧 locate 合并）
+        if let Some(q) = args.get("query").and_then(Value::as_str) {
+            return self.locate(doc, q);
+        }
         let spec = args
             .get("range")
             .and_then(Value::as_str)
-            .ok_or_else(|| "read 需要参数 range".to_string())?;
+            .ok_or_else(|| "read 需要参数 range 或 query".to_string())?;
         let total_lines = total_lines(doc.canonical());
         let (a, b) = resolve_arg(doc, spec).or_else(|e| {
             // read 允许范围超出文件末尾：截到最后一行为止（edit 仍严格拒绝）
@@ -198,11 +200,144 @@ impl Tools {
         )))
     }
 
-    fn locate(&self, doc: &XmlDoc, args: &Value) -> Result<ToolOutput, String> {
-        let query = args
-            .get("query")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "locate 需要参数 query".to_string())?;
+    /// 几何级工具：align（对齐/等距）与 move（平移）。只动 mxGeometry，
+    /// 不碰文本/样式/连线（那些走 edit）。整批计算 → 一次 apply_edits 落盘。
+    fn layout(&self, doc: &mut XmlDoc, args: &Value) -> Result<ToolOutput, String> {
+        let mut edits: Vec<(usize, usize, String)> = Vec::new();
+        if let Some(m) = args.get("move") {
+            let ids: Vec<String> = m
+                .get("ids")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "move 需要 ids 数组".to_string())?
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            let dx = m.get("dx").and_then(Value::as_f64).unwrap_or(0.0);
+            let dy = m.get("dy").and_then(Value::as_f64).unwrap_or(0.0);
+            if ids.is_empty() {
+                return Err("move 的 ids 不能为空".to_string());
+            }
+            for id in &ids {
+                let (x, y, w, h) = doc
+                    .geometry_of(id)
+                    .ok_or_else(|| format!("cell `{id}` 不存在或其几何不可读"))?;
+                if let Some((ln, line)) = doc
+                    .set_geometry_line(id, x + dx, y + dy, w, h)
+                    .map_err(|e| format!("{e}"))?
+                {
+                    edits.push((ln, ln, line));
+                }
+            }
+        } else if let Some(a) = args.get("align") {
+            let ids: Vec<String> = a
+                .get("ids")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "align 需要 ids 数组".to_string())?
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            let axis = a.get("axis").and_then(Value::as_str).unwrap_or("x");
+            let mode = a.get("mode").and_then(Value::as_str).unwrap_or("left");
+            if ids.len() < 2 {
+                return Err("align 至少需要 2 个 cell".to_string());
+            }
+            let mut geoms = Vec::new();
+            for id in &ids {
+                let g = doc
+                    .geometry_of(id)
+                    .ok_or_else(|| format!("cell `{id}` 不存在或其几何不可读"))?;
+                geoms.push((id.clone(), g));
+            }
+            // 计算目标值并生成几何行替换
+            // axis=x: left(最小x) right(最大右缘) center(中心对齐) gap(水平等距)
+            // axis=y: top(最小y) bottom(最大下缘) middle(中心对齐) gap(垂直等距)
+            let mut targets: Vec<(String, f64, f64)> = Vec::new(); // id, x, y
+            let geoms_ref = &geoms;
+            if axis == "x" && mode == "left" {
+                let t = geoms_ref.iter().map(|(_, g)| g.0).fold(f64::INFINITY, f64::min);
+                targets = geoms_ref.iter().map(|(id, g)| (id.clone(), t, g.1)).collect();
+            } else if axis == "x" && mode == "right" {
+                let t = geoms_ref.iter().map(|(_, g)| g.0 + g.2).fold(f64::NEG_INFINITY, f64::max);
+                targets = geoms_ref.iter().map(|(id, g)| (id.clone(), t - g.2, g.1)).collect();
+            } else if axis == "x" && mode == "center" {
+                let t = geoms_ref.iter().map(|(_, g)| g.0 + g.2 / 2.0).sum::<f64>() / geoms_ref.len() as f64;
+                targets = geoms_ref.iter().map(|(id, g)| (id.clone(), t - g.2 / 2.0, g.1)).collect();
+            } else if axis == "y" && mode == "top" {
+                let t = geoms_ref.iter().map(|(_, g)| g.1).fold(f64::INFINITY, f64::min);
+                targets = geoms_ref.iter().map(|(id, g)| (id.clone(), g.0, t)).collect();
+            } else if axis == "y" && mode == "bottom" {
+                let t = geoms_ref.iter().map(|(_, g)| g.1 + g.3).fold(f64::NEG_INFINITY, f64::max);
+                targets = geoms_ref.iter().map(|(id, g)| (id.clone(), g.0, t - g.3)).collect();
+            } else if axis == "y" && mode == "middle" {
+                let t = geoms_ref.iter().map(|(_, g)| g.1 + g.3 / 2.0).sum::<f64>() / geoms_ref.len() as f64;
+                targets = geoms_ref.iter().map(|(id, g)| (id.clone(), g.0, t - g.3 / 2.0)).collect();
+            } else if mode == "gap" {
+                // 等距分布：按轴排序后均匀摆放（间距 = 空隙相等）
+                let horizontal = axis == "x";
+                let mut sorted: Vec<&(String, (f64, f64, f64, f64))> = geoms_ref.iter().collect();
+                if horizontal {
+                    sorted.sort_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap());
+                } else {
+                    sorted.sort_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap());
+                }
+                let total_len: f64 = if horizontal {
+                    sorted.iter().map(|(_, g)| g.2).sum()
+                } else {
+                    sorted.iter().map(|(_, g)| g.3).sum()
+                };
+                let span = if horizontal {
+                    sorted.last().unwrap().1 .0 + sorted.last().unwrap().1 .2 - sorted.first().unwrap().1 .0
+                } else {
+                    sorted.last().unwrap().1 .1 + sorted.last().unwrap().1 .3 - sorted.first().unwrap().1 .1
+                };
+                let gap = ((span - total_len) / (sorted.len().saturating_sub(1) as f64)).max(0.0);
+                let mut cursor = if horizontal { sorted[0].1 .0 } else { sorted[0].1 .1 };
+                for (id, g) in &sorted {
+                    if horizontal {
+                        targets.push((id.clone(), cursor, g.1));
+                        cursor += g.2 + gap;
+                    } else {
+                        targets.push((id.clone(), g.0, cursor));
+                        cursor += g.3 + gap;
+                    }
+                }
+            } else {
+                return Err(format!(
+                    "align 支持: axis=x|y × mode=left|right|center|top|bottom|middle|gap（axis 与 mode 需匹配）
+                     示例: {{\"align\": {{\"ids\": [\"a\",\"b\",\"c\"], \"axis\": \"x\", \"mode\": \"left\"}}}}"
+                ));
+            }
+            for (id, nx, ny) in &targets {
+                let (_, _, w, h) = doc
+                    .geometry_of(id)
+                    .ok_or_else(|| format!("cell `{id}` 不存在"))?;
+                if let Some((ln, line)) = doc
+                    .set_geometry_line(id, *nx, *ny, w, h)
+                    .map_err(|e| format!("{e}"))?
+                {
+                    edits.push((ln, ln, line));
+                }
+            }
+        } else {
+            return Err("layout 需要 move 或 align 参数".to_string());
+        }
+        if edits.is_empty() {
+            return Ok(ToolOutput::text("no-op：几何无需调整。"));
+        }
+        match doc.apply_edits(&edits) {
+            Ok(report) if report.noop => Ok(ToolOutput::text("no-op：内容与当前文件相同，未修改。")),
+            Ok(report) => {
+                doc.save().map_err(|e| format!("保存失败: {e}"))?;
+                Ok(ToolOutput::text(format!(
+                    "布局已应用并保存。{}",
+                    report_summary(&report)
+                )))
+            }
+            Err(e) => Err(format!("布局被拒绝（文件未改动）: {e}")),
+        }
+    }
+
+    fn locate(&self, doc: &XmlDoc, query: &str) -> Result<ToolOutput, String> {
         let q = query.to_lowercase();
         let text = doc.canonical();
         // 只报叶子 cell：容器（diagram 等）的 span 覆盖所有子元素，
@@ -553,6 +688,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn layout_move_shifts_cells() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        let out = t.run(&mut d, "layout", &serde_json::json!({
+            "move": {"ids": ["svc-a", "svc-b"], "dx": 40, "dy": 10}
+        })).await.unwrap();
+        assert!(out.text.contains("changed=[svc-a, svc-b]"), "{}", out.text);
+        let ga = d.geometry_of("svc-a").unwrap();
+        let gb = d.geometry_of("svc-b").unwrap();
+        assert_eq!((ga.0, ga.1), (80.0, 70.0));
+        assert_eq!((gb.0, gb.1), (300.0, 70.0));
+    }
+
+    #[tokio::test]
+    async fn layout_align_x_left_groups_columns() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        // 再造一个 x 不同的 cell 验证 left 对齐
+        let a = d.geometry_of("svc-a").unwrap();
+        let out = t.run(&mut d, "layout", &serde_json::json!({
+            "align": {"ids": ["svc-a", "svc-b"], "axis": "x", "mode": "left"}
+        })).await.unwrap();
+        assert!(out.text.contains("changed=[svc-b]"), "{}", out.text);
+        assert_eq!(d.geometry_of("svc-b").unwrap().0, a.0);
+    }
+
+    #[tokio::test]
+    async fn layout_align_gap_evenly_distributes() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        // 竖向等距：两个 cell 上下排
+        let out = t.run(&mut d, "layout", &serde_json::json!({
+            "align": {"ids": ["svc-a", "svc-b"], "axis": "y", "mode": "gap"}
+        })).await.unwrap();
+        // 应让两者间隔相等（这里两 cell 同尺寸 → 上下紧贴排列）
+        let ga = d.geometry_of("svc-a").unwrap();
+        let gb = d.geometry_of("svc-b").unwrap();
+        assert_eq!(ga.1, 60.0);
+        assert_eq!(gb.1, 120.0, "b 应紧贴 a 下方（等距=0 空隙）");
+    }
+
+    #[tokio::test]
     async fn edit_by_cell_id_applies_and_reports() {
         let mut d = doc();
         let mut t = Tools::new(false);
@@ -590,7 +767,7 @@ mod tests {
     async fn locate_finds_by_value() {
         let mut d = doc();
         let mut t = Tools::new(false);
-        let out = t.run(&mut d, "locate", &serde_json::json!({"query": "order"})).await.unwrap();
+        let out = t.run(&mut d, "read", &serde_json::json!({"query": "order"})).await.unwrap();
         assert!(out.text.contains("svc-a"), "{}", out.text);
         assert!(out.text.contains("@"), "{}", out.text);
     }
@@ -619,7 +796,7 @@ mod tests {
         xml.push_str("</root></mxGraphModel></diagram></mxfile>");
         let mut d = XmlDoc::from_text(&xml).unwrap();
         let mut t = Tools::new(false);
-        let out = t.run(&mut d, "locate", &serde_json::json!({"query": "common word"})).await.unwrap();
+        let out = t.run(&mut d, "read", &serde_json::json!({"query": "common word"})).await.unwrap();
         assert!(out.text.contains("命中 30 个 cell，显示前 12 条"), "{}", &out.text[..120]);
     }
 

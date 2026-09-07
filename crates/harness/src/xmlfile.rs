@@ -663,6 +663,69 @@ impl XmlDoc {
         Ok(doc)
     }
 
+    /// 读 cell 的几何（模型坐标），无则 None。复用 metrics 的解析。
+    pub fn geometry_of(&self, id: &str) -> Option<(f64, f64, f64, f64)> {
+        let (cells, _) = crate::metrics::parse_geom(&self.text).ok()?;
+        cells
+            .iter()
+            .find(|c| c.id == id && !c.is_edge)
+            .map(|c| (c.x, c.y, c.w, c.h))
+    }
+
+    /// 把 cell 的 mxGeometry 行整体替换（x/y/width/height 不变则返回 Ok(None)）。
+    /// 返回 (该行行号, 新行文本)——布局工具只替换这一行，不碰 cell 其余行。
+    pub fn set_geometry_line(&self, id: &str, x: f64, y: f64, w: f64, h: f64) -> Result<Option<(usize, String)>, XmlError> {
+        let span = self
+            .cells
+            .iter()
+            .find(|c| c.id == id)
+            .ok_or_else(|| XmlError::BadRange(format!("cell `{id}` 不存在")))?;
+        let slice = lines_in(&self.text, span.start_line, span.end_line);
+        // 找 mxGeometry 所在行
+        let mut geo_line_no = None;
+        for (i, l) in slice.lines().enumerate() {
+            if l.contains("mxGeometry") {
+                geo_line_no = Some(i);
+                break;
+            }
+        }
+        let Some(gi) = geo_line_no else {
+            return Err(XmlError::BadRange(format!("cell `{id}` 没有 mxGeometry")));
+        };
+        let line = slice.lines().nth(gi).unwrap().to_string();
+        let fmt = |v: f64| {
+            if (v - v.round()).abs() < 1e-9 {
+                format!("{}", v.round() as i64)
+            } else {
+                format!("{v:.2}")
+            }
+        };
+        // 线内 x=/y=/width=/height= 逐个替换（手写区间替换，无正则依赖）
+        let mut out_line = line.clone();
+        for (attr, val) in [
+            ("x", x),
+            ("y", y),
+            ("width", w),
+            ("height", h),
+        ] {
+            let re = format!(r#"({attr}=\")[^\"]*(\")"#);
+            // 简单手写：找到 attr=" 后到下一个 " 的区间
+            let pat = format!("{attr}=\"");
+            let Some(starti) = out_line.find(&pat) else {
+                continue;
+            };
+            let vstart = starti + pat.len();
+            let vend = out_line[vstart..].find('"').map(|i| vstart + i);
+            if let Some(ve) = vend {
+                out_line.replace_range(vstart..ve, &fmt(val));
+            }
+        }
+        if out_line == line {
+            return Ok(None);
+        }
+        Ok(Some((span.start_line + gi, out_line)))
+    }
+
     pub fn save(&self) -> Result<(), XmlError> {
         // 原子落盘：临时文件 + rename（批量全或无的最后一环）
         // 唯一后缀：多线程测试/多会话并行时避免 tmp 路径相撞
