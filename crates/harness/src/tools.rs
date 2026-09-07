@@ -106,9 +106,10 @@ impl Tools {
    整图重建（新画一张图或大改布局时用）。xml 必须是完整 mxfile。
 
 5. check  {}
-   确定性校验：XML 结构、id 唯一、parent/source/target 引用完整，
-   并附布局质量摘要（重叠/交叉/标签溢出/越界/分支平行）。
-   edit/draw 之后建议调用；布局类任务收尾前再调一次确认清零。
+   确定性结构校验：XML 合法、id 唯一、parent/source/target 引用完整。
+   edit/draw 之后建议调用。布局质量（重叠/交叉/对齐/箭头）不看这里——
+   用 view 看图自己判断（你有语义理解：容器背景叠放、有向边箭头等
+   由你按图意把握）。
 
 6. lint   {}
    确定性布局质量检查：重叠、连线交叉/穿框、标签溢出、越界、断引用。
@@ -147,19 +148,7 @@ impl Tools {
             "read" => self.read(doc, args),
             "edit" => self.edit(doc, args, false),
             "draw" => self.edit(doc, args, true),
-            "check" => {
-                // check = 结构校验 + 布局 lint 摘要（两条建议合并）
-                let mut out = self.check(doc)?;
-                if let Ok(report) = crate::metrics::analyze(doc.canonical()) {
-                    let ext = crate::metrics::lint_text(&report);
-                    // check 文本 + lint 文本去重合并
-                    let mut merged = out.text.clone();
-                    merged.push('\n');
-                    merged.push_str(&ext);
-                    out.text = merged;
-                }
-                Ok(out)
-            }
+            "check" => self.check(doc),
             "layout" => self.layout(doc, args),
             "view" => self.view(doc, args).await,
             other => Err(format!("未知工具 `{other}`。可用: read edit draw check view layout")),
