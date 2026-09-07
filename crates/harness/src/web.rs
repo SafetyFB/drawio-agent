@@ -27,7 +27,7 @@ use tokio_stream::StreamExt;
 
 use crate::chat::{Chat, OpenAiChat};
 use crate::config::{self, LlmSettings};
-use crate::engine::{EngineEvent, Harness, ProgressFn};
+use crate::engine::{EngineEvent, Harness, ProgressFn, TurnOutcome};
 use crate::history::{self, HistoryRec};
 use crate::refs;
 use crate::tools::Tools;
@@ -816,24 +816,71 @@ async fn api_chat_stream(
                 }
             }
         };
-        let run_fut = async {
-            harness
-                .run(
+        // 主 ask；结束后若全程未 view 且改过图，自动追加一次独立自检轮。
+        const SELFCHECK_TEXT: &str =
+            "（自动自检）你刚完成绘图但全程没有用 view 查看成图。请：调用一次 view              检查布局/箭头/间距是否符合图意；有明显问题（重叠/穿线/缺箭头）修最明显的              1-2 处即可，不必追求完美；然后简短总结收尾。";
+        let progress_opt: Option<ProgressFn> = Some(progress);
+        let run_main = harness.run(
+            &mut chat,
+            &mut tools,
+            &mut doc,
+            &req.text,
+            &ctx,
+            &opts,
+            &mut stats,
+            &progress_opt,
+        );
+        let outcome = tokio::select! {
+            _ = monitor => Err("已停止（客户端断开或用户取消）".to_string()),
+            r = run_main => r,
+        };
+        let mut outcome2: Option<Result<TurnOutcome, String>> = None;
+        // 自检轮判定：主 ask 成功、改过图（draw/edit）、全程无 view、连接还在
+        if outcome.is_ok() && !tx.is_closed() {
+            let evs = events.lock().map(|v| v.clone()).unwrap_or_default();
+            let has_edit = evs.iter().any(|e| {
+                e.get("name").and_then(|v| v.as_str()).is_some_and(|n| matches!(n, "draw" | "edit"))
+            });
+            let has_view = evs.iter().any(|e| {
+                e.get("name").and_then(|v| v.as_str()) == Some("view")
+            });
+            if has_edit && !has_view {
+                let _ = tx
+                    .send(
+                        format!(
+                            "{}\n",
+                            json!({ "type": "tool-note", "text": "（自动自检）本轮已改图但未 view——追加一次质量自检…" })
+                        )
+                        .into_bytes(),
+                    )
+                    .await;
+                // 第二监视器（同一取消语义）
+                let flag2b = cancel_flag.clone();
+                let tx3b = tx.clone();
+                let monitor2 = async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        if tx3b.is_closed() || flag2b.load(std::sync::atomic::Ordering::SeqCst) {
+                            return;
+                        }
+                    }
+                };
+                let run_self = harness.run(
                     &mut chat,
                     &mut tools,
                     &mut doc,
-                    &req.text,
-                    &ctx,
+                    SELFCHECK_TEXT,
+                    "",
                     &opts,
                     &mut stats,
-                    &Some(progress),
-                )
-                .await
-        };
-        let outcome = tokio::select! {
-            _ = monitor => Err("已停止（客户端断开或用户取消）".to_string()),
-            r = run_fut => r,
-        };
+                    &progress_opt,
+                );
+                outcome2 = Some(tokio::select! {
+                    _ = monitor2 => Err("已停止（客户端断开或用户取消）".to_string()),
+                    r = run_self => r,
+                });
+            }
+        }
         let disconnected = tx.is_closed();
 
         // 事件收尾：断开时接收端已不在，跳过发送
