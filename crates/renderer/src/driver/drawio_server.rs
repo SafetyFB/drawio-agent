@@ -30,47 +30,55 @@ const WRAPPER_HTML: &str = r#"<!DOCTYPE html><html><body style="margin:0">
     params = JSON.parse(decodeURIComponent(escape(atob(b))));
   } catch (e) {}
   var f = document.getElementById('f');
-  var loaded = false;
+  var booted = false;
+  var pendingRun = null;
+  var pendingResolve = null;
   window.addEventListener('message', function (ev) {
     var d = ev.data;
     try { if (typeof d === 'string') d = JSON.parse(d); } catch (e) {}
     if (!d || typeof d !== 'object') return;
-    if (d.event === 'init' && !loaded) {
-      loaded = true;
+    if (d.event === 'init') {
+      booted = true;
       window.__ready = true;
-      f.contentWindow.postMessage(JSON.stringify({ action: 'load', autosave: 1, xml: params.xml }), '*');
+      if (pendingRun) { var r = pendingRun; pendingRun = null; r(); }
+      else if (params.xml) {
+        f.contentWindow.postMessage(JSON.stringify({ action: 'load', autosave: 1, xml: params.xml }), '*');
+      }
     }
     if (d.event === 'export') {
       var data = d.data || '';
       var m = data.match(/^data:image\/png;base64,([\s\S]*)$/);
       window.__exportPng = m ? m[1] : data;
       window.__exportDone = true;
+      if (pendingResolve) { var rs = pendingResolve; pendingResolve = null; rs({ ok: true, png: window.__exportPng }); }
     }
   });
-  window.__doExport = function () {
-    f.contentWindow.postMessage(JSON.stringify({
-      action: 'export', format: 'png', xml: params.xml,
-      scale: params.scale, border: params.border, background: params.background
-    }), '*');
+  // 热路径：应用常驻，重复渲染只换 xml + 导出，不再重启 iframe
+  window.__doRender = function (xml, scale, border, background) {
+    window.__exportDone = false;
+    window.__exportPng = undefined;
+    var run = function () {
+      f.contentWindow.postMessage(JSON.stringify({ action: 'load', autosave: 1, xml: xml }), '*');
+      setTimeout(function () {
+        f.contentWindow.postMessage(JSON.stringify({
+          action: 'export', format: 'png', xml: xml,
+          scale: scale, border: border, background: background
+        }), '*');
+      }, 600);
+    };
+    return new Promise(function (resolve) {
+      pendingResolve = resolve;
+      if (booted) run();
+      else pendingRun = run;
+    });
   };
 })();
 </script></body></html>"#;
 
-/// Fragment-encode render parameters (base64url of the JSON payload).
-fn frag(params: &serde_json::Value) -> String {
-    let bytes = serde_json::to_vec(params).unwrap_or_default();
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-
-/// URL of the export wrapper for the given xml/opts.
-pub fn export_url(xml: &str, opts: &RenderOptions) -> String {
-    let params = serde_json::json!({
-        "xml": xml,
-        "scale": opts.scale,
-        "border": opts.border,
-        "background": opts.background,
-    });
-    format!("http://127.0.0.1:{}/__harness_export.html#{}", port(), frag(&params))
+/// Base URL of the export wrapper (xml travels via CDP evaluate, not the
+/// URL — no length limits, and the page stays hot across renders).
+pub fn export_page_url() -> String {
+    format!("http://127.0.0.1:{}/__harness_export.html", port())
 }
 
 fn port() -> u16 {

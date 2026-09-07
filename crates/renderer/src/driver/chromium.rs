@@ -124,6 +124,10 @@ struct ChromiumInner {
     session_id: Mutex<Option<String>>,
     /// Keeps the WebSocket reader task alive.
     _reader_task: tokio::task::JoinHandle<()>,
+    /// 热页面：wrapper 已导航并等待 app 就绪后置真；进程级复用。
+    page_ready: std::sync::atomic::AtomicBool,
+    /// 串行化渲染（同一进程/页面一次只跑一个导出）。
+    render_lock: tokio::sync::Mutex<()>,
 }
 
 impl Drop for ChromiumInner {
@@ -267,6 +271,8 @@ impl HeadlessChromiumDriver {
             pending,
             session_id: Mutex::new(None),
             _reader_task: reader_task,
+            page_ready: std::sync::atomic::AtomicBool::new(false),
+            render_lock: tokio::sync::Mutex::new(()),
         };
         let driver = Self {
             inner: Arc::new(inner),
@@ -365,85 +371,98 @@ impl RenderDriver for HeadlessChromiumDriver {
             return Err(RenderError::Xml("empty xml".into()));
         }
 
-        // 1. Navigate to the export wrapper (drawio webapp in an iframe,
-        //    native export protocol).
-        let url = crate::driver::drawio_server::export_url(xml, opts);
-        self.send("Page.enable", None).await?;
-        self.send("Page.navigate", Some(json!({ "url": url }))).await?;
+        // 渲染串行化（同进程共享一个热页面）。
+        let _guard = self.inner.render_lock.lock().await;
 
-        // 2. Wait for the wrapper to load the app and hand over the xml.
-        let mut ready = false;
-        for _ in 0..400 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            match self
-                .send(
-                    "Runtime.evaluate",
-                    Some(json!({
-                        "expression": "window.__ready === true",
-                        "returnByValue": true,
-                    })),
-                )
-                .await
-            {
-                Ok(r) => {
-                    if r.get("result")
-                        .and_then(|v| v.get("value"))
-                        .and_then(|v| v.as_bool())
-                        == Some(true)
-                    {
-                        ready = true;
-                        break;
+        // 1. 首次：导航到 wrapper 页并等应用就绪；之后进程/页面常驻，
+        //    每次渲染只换 xml + 导出（省掉进程启动与应用加载）。
+        if !self.inner.page_ready.load(std::sync::atomic::Ordering::Acquire) {
+            let url = crate::driver::drawio_server::export_page_url();
+            self.send("Page.enable", None).await?;
+            self.send("Page.navigate", Some(json!({ "url": url }))).await?;
+            let mut ready = false;
+            for _ in 0..600 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                match self
+                    .send(
+                        "Runtime.evaluate",
+                        Some(json!({
+                            "expression": "window.__ready === true",
+                            "returnByValue": true,
+                        })),
+                    )
+                    .await
+                {
+                    Ok(r) => {
+                        if r.get("result")
+                            .and_then(|v| v.get("value"))
+                            .and_then(|v| v.as_bool())
+                            == Some(true)
+                        {
+                            ready = true;
+                            break;
+                        }
                     }
+                    Err(_) => continue,
                 }
-                Err(_) => continue,
             }
-        }
-        if !ready {
-            return Err(RenderError::Page(
-                "drawio webapp did not become ready (offline? app not cached?)".into(),
-            ));
+            if !ready {
+                return Err(RenderError::Page(
+                    "drawio webapp did not become ready (offline? app not cached?)".into(),
+                ));
+            }
+            self.inner
+                .page_ready
+                .store(true, std::sync::atomic::Ordering::Release);
         }
 
-        // 3. Trigger the native export.
-        self.send(
-            "Runtime.evaluate",
-            Some(json!({
-                "expression": "window.__doExport()",
-                "returnByValue": true,
-            })),
-        )
-        .await?;
-
-        // 4. Wait for the export result.
-        let mut png_b64: Option<String> = None;
-        for _ in 0..400 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            match self
-                .send(
-                    "Runtime.evaluate",
-                    Some(json!({
-                        "expression": "window.__exportDone === true ? window.__exportPng : undefined",
-                        "returnByValue": true,
-                    })),
-                )
-                .await
-            {
-                Ok(r) => {
-                    if let Some(v) = r
-                        .get("result")
-                        .and_then(|x| x.get("value"))
-                        .and_then(|x| x.as_str())
-                    {
-                        png_b64 = Some(v.to_string());
-                        break;
-                    }
-                }
-                Err(_) => continue,
-            }
-        }
-        let Some(png_b64) = png_b64 else {
-            return Err(RenderError::Page("drawio export timed out".into()));
+        // 2. 热路径渲染：__doRender 返回 Promise，CDP awaitPromise 等它
+        //    在应用内完成 load + export。
+        let bg = if opts.background.is_empty() {
+            "#ffffff"
+        } else {
+            &opts.background
         };
+        let expr = format!(
+            "window.__doRender({xml}, {scale}, {border}, {bg})",
+            xml = serde_json::Value::String(xml.to_string()),
+            scale = opts.scale,
+            border = opts.border,
+            bg = serde_json::Value::String(bg.to_string()),
+        );
+        let result = timeout(
+            Duration::from_secs(45),
+            self.send(
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression": expr,
+                    "awaitPromise": true,
+                    "returnByValue": true,
+                })),
+            ),
+        )
+        .await
+        .map_err(|_| RenderError::Page("drawio export timed out".into()))??;
+        if let Some(exception) = result.get("exceptionDetails") {
+            if !exception.is_null() {
+                return Err(RenderError::Xml(format!("__doRender threw: {exception}")));
+            }
+        }
+        let value = result
+            .get("result")
+            .and_then(|v| v.get("value"))
+            .cloned()
+            .unwrap_or(json!({}));
+        let png_b64 = value
+            .get("png")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                let msg = value
+                    .get("err")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("no png in export result");
+                RenderError::Export(msg.to_string())
+            })?;
         let png = base64::engine::general_purpose::STANDARD
             .decode(png_b64.trim())
             .map_err(|e| RenderError::Export(format!("base64 decode: {e}")))?;

@@ -48,6 +48,9 @@ struct AppState {
     /// 解压好的 drawio webapp 目录（编辑器 iframe 与渲染共用）；
     /// None = 离线且未缓存 → 前端回退到旧 mxGraph 画布。
     drawio: Option<PathBuf>,
+    /// 共享的无头渲染 driver：整个服务器进程只有一个浏览器实例 +
+    /// 热页面，导出/渲染不再每次启动进程。
+    renderer: Arc<tokio::sync::Mutex<Option<Arc<drawio_agent_renderer::HeadlessChromiumDriver>>>>,
 }
 
 impl FromRef<AppState> for Arc<Mutex<WebState>> {
@@ -173,7 +176,12 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
         Some(c) => println!("渲染宿主已就绪: {}", c.display()),
         None => println!("渲染宿主不可用（离线且无系统浏览器）——view/导出将报错"),
     }
-    let app_state = AppState { big: state, cancel, drawio };
+    let app_state = AppState {
+        big: state,
+        cancel,
+        drawio,
+        renderer: Arc::new(tokio::sync::Mutex::new(None)),
+    };
     let app = Router::new()
         .route("/", get(page))
         .route("/app.css", get(css))
@@ -1163,9 +1171,9 @@ struct ManualReq {
 
 /// 导出当前会话为 PNG：读磁盘上的 canonical XML（与 /api/file 同一路径，
 /// 不受任务锁影响），chromium 2x 渲染返回。
-async fn api_export_png(State(st): State<Arc<Mutex<WebState>>>) -> Response {
+async fn api_export_png(State(app): State<AppState>) -> Response {
     let (path, stem) = {
-        let st = st.lock().await;
+        let st = app.big.lock().await;
         match &st.current {
             Some(cur) => (
                 st.dir.join(cur),
@@ -1178,17 +1186,23 @@ async fn api_export_png(State(st): State<Arc<Mutex<WebState>>>) -> Response {
         Ok(x) => x,
         Err(_) => return (StatusCode::NOT_FOUND, "no session file").into_response(),
     };
-    let driver = match drawio_agent_renderer::HeadlessChromiumDriver::launch().await {
-        Ok(d) => d,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("chromium 启动失败: {e}"),
-            )
-                .into_response()
+    // 复用共享 driver（懒启动一次，之后热页面渲染）
+    let mut slot = app.renderer.lock().await;
+    if slot.is_none() {
+        match drawio_agent_renderer::HeadlessChromiumDriver::launch().await {
+            Ok(d) => *slot = Some(std::sync::Arc::new(d)),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("chromium 启动失败: {e}"),
+                )
+                    .into_response()
+            }
         }
-    };
-    let renderer = drawio_agent_renderer::Renderer::new(std::sync::Arc::new(driver));
+    }
+    let driver = slot.clone().expect("driver just ensured");
+    drop(slot);
+    let renderer = drawio_agent_renderer::Renderer::new(driver);
     let opts = drawio_agent_renderer::RenderOptions {
         scale: 2.0,
         ..Default::default()
