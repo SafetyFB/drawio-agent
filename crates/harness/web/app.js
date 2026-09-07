@@ -535,12 +535,29 @@ function hitTestCells(rect) {
   return out;
 }
 
+/// canonical xml → id→value 映射（用户手画 cell 的 id 是 drawio 随机串，
+/// 展示时附上 value 才可读）
+function buildLabelMap() {
+  const map = {};
+  try {
+    const re = /<mxCell\s+id="([^"]+)"\s+value="([^"]*)"/g;
+    let m;
+    while ((m = re.exec(currentXml))) map[m[1]] = m[2];
+  } catch (e) { /* 保留空 map */ }
+  return map;
+}
+function labelOf(id, map) {
+  const v = map[id];
+  return v && v.trim() && v !== id ? `${id}（${v}）` : id;
+}
 function setSelection(ids) {
   selectedIds = ids;
   const chip = $('sel-chip');
   if (!ids.length) { chip.hidden = true; $('sel-note').textContent = ''; return; }
   chip.hidden = false;
-  chip.textContent = `已选中 ${ids.length} 个 cell：${ids.join(', ')} —— 将随下一条消息附带`;
+  const map = buildLabelMap();
+  const shown = ids.map((i) => labelOf(i, map)).join(', ');
+  chip.textContent = `已选中 ${ids.length} 个 cell：${shown} —— 将随下一条消息附带`;
   $('sel-note').textContent = `（附带 ${ids.length} 个 cell 引用）`;
 }
 
