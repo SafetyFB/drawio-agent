@@ -31,6 +31,7 @@ Draw.loadPlugin(function (ui) {
     if (d.event) diag('msg:' + d.event);
     if (d.action === 'export_annotate') {
       var crop = null;
+      var retries = 0;
       var ids = d.ids || [];
       if (ids.length) {
         var minX = 1e12, minY = 1e12, maxX = -1e12, maxY = -1e12;
@@ -50,53 +51,77 @@ Draw.loadPlugin(function (ui) {
         }
       }
       if (d.annotate) {
-        var placed = [];
         var allowed = d.allowed || null;
         var cap = 200;
-        var walk = function (cell) {
+        var placedCount = 0;
+        var candidates = [];
+        // 先收集候选 cell（load 后视图可能未 revalidate——state 无效时
+        // 等 200ms 重试，最多 10 次，避免把徽章插到陈旧坐标上）
+        var collect = function (cell) {
           if (cell && cell.id !== '0' && cell.id !== '1' && g.model.isVertex(cell)
-              && placed.length < cap
+              && candidates.length < cap
               && (!allowed || allowed.indexOf(cell.id) >= 0)) {
-            var st = g.view.getState(cell);
-            if (st && st.width > 0) {
-              var label = cell.id.length > 10 ? cell.id.slice(0, 9) + '…' : cell.id;
-              var bw = Math.max(24, label.length * 5.5 + 6), bh = 12;
-              var x0 = st.x - 4, y0 = st.y - 12;
-              var placedAt = null;
-              for (var k = 0; k < 6; k++) {
-                var bx = x0 + k * 14, by = y0;
-                var hit = false;
-                for (var p = 0; p < placed.length; p++) {
-                  var r = placed[p];
-                  if (bx < r.x + r.w && r.x < bx + bw && by < r.y + r.h && r.y < by + bh) { hit = true; break; }
-                }
-                if (!hit) { placedAt = [bx, by]; break; }
+            candidates.push(cell);
+          }
+          if (cell) for (var i = 0; i < g.model.getChildCount(cell); i++) collect(g.model.getChildAt(cell, i));
+        };
+        collect(g.model.getRoot());
+        var placeBadges = function () {
+          // 全部在模型坐标空间计算：cell.geometry 是绝对模型坐标，
+          // 永不过期（此前依赖 view.getState，读到的是 app 异步 auto-fit
+          // 前的陈旧视图状态——徽章整体偏移的根源）。
+          var s = g.view.scale;
+          var placed = [];
+          for (var i = 0; i < candidates.length; i++) {
+            var cell = candidates[i];
+            var geo = cell.geometry;
+            if (!geo || !geo.width || !geo.height) continue;
+            var label = cell.id.length > 10 ? cell.id.slice(0, 9) + '…' : cell.id;
+            var bw = Math.max(24, label.length * 5.5 + 6), bh = 12;
+            // 模型坐标：cell 左上角 + 视口偏移换算（-4/-12 视口单位 ÷ s）
+            var x0 = geo.x - 4 / s, y0 = geo.y - 12 / s;
+            var placedAt = null;
+            for (var k = 0; k < 6; k++) {
+              var bx = x0 + k * 14 / s, by = y0;
+              var hit = false;
+              for (var p = 0; p < placed.length; p++) {
+                var r = placed[p];
+                if (bx < r.x + r.w && r.x < bx + bw / s && by < r.y + r.h && r.y < by + bh / s) { hit = true; break; }
               }
-              if (placedAt) {
-                placed.push({ x: placedAt[0], y: placedAt[1], w: bw, h: bh });
-                var s = g.view.scale, t = g.view.translate;
-                // 关键：与被标注 cell 同父（getDefaultParent 是图层 cell，
-                // 自带几何偏移——徽章会被整体平移错位）
-                var pcell = cell.parent || g.getDefaultParent();
-                var ov = g.insertVertex(
-                  pcell, null, label,
-                  (placedAt[0] - t.x) / s, (placedAt[1] - t.y) / s, bw / s, bh / s,
-                  'text;html=1;align=left;verticalAlign=top;fontSize=9;fontColor=#D32F2F;fillColor=none;strokeColor=none;spacing=0;'
-                );
-                overlays.push(ov);
-              }
+              if (!hit) { placedAt = [bx, by]; break; }
+            }
+            if (placedAt) {
+              placed.push({ x: placedAt[0], y: placedAt[1], w: bw / s, h: bh / s });
+              var pcell = cell.parent || g.getDefaultParent();
+              var ov = g.insertVertex(
+                pcell, null, label,
+                placedAt[0], placedAt[1], bw / s, bh / s,
+                'text;html=1;align=left;verticalAlign=top;fontSize=9;fontColor=#D32F2F;fillColor=none;strokeColor=none;spacing=0;'
+              );
+              ov.geometry.relative = false;
+              ov.geometry.x = placedAt[0];
+              ov.geometry.y = placedAt[1];
+              overlays.push(ov);
+              placedCount++;
             }
           }
-          if (cell) for (var i = 0; i < g.model.getChildCount(cell); i++) walk(g.model.getChildAt(cell, i));
+          g.view.revalidate();
+          finishReady();
         };
-        walk(g.model.getRoot());
+      } else {
+        // 无标注：直接回 ready（裁剪信息可能携带）
+        finishReady();
+      }
+      function finishReady() {
+        if (crop) {
+          crop.gy -= 16; crop.gh += 16;
+        }
+        parent.postMessage({ event: 'export_annotate_ready', crop: crop }, '*');
+      }
+      if (d.annotate) {
         g.view.revalidate();
+        placeBadges();
       }
-      if (crop) {
-        // 徽章可能高于 gb 顶边，扩出标注区保证裁剪映射正确
-        crop.gy -= 16; crop.gh += 16;
-      }
-      parent.postMessage({ event: 'export_annotate_ready', crop: crop }, '*');
     }
     if (d.action === 'export_annotate_clear') {
       for (var i = 0; i < overlays.length; i++) g.model.remove(overlays[i]);
@@ -150,13 +175,7 @@ const WRAPPER_HTML: &str = r#"<!DOCTYPE html><html><body style="margin:0">
     }
     if (d.event === 'export_annotate_ready') {
       window.__crop = d.crop || null;
-      window.__overlayXmls = d.overlayXmls || [];
-      diag('annotate_ready: overlays=' + window.__overlayXmls.length + ' crop=' + JSON.stringify(window.__crop));
-      if (d.badgeModels && d.badgeModels.length) {
-        var bm = d.badgeModels[0];
-        diag('badge model=' + bm.x + ',' + bm.y + ' view_s=' + bm.s + ' view_t=' + bm.tx + ',' + bm.ty);
-      }
-      if (window.__overlayXmls.length) diag('overlay[0]=' + window.__overlayXmls[0].slice(0, 150));
+      diag('annotate_ready crop=' + JSON.stringify(window.__crop));
     }
     if (d.event === 'export') {
       var data = d.data || '';
@@ -186,16 +205,29 @@ const WRAPPER_HTML: &str = r#"<!DOCTYPE html><html><body style="margin:0">
           allowed: allowed
         }), '*');
         setTimeout(function () {
-          // 导出 live model（徽章 overlay 已插入模型，无需 xml 注入——
-          // 探针实测：无 xml 参数的 export 即导出当前模型，几何精确）。
-          // 无 xml 时协议回退到模型内容，此前 timeout 是 cropToPng
-          // Promise bug 的同期假象。
-          var effBorder = cropNeeded ? 0 : (annotate ? Math.max(border, 24) : border);
-          f.contentWindow.postMessage(JSON.stringify({
-            action: 'export', format: 'png',
-            scale: scale, border: effBorder, background: background
-          }), '*');
-        }, 300);
+          // 导出 live model（徽章 overlay 已插入模型）
+          var doExport = function () {
+            var effBorder = cropNeeded ? 0 : (annotate ? Math.max(border, 24) : border);
+            f.contentWindow.postMessage(JSON.stringify({
+              action: 'export', format: 'png',
+              scale: scale, border: effBorder, background: background
+            }), '*');
+          };
+          // 等插件真正放好徽章（export_annotate_ready）再导出；5s 兜底
+          var doneFlag = false;
+          var onReady = function (ev) {
+            var dd = ev.data;
+            try { if (typeof dd === 'string') dd = JSON.parse(dd); } catch (e) {}
+            if (!dd || dd.event !== 'export_annotate_ready') return;
+            doneFlag = true;
+            window.removeEventListener('message', onReady);
+            doExport();
+          };
+          window.addEventListener('message', onReady);
+          setTimeout(function () {
+            if (!doneFlag) { window.removeEventListener('message', onReady); doExport(); }
+          }, 5000);
+        }, 600);
       }, 600);
     };
     var cropToPng = function (b64) {
