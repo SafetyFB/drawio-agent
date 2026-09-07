@@ -325,7 +325,9 @@ impl Tools {
                     report_summary(&report)
                 )))
             }
-            Err(e) => Err(format!("编辑被拒绝（文件未改动）: {e}")),
+            Err(e) => Err(format!(
+                "编辑被拒绝（文件未改动）: {e}\n正确形态示例（单 cell 自洽 XML，含完整属性）：\n<mxCell id=\"新id\" value=\"标签\" vertex=\"1\" parent=\"1\"><mxGeometry x=\"40\" y=\"60\" width=\"120\" height=\"60\" as=\"geometry\"/></mxCell>\n连线需 vertex→edge：source/target=已有 cell id、父级 parent=\"1\"。"
+            )),
         }
     }
 
