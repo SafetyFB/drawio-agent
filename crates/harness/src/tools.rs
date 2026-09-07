@@ -99,8 +99,9 @@ impl Tools {
    整图重建（新画一张图或大改布局时用）。xml 必须是完整 mxfile。
 
 5. check  {}
-   确定性校验：XML 结构、id 唯一、parent/source/target 引用完整。
-   edit/draw 之后建议调用。
+   确定性校验：XML 结构、id 唯一、parent/source/target 引用完整，
+   并附布局质量摘要（重叠/交叉/标签溢出/越界/分支平行）。
+   edit/draw 之后建议调用；布局类任务收尾前再调一次确认清零。
 
 6. lint   {}
    确定性布局质量检查：重叠、连线交叉/穿框、标签溢出、越界、断引用。
@@ -135,7 +136,19 @@ impl Tools {
             "locate" => self.locate(doc, args),
             "edit" => self.edit(doc, args, false),
             "draw" => self.edit(doc, args, true),
-            "check" => self.check(doc),
+            "check" => {
+                // check = 结构校验 + 布局 lint 摘要（两条建议合并）
+                let mut out = self.check(doc)?;
+                if let Ok(report) = crate::metrics::analyze(doc.canonical()) {
+                    let ext = crate::metrics::lint_text(&report);
+                    // check 文本 + lint 文本去重合并
+                    let mut merged = out.text.clone();
+                    merged.push_str("\n");
+                    merged.push_str(&ext);
+                    out.text = merged;
+                }
+                Ok(out)
+            }
             "lint" => {
                 let report = crate::metrics::analyze(doc.canonical())
                     .map_err(|e| format!("lint 失败: {e}"))?;
