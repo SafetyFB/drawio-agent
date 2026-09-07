@@ -287,6 +287,18 @@ parent.postMessage({ event: 'plugin-ping', stage: 'top' }, '*');
 Draw.loadPlugin(function (ui) {
   parent.postMessage({ event: 'plugin-ping', stage: 'loaded' }, '*');
   var g = ui.editor.graph;
+  // 用户新建 cell 的 id 规整：drawio 默认 base64 随机串不可读。
+  // 覆盖 createId → 短规律 u1/u2/u3（加载文件不走此路径；复制粘贴
+  // 也经 createId 重新生成）。存在性检查防撞。
+  var origCreateId = mxGraphModel.prototype.createId;
+  var seq = 0;
+  mxGraphModel.prototype.createId = function () {
+    for (;;) {
+      seq++;
+      var id = 'u' + seq;
+      if (!this.getCell(id)) return id;
+    }
+  };
   g.getSelectionModel().addListener(mxEvent.SELECTION_CHANGED, function () {
     var ids = g.getSelectionCells()
       .filter(function (c) { return c.id && c.id !== '0' && c.id !== '1'; })
