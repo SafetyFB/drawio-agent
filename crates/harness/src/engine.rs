@@ -99,6 +99,9 @@ pub struct RunOpts {
     pub budget_remaining: f64,
     /// Max model rounds for this run (configurable in the settings panel).
     pub max_turns: usize,
+    /// 旧版 mxGraph 画布回退模式（drawio webapp 不可用）：提示词附带
+    /// 2018 viewer 的形状拼写约束。
+    pub legacy_viewer: bool,
 }
 
 impl Default for RunOpts {
@@ -110,6 +113,7 @@ impl Default for RunOpts {
             price_output_per_m: 0.0,
             budget_remaining: f64::INFINITY,
             max_turns: crate::config::default_max_turns(),
+            legacy_viewer: false,
         }
     }
 }
@@ -123,6 +127,7 @@ impl RunOpts {
             price_output_per_m: s.price_output_per_m,
             budget_remaining: f64::INFINITY,
             max_turns: s.max_turns.max(1),
+            legacy_viewer: false,
         }
     }
 }
@@ -144,7 +149,18 @@ impl Default for Harness {
     }
 }
 
-fn system_prompt(doc: &XmlDoc) -> String {
+fn system_prompt(doc: &XmlDoc, legacy_viewer: bool) -> String {
+    let legacy_note = if legacy_viewer {
+        r#"
+
+## 当前画布兼容性（旧版回退模式）
+本次会话未加载最新 drawio 编辑器，画布/渲染为 2018 版 mxGraph：
+形状必须写 `shape=<名字>`；禁止裸形状名（如 `ellipse;…`）或
+`shape=mxgraph.basic.ellipse`——这两种都会渲染成矩形（系统会自动改写，
+但自己写对更稳）。"#
+    } else {
+        ""
+    };
     format!(
         r#"你是 drawio 图表的编辑 Agent，唯一工件是本地文件 {path}
 （规范 XML：每元素一行、行号稳定、属性已规范转义；共 {cells} 个带 id 元素）。
@@ -200,8 +216,10 @@ relative="1"。坐标是绝对画布坐标，摆位时注意间距避免重叠�
 
 ## 错误处理
 - 工具失败时读返回的错误信息，修正参数重试；不要原样重复失败调用。
-- 预算或上下文超限会被系统强制中止，不要尝试绕过。"#,
+- 预算或上下文超限会被系统强制中止，不要尝试绕过。
+{legacy_note}"#,
         path = doc.path.display(),
+        legacy_note = legacy_note,
         cells = doc.cells.len(),
         png = doc.path.with_extension("png").display(),
         specs = Tools::tool_specs(),
@@ -331,7 +349,7 @@ impl Harness {
                 }
             };
         }
-        let mut history: Vec<Message> = vec![Message::system(system_prompt(doc))];
+        let mut history: Vec<Message> = vec![Message::system(system_prompt(doc, opts.legacy_viewer))];
         // R5: re-inject the rolling memory of earlier asks (kept trimmed).
         for m in &stats.transcript {
             history.push(m.clone());
@@ -637,7 +655,12 @@ mod tests {
     #[test]
     fn system_prompt_renders_single_brace_json_examples() {
         let doc = XmlDoc::from_text(SAMPLE).unwrap();
-        let p = system_prompt(&doc);
+        let p = system_prompt(&doc, false);
+        assert!(p.contains("Draw.io 样式知识"));
+        assert!(!p.contains("2018"));
+        let legacy = system_prompt(&doc, true);
+        assert!(legacy.contains("2018"));
+        assert!(legacy.contains("旧版回退模式"));
         assert!(p.contains(r#"{"tool": "locate", "args"#) || p.contains(r#"{"tool": "<工具名>""#), "信封示例必须是单层花括号");
         assert!(p.contains("read   {"), "工具清单必须有 read");
         assert!(!p.contains("{{"), "提示词里不应残留双层花括号: {}", &p[p.len().saturating_sub(400)..]);

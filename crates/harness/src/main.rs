@@ -538,6 +538,7 @@ async fn run_one_ask(
     let budget = cfg.budget_yuan;
     let opts = {
         let mut o = drawio_harness::RunOpts::from_settings(&cfg);
+        o.legacy_viewer = !drawio_agent_renderer::drawio_app_cached();
         if let Some(b) = budget {
             o.budget_remaining = (b - r.usage.cost_yuan).max(0.0);
         }

@@ -744,6 +744,7 @@ async fn api_chat_stream(
             if let Some(b) = budget_yuan {
                 o.budget_remaining = (b - stats.cost_yuan).max(0.0);
             }
+            o.legacy_viewer = !drawio_agent_renderer::drawio_app_cached();
             o
         };
         // Canvas selection -> @cell refs (same as REPL /sel)。
