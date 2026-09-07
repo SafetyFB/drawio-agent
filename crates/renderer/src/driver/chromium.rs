@@ -424,13 +424,17 @@ impl RenderDriver for HeadlessChromiumDriver {
             &opts.background
         };
         let expr = format!(
-            "window.__doRender({xml}, {scale}, {border}, {bg})",
+            "window.__doRender({xml}, {scale}, {border}, {bg}, {annotate}, {focus})",
             xml = serde_json::Value::String(xml.to_string()),
             scale = opts.scale,
             border = opts.border,
             bg = serde_json::Value::String(bg.to_string()),
+            annotate = opts.annotate,
+            focus = serde_json::Value::Array(
+                opts.focus.iter().map(|f| serde_json::Value::String(f.clone())).collect()
+            ),
         );
-        let result = timeout(
+        let result = match timeout(
             Duration::from_secs(45),
             self.send(
                 "Runtime.evaluate",
@@ -442,7 +446,56 @@ impl RenderDriver for HeadlessChromiumDriver {
             ),
         )
         .await
-        .map_err(|_| RenderError::Page("drawio export timed out".into()))??;
+        {
+            Ok(r) => match r {
+                Ok(r) => r,
+                Err(e) => {
+                    let diag = self
+                        .send(
+                            "Runtime.evaluate",
+                            Some(json!({
+                                "expression": "JSON.stringify(window.__diag || [])",
+                                "returnByValue": true,
+                            })),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|r| {
+                            r.get("result")
+                                .and_then(|v| v.get("value"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or_else(|| "(no diag)".into());
+                    return Err(RenderError::Page(format!(
+                        "drawio export failed: {e}. page diag: {diag}"
+                    )));
+                }
+            },
+            Err(_) => {
+                // 超时：尽力读回页面诊断再报错
+                let diag = self
+                    .send(
+                        "Runtime.evaluate",
+                        Some(json!({
+                            "expression": "JSON.stringify(window.__diag || [])",
+                            "returnByValue": true,
+                        })),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|r| {
+                        r.get("result")
+                            .and_then(|v| v.get("value"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| "(no diag)".into());
+                return Err(RenderError::Page(format!(
+                    "drawio export timed out. page diag: {diag}"
+                )));
+            }
+        };
         if let Some(exception) = result.get("exceptionDetails") {
             if !exception.is_null() {
                 return Err(RenderError::Xml(format!("__doRender threw: {exception}")));

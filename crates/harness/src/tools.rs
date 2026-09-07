@@ -108,8 +108,11 @@ impl Tools {
    比纯眼睛可靠；warning 阈值化，不必强行全清（0 交叉但布局怪
    反而更差）。
 
-7. view   {}
+7. view   {} 或 {"annotate": true} 或 {"focus": ["svc-a", "db"]}
    渲染当前文件为截图并作为图像消息发给你——你会真正看到这张图。
+   - annotate=true：图上叠加红色小徽章标注 cell id（密集处自动避让），
+     用于把视觉元素与 cell id 对应起来
+   - focus=[id...]：只渲染这些 cell 的局部放大图（密集区域看细节用）
    检查：节点重叠、文字溢出框体、连线错位/穿框、箭头方向、布局失衡。
    看完再决定改哪里；不要连续重复调用（上一张图已经在你的上下文里）。
    画布坐标与 xml 行区间没有 1:1 对应：定位用 locate，几何值用 read。
@@ -138,13 +141,7 @@ impl Tools {
                     .map_err(|e| format!("lint 失败: {e}"))?;
                 Ok(ToolOutput::text(crate::metrics::lint_text(&report)))
             }
-            "view" => {
-                let open = args
-                    .get("open")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                self.view(doc, open).await
-            }
+            "view" => self.view(doc, args).await,
             other => Err(format!("未知工具 `{other}`。可用: read locate edit draw check lint view")),
         }
     }
@@ -292,7 +289,8 @@ impl Tools {
     /// Render current doc to PNG. `open=true` also opens it in the system
     /// viewer (human `/view`); model-driven calls pass `false` and instead
     /// get the PNG back as an image part.
-    pub async fn view(&mut self, doc: &XmlDoc, open: bool) -> Result<ToolOutput, String> {
+    pub async fn view(&mut self, doc: &XmlDoc, args: &Value) -> Result<ToolOutput, String> {
+        let open = args.get("open").and_then(Value::as_bool).unwrap_or(false);
         if !self.render {
             return Ok(ToolOutput::text(
                 "渲染未启用（无 chromium）。请用 /view 在本地渲染查看。",
@@ -315,7 +313,17 @@ impl Tools {
                 r
             }
         };
-        let opts = drawio_agent_renderer::RenderOptions::default();
+        let mut opts = drawio_agent_renderer::RenderOptions::default();
+        // 可选增强：annotate=id 徽章标注；focus=[cell ids] 局部裁剪放大
+        if args.get("annotate").and_then(Value::as_bool) == Some(true) {
+            opts.annotate = true;
+        }
+        if let Some(f) = args.get("focus").and_then(Value::as_array) {
+            opts.focus = f
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+        }
         match renderer.render(doc.canonical(), &opts).await {
             Ok(png) => {
                 let mut text = format!("渲染成功 ({} bytes, cells={})", png.len(), doc.cells.len());

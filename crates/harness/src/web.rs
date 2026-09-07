@@ -191,7 +191,7 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
         .route("/drawio/", get(drawio_index))
         .route("/drawio/*path", get(drawio_static))
         .route("/drawio-plugin.js", get(drawio_plugin))
-        .route("/api/state", get(api_state))
+                        .route("/api/state", get(api_state))
         .route("/api/sessions", get(api_sessions_list).post(api_sessions_create))
         .route("/api/sessions/switch", post(api_sessions_switch))
         .route("/api/sessions/:name", axum::routing::delete(api_sessions_delete))
@@ -1171,7 +1171,16 @@ struct ManualReq {
 
 /// 导出当前会话为 PNG：读磁盘上的 canonical XML（与 /api/file 同一路径，
 /// 不受任务锁影响），chromium 2x 渲染返回。
-async fn api_export_png(State(app): State<AppState>) -> Response {
+#[derive(Debug, serde::Deserialize)]
+struct ExportQuery {
+    annotate: Option<bool>,
+    focus: Option<String>,
+}
+
+async fn api_export_png(
+    State(app): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ExportQuery>,
+) -> Response {
     let (path, stem) = {
         let st = app.big.lock().await;
         match &st.current {
@@ -1205,6 +1214,11 @@ async fn api_export_png(State(app): State<AppState>) -> Response {
     let renderer = drawio_agent_renderer::Renderer::new(driver);
     let opts = drawio_agent_renderer::RenderOptions {
         scale: 2.0,
+        annotate: q.annotate.unwrap_or(false),
+        focus: q
+            .focus
+            .map(|f| f.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default(),
         ..Default::default()
     };
     match renderer.render(&xml, &opts).await {

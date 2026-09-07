@@ -17,11 +17,115 @@ use crate::RenderOptions;
 
 static PORT: OnceLock<u16> = OnceLock::new();
 
+/// 导出侧插件：徽章标注（碰撞避让）+ 裁剪矩形信息 + overlay XML 回传。
+/// headless 页面专用（renderer 内部静态服务器提供；用户浏览器用的是
+/// harness 侧的 sel 桥插件）。
+pub const EXPORT_PLUGIN_JS: &str = r#"
+Draw.loadPlugin(function (ui) {
+  var g = ui.editor.graph;
+  var overlays = [];
+  window.addEventListener('message', function (ev) {
+    var d = ev.data;
+    try { if (typeof d === 'string') d = JSON.parse(d); } catch (e) {}
+    if (!d || typeof d !== 'object') return;
+    if (d.event) diag('msg:' + d.event);
+    if (d.action === 'export_annotate') {
+      var crop = null;
+      var ids = d.ids || [];
+      if (ids.length) {
+        var minX = 1e12, minY = 1e12, maxX = -1e12, maxY = -1e12;
+        for (var i = 0; i < ids.length; i++) {
+          var cell = g.model.getCell(ids[i]);
+          var st = cell ? g.view.getState(cell) : null;
+          if (st) {
+            minX = Math.min(minX, st.x); minY = Math.min(minY, st.y);
+            maxX = Math.max(maxX, st.x + st.width); maxY = Math.max(maxY, st.y + st.height);
+          }
+        }
+        if (minX < 1e12) {
+          var M = 24;
+          var gb = g.getGraphBounds();
+          crop = { gx: gb.x, gy: gb.y, gw: gb.width, gh: gb.height,
+                   fx: minX - M, fy: minY - M, fw: maxX - minX + 2 * M, fh: maxY - minY + 2 * M };
+        }
+      }
+      var overlayXmls = [];
+      if (d.annotate) {
+        var placed = [];
+        var allowed = d.allowed || null;
+        var cap = 200;
+        var walk = function (cell) {
+          if (cell && cell.id !== '0' && cell.id !== '1' && g.model.isVertex(cell)
+              && placed.length < cap
+              && (!allowed || allowed.indexOf(cell.id) >= 0)) {
+            var st = g.view.getState(cell);
+            if (st && st.width > 0) {
+              var label = cell.id.length > 10 ? cell.id.slice(0, 9) + '…' : cell.id;
+              var bw = Math.max(24, label.length * 5.5 + 6), bh = 12;
+              var x0 = st.x - 4, y0 = st.y - 12;
+              var placedAt = null;
+              for (var k = 0; k < 6; k++) {
+                var bx = x0 + k * 14, by = y0;
+                var hit = false;
+                for (var p = 0; p < placed.length; p++) {
+                  var r = placed[p];
+                  if (bx < r.x + r.w && r.x < bx + bw && by < r.y + r.h && r.y < by + bh) { hit = true; break; }
+                }
+                if (!hit) { placedAt = [bx, by]; break; }
+              }
+              if (placedAt) {
+                placed.push({ x: placedAt[0], y: placedAt[1], w: bw, h: bh });
+                var s = g.view.scale, t = g.view.translate;
+                var ov = g.insertVertex(
+                  g.getDefaultParent(), null, label,
+                  (placedAt[0] - t.x) / s, (placedAt[1] - t.y) / s, bw / s, bh / s,
+                  'text;html=1;align=left;verticalAlign=top;fontSize=9;fontColor=#D32F2F;fillColor=none;strokeColor=none;spacing=0;'
+                );
+                overlays.push(ov);
+                try {
+                  var codec = new mxCodec();
+                  overlayXmls.push(mxUtils.getXml(codec.encode(ov)));
+                } catch (e) {}
+              }
+            }
+          }
+          if (cell) for (var i = 0; i < g.model.getChildCount(cell); i++) walk(g.model.getChildAt(cell, i));
+        };
+        walk(g.model.getRoot());
+        g.view.revalidate();
+      }
+      if (crop) {
+        // 徽章可能高于 gb 顶边，扩出标注区保证裁剪映射正确
+        crop.gy -= 16; crop.gh += 16;
+      }
+      parent.postMessage({ event: 'export_annotate_ready', crop: crop, overlayXmls: overlayXmls }, '*');
+    }
+    if (d.action === 'export_annotate_clear') {
+      for (var i = 0; i < overlays.length; i++) g.model.remove(overlays[i]);
+      overlays = [];
+    }
+  });
+});
+"#;
+
 const WRAPPER_HTML: &str = r#"<!DOCTYPE html><html><body style="margin:0">
 <iframe id="f" style="position:fixed;inset:0;width:100%;height:100%;border:0"
   src="/drawio/index.html?embed=1&proto=json&spin=1&modified=unsavedChanges&keepmodified=1&noSaveBtn=1&saveAndExit=0"></iframe>
 <script>
 (function () {
+  // 注册导出插件（徽章/裁剪信息桥）。headless 专用浏览器 profile，
+  // 与用户浏览器的 localStorage 完全隔离。
+  try {
+    var key = '.drawio-config';
+    var cfg = {};
+    try { cfg = JSON.parse(localStorage.getItem(key) || '{}'); } catch (e) {}
+    var plugins = (cfg.plugins || []).filter(function (u) { return u !== '/drawio-export-plugin.js'; });
+    plugins.push('/drawio-export-plugin.js');
+    localStorage.setItem(key, JSON.stringify(Object.assign({}, cfg, { plugins: plugins })));
+  } catch (e) {}
+  window.__diag = [];
+  var diag = function (m) { window.__diag.push(String(m).slice(0, 200)); };
+  window.onerror = function (m, src, line) { diag('window.onerror: ' + m + ' @' + src + ':' + line); };
   var params = {};
   try {
     var h = decodeURIComponent(location.hash.slice(1));
@@ -37,6 +141,7 @@ const WRAPPER_HTML: &str = r#"<!DOCTYPE html><html><body style="margin:0">
     var d = ev.data;
     try { if (typeof d === 'string') d = JSON.parse(d); } catch (e) {}
     if (!d || typeof d !== 'object') return;
+    if (d.event) diag('msg:' + d.event);
     if (d.event === 'init') {
       booted = true;
       window.__ready = true;
@@ -44,6 +149,12 @@ const WRAPPER_HTML: &str = r#"<!DOCTYPE html><html><body style="margin:0">
       else if (params.xml) {
         f.contentWindow.postMessage(JSON.stringify({ action: 'load', autosave: 1, xml: params.xml }), '*');
       }
+    }
+    if (d.event === 'export_annotate_ready') {
+      window.__crop = d.crop || null;
+      window.__overlayXmls = d.overlayXmls || [];
+      diag('annotate_ready: overlays=' + window.__overlayXmls.length + ' crop=' + JSON.stringify(window.__crop));
+      if (window.__overlayXmls.length) diag('overlay[0]=' + window.__overlayXmls[0].slice(0, 150));
     }
     if (d.event === 'export') {
       var data = d.data || '';
@@ -54,22 +165,87 @@ const WRAPPER_HTML: &str = r#"<!DOCTYPE html><html><body style="margin:0">
     }
   });
   // 热路径：应用常驻，重复渲染只换 xml + 导出，不再重启 iframe
-  window.__doRender = function (xml, scale, border, background) {
+  window.__doRender = function (xml, scale, border, background, annotate, focusIds) {
     window.__exportDone = false;
     window.__exportPng = undefined;
+    window.__crop = null;
+    var cropNeeded = !!(focusIds && focusIds.length);
     var run = function () {
       f.contentWindow.postMessage(JSON.stringify({ action: 'load', autosave: 1, xml: xml }), '*');
       setTimeout(function () {
+        // 徽章/裁剪信息桥：插件返回 crop 矩形（与导出图同一坐标空间的比例）
+        var allowed = [];
+        try {
+          var idRe = /\bid="([^"]+)"/g, m2;
+          while ((m2 = idRe.exec(xml))) allowed.push(m2[1]);
+        } catch (e) {}
         f.contentWindow.postMessage(JSON.stringify({
-          action: 'export', format: 'png', xml: xml,
-          scale: scale, border: border, background: background
+          action: 'export_annotate', annotate: !!annotate, ids: focusIds || [],
+          allowed: allowed
         }), '*');
+        setTimeout(function () {
+          // 徽章 overlay 以 XML 字符串回传后拼进导出 xml（export 协议
+          // 需要 xml 字段，且它导出的是传入的 xml 而非 live model）
+          var exportXml = xml;
+          if (window.__overlayXmls && window.__overlayXmls.length) {
+            var idx = exportXml.indexOf('</root>');
+            if (idx >= 0) {
+              exportXml = exportXml.slice(0, idx) +
+                window.__overlayXmls.join('\n') + exportXml.slice(idx);
+            }
+          }
+          f.contentWindow.postMessage(JSON.stringify({
+            action: 'export', format: 'png', xml: exportXml,
+            scale: scale, border: cropNeeded ? 0 : border, background: background
+          }), '*');
+        }, 300);
       }, 600);
     };
+    var cropToPng = function (b64) {
+      if (!window.__crop) return Promise.resolve(b64);
+      var img = new Image();
+      img.src = 'data:image/png;base64,' + b64;
+      return new Promise(function (res) {
+        img.onload = function () {
+          var W = img.width, H = img.height;
+          var c = window.__crop;
+          // crop 矩形以图元 bbox 的比例给出
+          var x = Math.max(0, Math.round((c.fx - c.gx) / c.gw * W));
+          var y = Math.max(0, Math.round((c.fy - c.gy) / c.gh * H));
+          var w = Math.min(W - x, Math.round(c.fw / c.gw * W));
+          var h = Math.min(H - y, Math.round(c.fh / c.gh * H));
+          var cv = document.createElement('canvas');
+          cv.width = w; cv.height = h;
+          cv.getContext('2d').drawImage(img, x, y, w, h, 0, 0, w, h);
+          res(cv.toDataURL('image/png').split(',')[1]);
+        };
+        img.onerror = function () { res(b64); };
+      });
+    };
     return new Promise(function (resolve) {
-      pendingResolve = resolve;
-      if (booted) run();
-      else pendingRun = run;
+      pendingResolve = function (r) {
+        cropToPng(r.png).then(function (png) {
+          f.contentWindow.postMessage(JSON.stringify({ action: 'export_annotate_clear' }), '*');
+          resolve({ ok: true, png: png });
+        }, function (e) {
+          resolve({ ok: false, err: 'crop failed: ' + (e && e.message ? e.message : e) });
+        });
+      };
+      var runSafely = function () {
+        try { run(); } catch (e) {
+          diag('run failed: ' + (e && e.message ? e.message : e));
+          resolve({ ok: false, err: 'run failed: ' + (e && e.message ? e.message : e) });
+        }
+      };
+      if (booted) runSafely();
+      else pendingRun = runSafely;
+      // 兜底：8s 无 export 事件 → 带诊断报错（低于驱动 CDP 15s 超时）
+      setTimeout(function () {
+        if (pendingResolve) {
+          pendingResolve = null;
+          resolve({ ok: false, err: 'no export event within 8s; diag=' + window.__diag.join(' | ') });
+        }
+      }, 8000);
     });
   };
 })();
@@ -172,6 +348,9 @@ async fn handle_conn(
     let path = path.split('?').next().unwrap_or("/");
     if path == "/__harness_export.html" {
         return respond(&mut sock, 200, "text/html", WRAPPER_HTML.as_bytes()).await;
+    }
+    if path == "/drawio-export-plugin.js" {
+        return respond(&mut sock, 200, "text/javascript", EXPORT_PLUGIN_JS.as_bytes()).await;
     }
     let rel = path.trim_start_matches("/drawio/");
     if path == "/drawio" || path == "/drawio/" || rel.is_empty() {

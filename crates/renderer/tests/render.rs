@@ -46,6 +46,7 @@ async fn renderer_passes_xml_and_opts_to_driver() {
         scale: 2.5,
         background: "#000000".into(),
         border: 42,
+        ..Default::default()
     };
     let xml = "<mxfile><diagram id='a'/></mxfile>";
     renderer.render(xml, &opts).await.unwrap();
@@ -150,6 +151,7 @@ fn render_options_clone_preserves_fields() {
         scale: 3.0,
         background: "transparent".into(),
         border: 7,
+        ..Default::default()
     };
     let copy = opts.clone();
     assert!((copy.scale - 3.0).abs() < 1e-9);

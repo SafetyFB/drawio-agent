@@ -313,7 +313,7 @@ fn main() {
                     let r = rt.block_on(async move {
                         let mut r = st.lock().await;
                         let ReplSession { tools, doc, .. } = &mut *r;
-                        tools.view(doc, true).await
+                        tools.view(doc, &serde_json::json!({"open": true})).await
                     });
                     match r {
                         Ok(out) => println!("{}", out.text),

@@ -36,6 +36,10 @@ pub struct RenderOptions {
     pub background: String,
     /// Optional border padding in pixels around the diagram.
     pub border: u32,
+    /// 叠加数字/id 徽章标注（碰撞避让；仅污染导出图，不碰文件）。
+    pub annotate: bool,
+    /// 只导出这些 cell 的包围盒区域（放大视图；空 = 全图）。
+    pub focus: Vec<String>,
 }
 
 impl Default for RenderOptions {
@@ -44,6 +48,8 @@ impl Default for RenderOptions {
             scale: 1.0,
             background: "#ffffff".into(),
             border: 10,
+            annotate: false,
+            focus: Vec::new(),
         }
     }
 }
