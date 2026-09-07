@@ -137,10 +137,19 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
     }));
 
     let cancel = Arc::new(CancelSlot::default());
-    // drawio webapp：首次使用从 GitHub 下载 draw.war（54MB，SHA-256 校验），
-    // 缓存到 ~/.drawio-agent/drawio/<ver>。离线且未缓存 → None（旧画布回退）。
-    let drawio = tokio::task::spawn_blocking(drawio_agent_renderer::ensure_drawio_app)
-        .await
+    // 两个重资产并行预热（都在启动期完成，避免第一次 view/导出卡下载）：
+    // - drawio webapp：首次使用从 GitHub 下载 draw.war（54MB，SHA-256 校验），
+    //   缓存到 ~/.drawio-agent/drawio/<ver>。离线且未缓存 → None（旧画布回退）。
+    // - chrome-headless-shell：resolve 顺序 = 已缓存 bundle → 系统
+    //   Chrome/Chromium/Edge/Brave（零下载）→ 按需下载。启动期预热后，
+    //   任务中的首次 view 不再等网络。
+    let (drawio, chromium) = tokio::join!(
+        tokio::task::spawn_blocking(drawio_agent_renderer::ensure_drawio_app),
+        tokio::task::spawn_blocking(
+            drawio_agent_renderer::chromium_ensure::resolve_chromium
+        ),
+    );
+    let drawio = drawio
         .unwrap_or_else(|e| {
             eprintln!("drawio webapp 任务失败: {e}");
             Ok(None)
@@ -149,9 +158,20 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
             eprintln!("drawio webapp 不可用（回退旧画布）: {e}");
             None
         });
+    let chromium = chromium
+        .unwrap_or_else(|e| {
+            eprintln!("chromium 预热失败: {e}");
+            Ok(None)
+        })
+        .ok()
+        .flatten();
     match &drawio {
         Some(d) => println!("drawio 编辑器: {}", d.display()),
         None => println!("drawio 编辑器未启用（离线或下载失败）——使用内置 mxGraph 画布"),
+    }
+    match &chromium {
+        Some(c) => println!("渲染宿主已就绪: {}", c.display()),
+        None => println!("渲染宿主不可用（离线且无系统浏览器）——view/导出将报错"),
     }
     let app_state = AppState { big: state, cancel, drawio };
     let app = Router::new()

@@ -33,10 +33,10 @@ cargo test -p drawio-agent-renderer   # 校验/渲染测试
 1. **drawio webapp**（首次运行 web 时）：官方 GitHub release 的
    `draw.war`（~54MB，解压后完整的最新版 drawio 编辑器），供画布编辑器
    与无头渲染共用
-2. **chrome-headless-shell**（首次 view/导出时，~90MB）：无头渲染宿主。
-   **如果系统已装 Chrome / Chromium / Edge / Brave，则直接复用、完全不
-   下载**（`find_chromium` 按「显式路径 → 已缓存 bundle → 系统浏览器 →
-   按需下载」顺序解析）
+2. **chrome-headless-shell**（~90MB，web 启动时与 war **并行预热**下载，
+   避免任务中第一次 view/导出卡网络）：无头渲染宿主。**如果系统已装
+   Chrome / Chromium / Edge / Brave，则直接复用、完全不下载**
+   （解析顺序：显式路径 → 已缓存 bundle → 系统浏览器 → 下载）
 
 > **注意：这两个下载在国内网络下都很慢**（storage.googleapis.com /
 > github.com）。建议开启代理的**增强模式 / TUN 模式**（让运行时流量也
