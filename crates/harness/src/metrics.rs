@@ -634,26 +634,24 @@ pub fn analyze(xml: &str) -> Result<Report, String> {
     Ok(report)
 }
 
-/// lint 工具用的紧凑人类可读文本。
-pub fn lint_text(report: &Report) -> String {
+/// check 工具嵌入的布局 lint 摘要（仅 warning 段——error 类的断引用
+/// 与结构校验重复，由 `check_doc` 报告，这里不再重发）。警告截断前 5 条
+/// 并附带「修最明显的即可、不要逐条清零」引导，防 check-edit 死亡循环。
+pub fn lint_summary_text(report: &Report) -> String {
+    let s = &report.stats;
     let mut out = format!(
-        "lint 结果: {} errors, {} warnings（重叠 {} · 交叉 {} · 标签溢出 {} · 越界 {} · 分支未平行 {}）",
-        report.stats.errors,
+        "布局 lint：{} 条警告（重叠 {} · 交叉 {} · 标签溢出 {} · 越界 {} · 分支未平行 {}）",
         report.warnings.len(),
-        report.stats.overlaps,
-        report.stats.crossings,
-        report.stats.label_overflows,
-        report.stats.out_of_bounds,
-        report.stats.branch_misaligned
+        s.overlaps,
+        s.crossings,
+        s.label_overflows,
+        s.out_of_bounds,
+        s.branch_misaligned
     );
-    if report.errors.is_empty() && report.warnings.is_empty() {
-        out.push_str("\n无硬缺陷与警告。");
+    if report.warnings.is_empty() {
+        out.push_str("——未触发重叠/交叉/溢出/越界。");
         return out;
     }
-    for e in &report.errors {
-        out.push_str(&format!("\n[error:{}] {} —— {}", e.kind, e.ids.join(", "), e.detail));
-    }
-    // 截断：警告过多时只列前 5——全量清单会让模型陷入逐条清零循环
     const SHOW_MAX: usize = 5;
     for (wi, w) in report.warnings.iter().take(SHOW_MAX).enumerate() {
         out.push_str(&format!(
@@ -664,12 +662,12 @@ pub fn lint_text(report: &Report) -> String {
         ));
         if wi + 1 == SHOW_MAX && report.warnings.len() > SHOW_MAX {
             out.push_str(&format!(
-                "\n…（另有 {} 条同类警告未列出——修最明显的即可，不要逐条清零）",
+                "\n…（另有 {} 条未列出——修最明显的即可，不要逐条清零）",
                 report.warnings.len() - SHOW_MAX
             ));
         }
     }
-    out.push_str("\n说明：结构错误必须修；布局警告修最明显的 1-2 处即可，残余轻微交叉/重叠可接受并在总结里说明——不要逐条清零（收益极低且烧轮次）。若警告过多，说明布局整体拥挤即可。");
+    out.push_str("\n说明：布局警告修最明显的 1-2 处即可，残余轻微交叉/重叠可接受并在总结里说明——不要逐条清零（收益极低且烧轮次）。若警告过多，说明布局整体拥挤，优先考虑整体重排而非局部小修。");
     out
 }
 
@@ -701,10 +699,10 @@ mod tests {
 
     #[test]
     fn skips_ancestor_overlap() {
-        let xml = doc(&format!(
+        let xml = doc(
             "<mxCell id=\"g\" value=\"\" vertex=\"1\" parent=\"1\"><mxGeometry x=\"0\" y=\"0\" width=\"200\" height=\"200\" as=\"geometry\"/></mxCell>\
-             <mxCell id=\"child\" value=\"c\" vertex=\"1\" parent=\"g\"><mxGeometry x=\"10\" y=\"10\" width=\"50\" height=\"50\" as=\"geometry\"/></mxCell>"
-        ));
+             <mxCell id=\"child\" value=\"c\" vertex=\"1\" parent=\"g\"><mxGeometry x=\"10\" y=\"10\" width=\"50\" height=\"50\" as=\"geometry\"/></mxCell>",
+        );
         let r = analyze(&xml).unwrap();
         assert_eq!(r.stats.overlaps, 0);
     }

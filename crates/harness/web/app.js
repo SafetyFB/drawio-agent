@@ -1375,6 +1375,7 @@ const cfgHint = $('cfg-demo-hint');
 const testResult = $('test-result');
 const cfgCtxLen = $('cfg-context-length');
 const cfgThinking = $('cfg-thinking');
+const cfgTemperature = $('cfg-temperature');
 const cfgPriceIn = $('cfg-price-in');
 const cfgPriceOut = $('cfg-price-out');
 const cfgBudget = $('cfg-budget');
@@ -1423,6 +1424,7 @@ function renderCurrentCfg(cfg) {
   cfgApiKey.placeholder = llm.api_key_masked ? `留空 = 保持不变 (${llm.api_key_masked})` : 'sk-…';
   cfgCtxLen.value = llm.context_length != null ? llm.context_length : '';
   cfgThinking.value = llm.thinking === 'no-think' ? 'no-think' : 'default';
+  cfgTemperature.value = llm.temperature != null ? llm.temperature : '';
   cfgPriceIn.value = (llm.price_input_per_m || 0);
   cfgPriceOut.value = (llm.price_output_per_m || 0);
   cfgBudget.value = llm.budget_yuan != null ? llm.budget_yuan : '';
@@ -1470,12 +1472,14 @@ $('cfg-test-btn').onclick = async () => {
 function configPayload() {
   const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
   const opt = (v) => { const n = parseFloat(v); return Number.isFinite(n) && v !== '' && n > 0 ? n : null; };
+  const optTemp = (v) => { const n = parseFloat(v); return Number.isFinite(n) && v !== '' && n >= 0 ? n : null; };
   return {
     base_url: cfgBaseUrl.value.trim(),
     model: cfgModel.value.trim(),
     api_key: cfgApiKey.value.trim(),
     context_length: opt(cfgCtxLen.value),
     thinking: cfgThinking.value === 'no-think' ? 'no-think' : 'default',
+    temperature: optTemp(cfgTemperature.value),
     price_input_per_m: num(cfgPriceIn.value),
     price_output_per_m: num(cfgPriceOut.value),
     budget_yuan: opt(cfgBudget.value),

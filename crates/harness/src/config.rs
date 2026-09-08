@@ -58,6 +58,11 @@ pub struct LlmSettings {
     /// Optional session spend cap in ¥; the agent stops when reached.
     #[serde(default)]
     pub budget_yuan: Option<f64>,
+    /// Sampling temperature. None = harness default (0.2 — low, suited to
+    /// the structured JSON envelope protocol; 0.7 measurably raises
+    /// envelope-parse failures which cost a full correction round).
+    #[serde(default)]
+    pub temperature: Option<f64>,
     /// Max model rounds per single ask (1 round = 1 LLM call + its tool
     /// execution); exceeding it aborts with an actionable hint.
     #[serde(default = "default_max_turns")]
@@ -221,6 +226,7 @@ mod tests {
             base_url: "https://x.example/v1".into(),
             model: "m-1".into(),
             api_key: "abcdefgh-12345678".into(),
+            temperature: Some(0.4),
             ..Default::default()
         };
         save_config_file(&p, &s).unwrap();

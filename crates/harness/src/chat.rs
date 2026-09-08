@@ -103,12 +103,19 @@ impl Usage {
     }
 }
 
-/// Per-call options (thinking mode).
+/// Per-call options (thinking mode, sampling temperature).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CallOpts {
     /// `thinking: {"type": "disabled"}` — GLM 4.6+ fast path.
     pub no_think: bool,
+    /// Sampling temperature; `None` = [`DEFAULT_TEMPERATURE`] (low — the
+    /// JSON envelope protocol rewards determinism, and one parse failure
+    /// costs a full correction round of context).
+    pub temperature: Option<f64>,
 }
+
+/// Temperature used when the caller doesn't specify one.
+pub const DEFAULT_TEMPERATURE: f64 = 0.2;
 
 /// Result of one chat completion: the assistant text plus usage.
 #[derive(Debug, Clone)]
@@ -194,20 +201,7 @@ impl OpenAiChat {
 #[async_trait::async_trait]
 impl Chat for OpenAiChat {
     async fn complete(&mut self, messages: &[Message], opts: &CallOpts) -> Result<Reply, ChatError> {
-        let mut body = serde_json::Map::new();
-        body.insert("model".into(), serde_json::json!(self.model));
-        let msgs: Vec<serde_json::Value> = messages
-            .iter()
-            .map(|m| serde_json::json!({ "role": m.role, "content": m.content_json() }))
-            .collect();
-        body.insert("messages".into(), serde_json::Value::Array(msgs));
-        body.insert(
-            "temperature".into(),
-            serde_json::json!(0.7),
-        );
-        if opts.no_think {
-            body.insert("thinking".into(), serde_json::json!({"type": "disabled"}));
-        }
+        let body = request_body(&self.model, messages, opts);
 
         let mut req = self
             .client
@@ -249,6 +243,25 @@ impl Chat for OpenAiChat {
     }
 }
 
+/// Wire body for a chat-completion call (extracted for tests).
+fn request_body(model: &str, messages: &[Message], opts: &CallOpts) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert("model".into(), serde_json::json!(model));
+    let msgs: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content_json() }))
+        .collect();
+    body.insert("messages".into(), serde_json::Value::Array(msgs));
+    body.insert(
+        "temperature".into(),
+        serde_json::json!(opts.temperature.unwrap_or(DEFAULT_TEMPERATURE)),
+    );
+    if opts.no_think {
+        body.insert("thinking".into(), serde_json::json!({"type": "disabled"}));
+    }
+    serde_json::Value::Object(body)
+}
+
 fn truncate(s: &str, n: usize) -> String {
     let t: String = s.chars().take(n).collect();
     if s.chars().count() > n {
@@ -284,5 +297,20 @@ mod tests {
         let url = arr[1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/png;base64,"), "{url}");
         assert!(url.contains("ECAw"), "raw bytes present in base64: {url}");
+    }
+
+    #[test]
+    fn request_body_temperature_defaults_low_and_override_wins() {
+        let msgs = [Message::user("hi")];
+        // 未指定 → 低默认（结构化信封任务，0.7 会抬高解析失败率）。
+        let b = request_body("m", &msgs, &CallOpts::default());
+        assert_eq!(b["temperature"], json!(DEFAULT_TEMPERATURE));
+        assert!(b.get("thinking").is_none(), "默认不携带 thinking 键");
+        // 显式覆盖生效。
+        let b2 = request_body("m", &msgs, &CallOpts { no_think: false, temperature: Some(0.7) });
+        assert_eq!(b2["temperature"], json!(0.7));
+        // no_think 附带 thinking 键。
+        let b3 = request_body("m", &msgs, &CallOpts { no_think: true, temperature: None });
+        assert_eq!(b3["thinking"]["type"], json!("disabled"));
     }
 }

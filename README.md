@@ -19,7 +19,8 @@ pretty-print 的 `.drawio` 文件。局部性靠「文件 + 行区间文本编�
   作为图像消息直接发给模型（视觉闭环在一条对话里完成）。任意的
   OpenAI-compatible 端点即可接入（需支持视觉时用多模态模型）。
 - **工具五类**：
-  - 查询 `read`（`range` 读行区间 / `query` 按文本搜 cell）
+  - 查询 `read`（`range` 读行区间 / `cells` 批量读多实体 / `query` 按文本搜
+    cell / `outline` 全图概览——每实体一行「行区间 | id | 类型 | 标签」）
   - 内容 `edit`（单区间或批量 `ranges`，全或无原子落盘）、`draw`（整图重建）
   - 几何 `layout`（`align` 对齐/等距、`move` 批量平移）
   - 校验 `check`（结构 + 布局 lint 摘要：重叠/交叉/标签溢出/越界/分支平行）
@@ -29,7 +30,7 @@ pretty-print 的 `.drawio` 文件。局部性靠「文件 + 行区间文本编�
 
 ```bash
 cargo build
-cargo test -p drawio-harness          # 66 tests
+cargo test -p drawio-harness          # 81 tests
 cargo test -p drawio-agent-renderer   # 校验/渲染测试
 ```
 
@@ -94,7 +95,7 @@ cargo run -p drawio-harness -- web 4000  # 自定义端口
 > 改完跑一次 check 确认没问题。
 
 > 现有图中订单相关的三个节点重叠了——用 layout 把它们的垂直中心对齐，
-> 并修掉 lint 报的重叠。
+> 并修掉 check 的 lint 摘要报的重叠。
 
 ### 画布（最新 drawio 原生编辑器）
 

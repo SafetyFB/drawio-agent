@@ -555,11 +555,13 @@ fn llm_view() -> serde_json::Value {
             "price_input_per_m": s.price_input_per_m,
             "price_output_per_m": s.price_output_per_m,
             "budget_yuan": s.budget_yuan,
+            "temperature": s.temperature,
             "max_turns": s.max_turns.max(1),
         }),
         None => json!({ "kind": "unconfigured", "base_url": "", "model": "", "api_key_masked": "",
             "context_length": null, "thinking": "default",
             "price_input_per_m": 0.0, "price_output_per_m": 0.0, "budget_yuan": null,
+            "temperature": null,
             "max_turns": crate::config::default_max_turns() }),
     }
 }
@@ -593,9 +595,11 @@ struct ConfigPutReq {
     #[serde(default)]
     price_output_per_m: Option<f64>,
     #[serde(default)]
-    budget_yuan: Option<f64>,
+    pub budget_yuan: Option<f64>,
     #[serde(default)]
-    max_turns: Option<usize>,
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub max_turns: Option<usize>,
 }
 
 async fn api_config_put(
@@ -626,6 +630,7 @@ async fn api_config_put(
         price_input_per_m: req.price_input_per_m.unwrap_or(0.0),
         price_output_per_m: req.price_output_per_m.unwrap_or(0.0),
         budget_yuan: req.budget_yuan,
+        temperature: req.temperature,
         max_turns: req.max_turns.unwrap_or(config::default_max_turns()).max(1),
     };
     let Some(path) = config::config_file_path() else {
@@ -723,6 +728,7 @@ fn truncate_utf8(s: &str, n: usize) -> String {
 }
 
 async fn api_chat_stream(
+    State(app): State<AppState>,
     State(st): State<Arc<Mutex<WebState>>>,
     State(cancel): State<Arc<CancelSlot>>,
     Json(req): Json<ChatReq>,
@@ -769,6 +775,14 @@ async fn api_chat_stream(
     };
     let (cur, ss, mut chat, mut tools, budget_yuan) = taken;
     let SessionState { mut doc, mut stats } = ss;
+
+    // 模型 view 复用共享热 chromium（与人工导出同一进程，懒启动一次、
+    // 之后热页面渲染）——否则每个 ask 的 clone 都会自带懒启动并在
+    // ask 结束时杀掉浏览器进程。启动失败时回退 Tools 自带的懒启动路径。
+    match ensure_shared_renderer(&app).await {
+        Ok(r) => tools.renderer = Some(r),
+        Err(e) => eprintln!("共享 chromium 未就绪（view 回退懒启动）: {e}"),
+    }
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
     let st2 = st.clone();
@@ -930,7 +944,7 @@ async fn api_chat_stream(
                 Ok(o) => (o.usage.input_tokens, o.usage.output_tokens),
                 Err(_) => (0, 0),
             };
-            let mut mk_rec = |user: &str, evs: &[serde_json::Value],
+            let mk_rec = |user: &str, evs: &[serde_json::Value],
                               out: &Result<TurnOutcome, String>,
                               ui: u64, uo: u64| {
                 let (reply, error) = match out {
@@ -1288,6 +1302,24 @@ struct ExportQuery {
     focus: Option<String>,
 }
 
+/// 共享热渲染器：整个服务器进程只有一个 chromium 实例 + 热页面，
+/// 模型 view 与人工导出（/api/export/png）共用。懒启动一次；失败返回
+/// Err（调用方回退各自兜底路径）。Renderer 包装很薄，每次调用新建、
+/// 浏览器进程由槽位持有，不会随 Renderer drop 被杀。
+async fn ensure_shared_renderer(
+    app: &AppState,
+) -> Result<Arc<drawio_agent_renderer::Renderer>, String> {
+    let mut slot = app.renderer.lock().await;
+    if slot.is_none() {
+        match drawio_agent_renderer::HeadlessChromiumDriver::launch().await {
+            Ok(d) => *slot = Some(Arc::new(d)),
+            Err(e) => return Err(format!("chromium 启动失败: {e}")),
+        }
+    }
+    let driver = slot.clone().expect("driver just ensured");
+    Ok(Arc::new(drawio_agent_renderer::Renderer::new(driver)))
+}
+
 async fn api_export_png(
     State(app): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<ExportQuery>,
@@ -1307,22 +1339,12 @@ async fn api_export_png(
         Err(_) => return (StatusCode::NOT_FOUND, "no session file").into_response(),
     };
     // 复用共享 driver（懒启动一次，之后热页面渲染）
-    let mut slot = app.renderer.lock().await;
-    if slot.is_none() {
-        match drawio_agent_renderer::HeadlessChromiumDriver::launch().await {
-            Ok(d) => *slot = Some(std::sync::Arc::new(d)),
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("chromium 启动失败: {e}"),
-                )
-                    .into_response()
-            }
+    let renderer = match ensure_shared_renderer(&app).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
         }
-    }
-    let driver = slot.clone().expect("driver just ensured");
-    drop(slot);
-    let renderer = drawio_agent_renderer::Renderer::new(driver);
+    };
     let opts = drawio_agent_renderer::RenderOptions {
         scale: 2.0,
         annotate: q.annotate.unwrap_or(false),

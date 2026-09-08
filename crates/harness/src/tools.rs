@@ -44,6 +44,11 @@ impl ToolOutput {
 pub struct Tools {
     pub render: bool,
     pub renderer: Option<Arc<drawio_agent_renderer::Renderer>>,
+    /// 上次成功 view 的 (文件内容 + 参数) hash：同一 Tools 生命周期内
+    /// 文件未变且参数相同 → 不重渲染、不重发图（截图占上下文，模型
+    /// 反复刷同一状态是常见浪费）。人工 `open` 路径不缓存（用户显式
+    /// 要求渲染并落盘打开）。
+    last_view: Option<u64>,
 }
 
 impl std::fmt::Debug for Tools {
@@ -71,26 +76,34 @@ fn numbered(text: &str, start: usize) -> String {
     out
 }
 
+/// 单次 read（所有模式合计）回给模型的正文行数上限：控制上下文膨胀，
+/// 超出截断并给出续读路径。
+const MAX_READ_LINES: usize = 150;
+
 impl Tools {
     pub fn new(render: bool) -> Self {
-        Self { render, renderer: None }
+        Self { render, renderer: None, last_view: None }
     }
 
     /// Test seam: inject a canned renderer (e.g. built on
     /// `drawio_agent_renderer::MockDriver`) so `view` works without chromium.
     pub fn with_renderer(renderer: drawio_agent_renderer::Renderer) -> Self {
-        Self { render: true, renderer: Some(Arc::new(renderer)) }
+        Self { render: true, renderer: Some(Arc::new(renderer)), last_view: None }
     }
 
     /// Tool docs embedded in the system prompt.
     pub fn tool_specs() -> &'static str {
         r#"1. read   {"range": "120-156" | "cell:svc-a" | "120"}
+          或 {"cells": ["svc-a", "e3", "40-80"]}（批量：一次读多个 cell/区间）
           或 {"query": "order"}（按文本搜 cell，返回命中 cell 与 @行区间，
            最多 12 条——把用户说的概念映射到文件位置）
-   返回文件中指定区间的原文（带行号）。改之前先读；范围尽量小
-   （超长区间会被截断）。行号会随编辑漂移，优先用 cell:id。
+          或 {"outline": true}（全图概览：每实体一行「行区间 | id | 类型 |
+           标签」，大图先概览再精读；实体多时加 "offset" 分页续读）
+   返回文件中指定区间的原文（带行号——这些行号就是 edit 的行号）。
+   改之前先读；范围尽量小（单次超 150 行会截断并给出续读 range）。
+   行号会随编辑漂移，优先用 cell:id。
 
-3. edit   {"range": "120-156" | "cell:svc-a", "text": "<完整 XML 片段>"}
+2. edit   {"range": "120-156" | "cell:svc-a", "text": "<完整 XML 片段>"}
           或批量 {"ranges": [{"range": "...", "text": "..."}, ...]}
    把 range 覆盖的行整体替换为 text。text 必须是**完整自洽的 XML**：
    开闭标签齐全、属性完整（如 mxGeometry 要带 as="geometry"、
@@ -102,39 +115,35 @@ impl Tools {
    规则：需要改动 2 个及以上 cell 时**必须**用批量一次提交，禁止逐个
    cell 单独 edit（那会浪费大量轮次——已有实测反馈）。
 
-4. draw   {"xml": "<mxfile>…</mxfile>"}
+3. draw   {"xml": "<mxfile>…</mxfile>"}
    整图重建（新画一张图或大改布局时用）。xml 必须是完整 mxfile。
 
-5. check  {}
-   确定性结构校验：XML 合法、id 唯一、parent/source/target 引用完整。
-   edit/draw 之后建议调用。布局质量（重叠/交叉/对齐/箭头）不看这里——
-   用 view 看图自己判断（你有语义理解：容器背景叠放、有向边箭头等
-   由你按图意把握）。
+4. check  {}
+   确定性校验：结构（XML 合法、id 唯一、parent/source/target 引用完整）
+   + 布局 lint 摘要（重叠/连线交叉/标签溢出/越界/分支未平行）。
+   edit/draw 之后建议调用。结构错误（引用断裂等）必须修；布局警告
+   修最明显的 1-2 处即可，**不要逐条清零**（烧轮次收益极低）——
+   视觉与语义层面的把关用 view 看图自己判断。
 
-6. lint   {}
-   确定性布局质量检查：重叠、连线交叉/穿框、标签溢出、越界、断引用。
-   返回分级清单（error/warning + cell id）。edit/draw 之后建议调用，
-   比纯眼睛可靠；warning 阈值化，不必强行全清（0 交叉但布局怪
-   反而更差）。
+5. layout {"move": {"ids": [...], "dx": n, "dy": n}}
+          或 {"move": [{"id": "a", "dx": 10, "dy": 0}, {"id": "b", "dx": -20, "dy": 5}]}
+          或 {"align": {"ids": [...], "axis": "x"|"y", "mode": "left"|"right"|"center"|"top"|"bottom"|"middle"|"gap"}}
+   几何级工具：批量平移/对齐/等距分布多个 cell——涉及位置调整优先用它，
+   支持一次移动多个 cell、每个 cell 不同偏移量。只动 mxGeometry，
+   不碰文本/样式/连线（那些用 edit）。整批一次落盘，失败整体回滚。
 
-7. view   {} 或 {"annotate": true} 或 {"focus": ["svc-a", "db"]}
+6. view   {} 或 {"annotate": true} 或 {"focus": ["svc-a", "db"]}
    渲染当前文件为截图并作为图像消息发给你——你会真正看到这张图。
    - annotate=true：图上叠加红色小徽章标注 cell id（密集处自动避让），
      用于把视觉元素与 cell id 对应起来
    - focus=[id...]：只渲染这些 cell 的局部放大图（密集区域看细节用）
    检查：节点重叠、文字溢出框体、连线错位/穿框、箭头方向、布局失衡。
-   看完再决定改哪里；不要连续重复调用（上一张图已经在你的上下文里）。
+   看完再决定改哪里；不要连续重复调用（上一张图已经在你的上下文里，
+   文件未变时重复 view 不会产生新图）。
    画布坐标与 xml 行区间没有 1:1 对应：定位用 read query，几何值用 read。
 
-8. layout {"move": {"ids": [...], "dx": n, "dy": n}}
-         或 {"move": [{"id": "a", "dx": 10, "dy": 0}, {"id": "b", "dx": -20, "dy": 5}]}
-         或 {"align": {"ids": [...], "axis": "x"|"y", "mode": "left"|"right"|"center"|"top"|"bottom"|"middle"|"gap"}}
-   几何级工具：批量平移/对齐/等距分布多个 cell——涉及位置调整优先用它，
-   支持一次移动多个 cell、每个 cell 不同偏移量。只动 mxGeometry，
-   不碰文本/样式/连线（那些用 edit）。整批一次落盘，失败整体回滚。
-
-7. 结束  {"reply": "<给用户的总结>", "done": true}
-   任务完成时使用；reply 会直接展示给用户。"#
+任务完成用输出协议的结束信封 {"reply": "<给用户的总结>", "done": true}
+（reply 会直接展示给用户）。"#
     }
 
     /// Run one tool. `name` comes straight from the model envelope; args are
@@ -162,16 +171,24 @@ impl Tools {
         if let Some(q) = args.get("query").and_then(Value::as_str) {
             return self.locate(doc, q);
         }
+        // 概览模式：read {"outline": true} 全图每实体一行（大图先概览再精读）
+        if args.get("outline").and_then(Value::as_bool) == Some(true) {
+            let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+            return self.outline(doc, offset);
+        }
+        // 批量模式：read {"cells": ["svc-a", "e3", "40-80"]} 一次读多个
+        if let Some(cells) = args.get("cells").and_then(Value::as_array) {
+            return self.read_cells(doc, cells);
+        }
         let spec = args
             .get("range")
             .and_then(Value::as_str)
-            .ok_or_else(|| "read 需要参数 range 或 query".to_string())?;
+            .ok_or_else(|| "read 需要参数 range / cells / outline / query".to_string())?;
         let total_lines = total_lines(doc.canonical());
         let (a, b) = resolve_arg(doc, spec).or_else(|e| {
             // read 允许范围超出文件末尾：截到最后一行为止（edit 仍严格拒绝）
             crate::xmlfile::parse_range_loose(spec, total_lines).map_err(|_| e)
         })?;
-        const MAX_READ_LINES: usize = 150;
         let lines = lines_in(doc.canonical(), a, b);
         let total = lines.lines().count();
         let body: String = lines
@@ -180,8 +197,10 @@ impl Tools {
             .collect::<Vec<_>>()
             .join("\n");
         let note = if total > MAX_READ_LINES {
+            let shown_end = a + MAX_READ_LINES - 1;
+            let next_start = a + MAX_READ_LINES;
             format!(
-                "\n…（区间共 {total} 行，已截断至前 {MAX_READ_LINES} 行；请缩小 range 分批读）"
+                "\n…（区间共 {total} 行，已截断：显示 {a}-{shown_end}；续读用 range \"{next_start}-{b}\"）"
             )
         } else {
             String::new()
@@ -193,6 +212,150 @@ impl Tools {
             numbered(&body, a),
             note
         )))
+    }
+
+    /// 批量读：一次拿多个 cell/区间，每项都是 range 解析语法（裸 id、
+    /// `cell:id`、`a-b`、`file:a-b` 均可）。读操作无副作用，单项失败不拖累
+    /// 其他项——错误行内报告，成功的照常返回（与 edit 的全或无相反，刻意如此）。
+    fn read_cells(&self, doc: &XmlDoc, cells: &[Value]) -> Result<ToolOutput, String> {
+        if cells.is_empty() {
+            return Err("cells 不能为空".to_string());
+        }
+        let mut out = String::new();
+        let mut budget = MAX_READ_LINES;
+        let mut errors: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        for item in cells {
+            let Some(spec) = item.as_str() else {
+                errors.push(format!("{}: 数组项需是字符串 range 语法", item));
+                continue;
+            };
+            match resolve_arg(doc, spec) {
+                Ok((a, b)) => {
+                    if budget == 0 {
+                        skipped.push(spec.to_string());
+                        continue;
+                    }
+                    let slice = lines_in(doc.canonical(), a, b);
+                    let taken: Vec<&str> = slice.lines().take(budget).collect();
+                    budget -= taken.len();
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(&format!(
+                        "@{}:{} 内容如下:\n{}",
+                        file_stem(doc),
+                        range_str(a, b),
+                        numbered(&taken.join("\n"), a)
+                    ));
+                }
+                Err(e) => errors.push(format!("{spec}: {e}")),
+            }
+        }
+        if !skipped.is_empty() {
+            out.push_str(&format!(
+                "\n…已达单次 {MAX_READ_LINES} 行上限，未读取: {}（请分次读取）",
+                skipped.join(", ")
+            ));
+        }
+        if !errors.is_empty() {
+            out.push_str(&format!("\n未解析: {}", errors.join("；")));
+        }
+        Ok(ToolOutput::text(out))
+    }
+
+    /// 全图概览：每个实体一行「行区间 | id | 类型 | 标签」，先看概览再精读。
+    /// 跳过结构锚点 0/1；非叶子元素标注（容器），其 span 覆盖全部子元素。
+    /// 每次最多 {MAX_READ_LINES} 行，`offset` 按实体个数分页。
+    fn outline(&self, doc: &XmlDoc, offset: usize) -> Result<ToolOutput, String> {
+        let text = doc.canonical();
+        let is_leaf = |c: &crate::xmlfile::CellSpan| {
+            !doc.cells.iter().any(|o| {
+                o.id != c.id && o.start_line > c.start_line && o.start_line <= c.end_line
+            })
+        };
+        let mut rows: Vec<String> = Vec::new();
+        let mut n_vertex = 0usize;
+        let mut n_edge = 0usize;
+        for c in &doc.cells {
+            if c.id == "0" || c.id == "1" {
+                continue;
+            }
+        let slice = lines_in(text, c.start_line, c.end_line);
+        // 属性只看首行（本元素的开始标签）——容器若扫整段 slice
+        // 会混入子元素的 vertex/edge 属性。
+        let open_line = slice.lines().next().unwrap_or_default();
+        let edge = open_line.contains("edge=\"1\"");
+        let vertex = open_line.contains("vertex=\"1\"");
+            let value = attr_value(&slice, "value").unwrap_or_default();
+            let kind: &str = if edge {
+                "edge"
+            } else if vertex {
+                "vertex"
+            } else {
+                &c.tag
+            };
+            let detail = if edge {
+                let s = attr_value(&slice, "source").unwrap_or_else(|| "?".into());
+                let t = attr_value(&slice, "target").unwrap_or_else(|| "?".into());
+                let lbl = if value.is_empty() {
+                    String::new()
+                } else {
+                    format!(" “{}”", truncate(&value, 20))
+                };
+                format!("{s}→{t}{lbl}")
+            } else if vertex {
+                if value.is_empty() {
+                    let style = attr_value(&slice, "style").unwrap_or_default();
+                    if style.is_empty() {
+                        "—".to_string()
+                    } else {
+                        format!("style≈{}", truncate(&style, 30))
+                    }
+                } else {
+                    truncate(&value, 40)
+                }
+            } else if value.is_empty() {
+                attr_value(&slice, "name").unwrap_or_else(|| "—".into())
+            } else {
+                truncate(&value, 40)
+            };
+            let container = if is_leaf(c) { "" } else { " （容器）" };
+            rows.push(format!(
+                "{:>5}-{:<5} {:<14} {:<7} {}{}",
+                c.start_line,
+                c.end_line,
+                truncate(&c.id, 14),
+                kind,
+                detail,
+                container
+            ));
+            if edge {
+                n_edge += 1;
+            } else if vertex {
+                n_vertex += 1;
+            }
+        }
+        let total = rows.len();
+        let mut out = format!(
+            "全图概览：{} vertex · {} edge · 共 {total} 个实体（行区间 | id | 类型 | 标签；\
+             容器的行区间覆盖其全部子元素）\n",
+            n_vertex, n_edge
+        );
+        let shown: Vec<&String> = rows.iter().skip(offset).take(MAX_READ_LINES).collect();
+        if shown.is_empty() {
+            out.push_str(&format!("（offset {offset} 超出范围，共 {total} 个实体）"));
+            return Ok(ToolOutput::text(out));
+        }
+        out.push_str(&shown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n"));
+        let end = offset + shown.len();
+        if end < total {
+            out.push_str(&format!(
+                "\n…（还有 {} 个未显示；续读加 \"offset\": {end}）",
+                total - end
+            ));
+        }
+        Ok(ToolOutput::text(out))
     }
 
     /// 几何级工具：align（对齐/等距）与 move（平移）。只动 mxGeometry，
@@ -479,10 +642,18 @@ impl Tools {
     }
 
     fn check(&self, doc: &XmlDoc) -> Result<ToolOutput, String> {
-        match check_doc(doc.canonical()) {
-            Ok(r) => Ok(ToolOutput::text(r.summarize())),
-            Err(e) => Err(format!("校验失败: {e}")),
+        let mut text = match check_doc(doc.canonical()) {
+            Ok(r) => r.summarize(),
+            Err(e) => return Err(format!("校验失败: {e}")),
+        };
+        // 布局 lint 摘要：确定性几何分析（重叠/交叉/溢出/越界/分支平行），
+        // 只附加 warning 段——error 类的断引用上面结构校验已报过。
+        // analyze 失败时静默跳过（结构校验已覆盖可解析性）。
+        if let Ok(rep) = crate::metrics::analyze(doc.canonical()) {
+            text.push('\n');
+            text.push_str(&crate::metrics::lint_summary_text(&rep));
         }
+        Ok(ToolOutput::text(text))
     }
 
     /// Render current doc to PNG. `open=true` also opens it in the system
@@ -493,6 +664,33 @@ impl Tools {
         if !self.render {
             return Ok(ToolOutput::text(
                 "渲染未启用（无 chromium）。请用 /view 在本地渲染查看。",
+            ));
+        }
+        // 可选增强：annotate=id 徽章标注；focus=[cell ids] 局部裁剪放大
+        let mut opts = drawio_agent_renderer::RenderOptions {
+            trace_dir: std::env::var("DRAWIO_RENDER_TRACE_DIR").ok(),
+            annotate: args.get("annotate").and_then(Value::as_bool) == Some(true),
+            ..Default::default()
+        };
+        if let Some(f) = args.get("focus").and_then(Value::as_array) {
+            opts.focus = f
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+        }
+        // 同内容缓存（仅模型路径；人工 open 显式要求渲染）：文件与参数都
+        // 未变时直接回文本，不重渲染、不重发图——上一张截图还在模型
+        // 上下文里，重发只是重复 token。判定在 chromium 懒启动之前。
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        doc.canonical().hash(&mut hasher);
+        opts.annotate.hash(&mut hasher);
+        opts.focus.hash(&mut hasher);
+        let view_hash = hasher.finish();
+        if !open && self.last_view == Some(view_hash) {
+            return Ok(ToolOutput::text(
+                "文件自上次 view 以来未变化：截图与上下文里的上一张相同，无需重复查看。\
+                 要看局部细节可加 focus 参数；改动后再 view 会得到新图。",
             ));
         }
         let renderer = match &self.renderer {
@@ -512,20 +710,11 @@ impl Tools {
                 r
             }
         };
-        // 可选增强：annotate=id 徽章标注；focus=[cell ids] 局部裁剪放大
-        let mut opts = drawio_agent_renderer::RenderOptions {
-            trace_dir: std::env::var("DRAWIO_RENDER_TRACE_DIR").ok(),
-            annotate: args.get("annotate").and_then(Value::as_bool) == Some(true),
-            ..Default::default()
-        };
-        if let Some(f) = args.get("focus").and_then(Value::as_array) {
-            opts.focus = f
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
-        }
         match renderer.render(doc.canonical(), &opts).await {
             Ok(png) => {
+                if !open {
+                    self.last_view = Some(view_hash);
+                }
                 let mut text = format!("渲染成功 ({} bytes, cells={})", png.len(), doc.cells.len());
                 if open {
                     let stem = file_stem(doc).replace(".xml", "").replace(".drawio", "");
@@ -639,6 +828,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn view_skips_render_when_doc_unchanged() {
+        let mock = drawio_agent_renderer::MockDriver::new();
+        let renderer =
+            drawio_agent_renderer::Renderer::new(std::sync::Arc::new(mock.clone()));
+        let mut tools = Tools::with_renderer(renderer);
+        let d = doc();
+        // 第一次 view：正常渲染。
+        let out1 = tools.view(&d, &serde_json::json!({})).await.unwrap();
+        assert!(out1.image_png.is_some(), "首次 view 应带图");
+        assert_eq!(mock.calls().len(), 1);
+        // 同内容重复 view：只回文本，不重渲染、不重发图。
+        let out2 = tools.view(&d, &serde_json::json!({})).await.unwrap();
+        assert!(out2.image_png.is_none(), "未变化时不应重发图");
+        assert!(out2.text.contains("未变化"), "{}", out2.text);
+        assert_eq!(mock.calls().len(), 1, "不应重复渲染");
+        // 参数不同（annotate）→ 重新渲染。
+        let out3 = tools.view(&d, &serde_json::json!({ "annotate": true })).await.unwrap();
+        assert!(out3.image_png.is_some());
+        assert_eq!(mock.calls().len(), 2);
+        // 文件内容变化 → 重新渲染。
+        let d2 = two_cell_doc();
+        let out4 = tools.view(&d2, &serde_json::json!({})).await.unwrap();
+        assert!(out4.image_png.is_some());
+        assert_eq!(mock.calls().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn check_reports_structural_and_layout_lint() {
+        // 重叠的两个节点：check 应同时含结构摘要与布局 lint 警告段。
+        let xml = r#"<mxfile host="app.diagrams.net"><diagram id="d1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" vertex="1" parent="1"><mxGeometry x="40" y="60" width="160" height="60" as="geometry"/></mxCell><mxCell id="b" value="B" vertex="1" parent="1"><mxGeometry x="100" y="70" width="160" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+        let mut d = XmlDoc::from_text(xml).unwrap();
+        let mut t = Tools::new(false);
+        let out = t.run(&mut d, "check", &serde_json::json!({})).await.unwrap();
+        assert!(out.text.contains("issues=0"), "结构应无问题: {}", out.text);
+        assert!(out.text.contains("布局 lint"), "{}", out.text);
+        assert!(
+            out.text.contains("[warning:overlap] a, b"),
+            "应列出重叠警告对: {}",
+            out.text
+        );
+        // 干净布局：lint 段无警告条目。
+        let mut clean = two_cell_doc();
+        let out2 = t.run(&mut clean, "check", &serde_json::json!({})).await.unwrap();
+        assert!(out2.text.contains("未触发重叠/交叉/溢出/越界"), "{}", out2.text);
+        assert!(!out2.text.contains("[warning:"), "{}", out2.text);
+        // 断引用仍由结构校验报告（error 不在 lint 段重复）。
+        let broken = r#"<mxfile><diagram id="d1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="e1" edge="1" parent="1" source="ghost" target="a"><mxGeometry relative="1" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+        let mut bd = XmlDoc::from_text(broken).unwrap();
+        let out3 = t.run(&mut bd, "check", &serde_json::json!({})).await.unwrap();
+        assert!(out3.text.contains("missing source cell `ghost`"), "{}", out3.text);
+    }
+
+    #[tokio::test]
     async fn batch_edit_applies_all_cells_atomically() {
         let mut d = two_cell_doc();
         let mut t = Tools::new(false);
@@ -748,7 +990,7 @@ mod tests {
         let mut d = two_cell_doc();
         let mut t = Tools::new(false);
         // 竖向等距：两个 cell 上下排
-        let out = t.run(&mut d, "layout", &serde_json::json!({
+        t.run(&mut d, "layout", &serde_json::json!({
             "align": {"ids": ["svc-a", "svc-b"], "axis": "y", "mode": "gap"}
         })).await.unwrap();
         // 应让两者间隔相等（这里两 cell 同尺寸 → 上下紧贴排列）
@@ -802,21 +1044,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_truncates_oversized_ranges() {
-        // 200+ cells: read 1-300 must truncate at 150 lines with a note.
-        let mut xml = String::from("<mxfile><diagram id=\"d\"><mxGraphModel><root><mxCell id=\"0\"/>");
-        for i in 1..=210 {
-            xml.push_str(&format!(r#"<mxCell id="n{i}" value="x" vertex="1" parent="1"><mxGeometry x="0" y="0" width="10" height="10" as="geometry"/></mxCell>"#));
-        }
-        xml.push_str("</root></mxGraphModel></diagram></mxfile>");
-        let mut d = XmlDoc::from_text(&xml).unwrap();
-        let mut t = Tools::new(false);
-        let out = t.run(&mut d, "read", &serde_json::json!({"range": "1-999"})).await.unwrap();
-        assert!(out.text.contains("已截断"), "{}", &out.text[out.text.len().saturating_sub(120)..]);
-        assert!(out.text.lines().count() <= 160, "{}", out.text.lines().count());
-    }
-
-    #[tokio::test]
     async fn locate_caps_hits_at_twelve() {
         let mut xml = String::from("<mxfile><diagram id=\"d\"><mxGraphModel><root><mxCell id=\"0\"/>");
         for i in 1..=30 {
@@ -827,6 +1054,94 @@ mod tests {
         let mut t = Tools::new(false);
         let out = t.run(&mut d, "read", &serde_json::json!({"query": "common word"})).await.unwrap();
         assert!(out.text.contains("命中 30 个 cell，显示前 12 条"), "{}", &out.text[..120]);
+    }
+
+    #[tokio::test]
+    async fn read_batch_cells_returns_each_span() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        let out = t
+            .run(&mut d, "read", &serde_json::json!({
+                "cells": ["svc-a", "cell:svc-b"]
+            }))
+            .await
+            .unwrap();
+        // 两个 cell 的区间各自带 @ 头与行号正文（文件名无关断言）
+        let a = d.id_to_cell("svc-a").unwrap();
+        let b = d.id_to_cell("svc-b").unwrap();
+        assert!(out.text.contains(&format!(":{} 内容如下:", range_str(a.start_line, a.end_line))), "{}", out.text);
+        assert!(out.text.contains(&format!(":{} 内容如下:", range_str(b.start_line, b.end_line))), "{}", out.text);
+        assert!(out.text.contains("value=\"A\"") && out.text.contains("value=\"B\""), "{}", out.text);
+        // 行号是绝对行号（与 edit 共享语义）
+        assert!(out.text.contains(&format!("{:>5}|", a.start_line)), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn read_batch_cells_reports_unresolved_inline() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        let out = t
+            .run(&mut d, "read", &serde_json::json!({
+                "cells": ["svc-a", "ghost", "42"]
+            }))
+            .await
+            .unwrap();
+        // 读操作无副作用：成功项照常返回，失败项行内报告
+        assert!(out.text.contains("svc-a"), "{}", out.text);
+        assert!(out.text.contains("未解析"), "{}", out.text);
+        assert!(out.text.contains("ghost") && out.text.contains("42"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn read_batch_cells_rejects_empty() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        let out = t.run(&mut d, "read", &serde_json::json!({ "cells": [] })).await;
+        assert!(out.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_outline_lists_entities_one_per_line() {
+        let mut d = doc(); // svc-a vertex
+        let mut t = Tools::new(false);
+        // 补一条边，验证 edge 行的 src→tgt 形态
+        let e = r#"<mxCell id="e1" value="是" edge="1" parent="1" source="svc-a" target="svc-a"><mxGeometry relative="1" as="geometry"/></mxCell>"#;
+        let total = crate::xmlfile::total_lines(d.canonical());
+        d.apply_edit(total, total, e).unwrap();
+        let out = t.run(&mut d, "read", &serde_json::json!({"outline": true})).await.unwrap();
+        assert!(out.text.contains("1 vertex"), "{}", out.text);
+        assert!(out.text.contains("1 edge"), "{}", out.text);
+        // vertex 行有 id 与标签；edge 行有 src→tgt
+        assert!(out.text.contains("svc-a"), "{}", out.text);
+        assert!(out.text.contains("Order Service"), "{}", out.text);
+        assert!(out.text.contains("svc-a→svc-a"), "{}", out.text);
+        // diagram 是容器且被标注；锚点 0/1 不出现（首个实体行是 d1）
+        assert!(out.text.contains("（容器）"), "{}", out.text);
+        let first_row = out.text.lines().nth(1).unwrap();
+        assert!(
+            first_row.trim_start().starts_with("2-"),
+            "首个实体行应是 d1 容器（跳过锚点 0/1）: {first_row}"
+        );
+        // offset 分页：跳过第一个实体后数量减少
+        let out2 = t.run(&mut d, "read", &serde_json::json!({"outline": true, "offset": 1})).await.unwrap();
+        let first_rows = out.text.lines().count();
+        let second_rows = out2.text.lines().count();
+        assert_eq!(first_rows - second_rows, 1, "offset=1 应少显示一行");
+    }
+
+    #[tokio::test]
+    async fn read_truncation_hint_names_next_range() {
+        let mut xml = String::from("<mxfile><diagram id=\"d\"><mxGraphModel><root><mxCell id=\"0\"/>");
+        for i in 1..=210 {
+            xml.push_str(&format!(r#"<mxCell id="n{i}" value="x" vertex="1" parent="1"><mxGeometry x="0" y="0" width="10" height="10" as="geometry"/></mxCell>"#));
+        }
+        xml.push_str("</root></mxGraphModel></diagram></mxfile>");
+        let mut d = XmlDoc::from_text(&xml).unwrap();
+        let mut t = Tools::new(false);
+        let out = t.run(&mut d, "read", &serde_json::json!({"range": "1-999"})).await.unwrap();
+        assert!(out.text.contains("已截断"), "{}", &out.text[out.text.len().saturating_sub(120)..]);
+        assert!(out.text.contains("续读用 range \"151-"), "应给出续读路径: {}", &out.text[out.text.len().saturating_sub(160)..]);
+        assert!(out.text.lines().count() <= 160, "{}", out.text.lines().count());
     }
 
     #[tokio::test]

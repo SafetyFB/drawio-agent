@@ -74,11 +74,41 @@ impl SessionStats {
 /// Memory cap when no context_length is configured (tokens, estimate).
 const DEFAULT_MEMORY_TOKENS: usize = 24_000;
 
+/// Is this user-role message one the harness itself synthesized (tool
+/// result / protocol correction) rather than a real user ask? Memory trimming
+/// uses this: the transcript must never start mid-ask (a dangling tool
+/// result or correction with its envelope already dropped).
+fn is_synthetic_user(m: &Message) -> bool {
+    match m.parts.first() {
+        Some(Part::Text(t)) => {
+            t.starts_with("[工具结果 ")
+                || t.starts_with("你的上一条输出不是合法信封")
+                || t.starts_with("信封缺少 tool 或 reply 字段")
+                // unknown-tool correction: "`{name}` 不是可用工具…"
+                || t.starts_with('`')
+        }
+        _ => true, // image-only user message = view result = synthetic
+    }
+}
+
 /// Trim `stats.transcript` to fit the memory cap: drop oldest messages
-/// until the estimate fits.
+/// until the estimate fits — but only in whole-ask groups, so the surviving
+/// transcript always starts at a real user ask (no orphaned tool results).
 fn trim_memory(stats: &mut SessionStats, cap_tokens: u64) {
     while estimate_tokens(&stats.transcript) > cap_tokens && stats.transcript.len() > 2 {
         stats.transcript.remove(0);
+        // Advance to the next ask boundary: keep dropping while the head
+        // is not a real user ask (and we still have >2 messages to spare).
+        while stats.transcript.len() > 2 {
+            let head_is_ask = stats
+                .transcript
+                .first()
+                .is_some_and(|m| m.role == "user" && !is_synthetic_user(m));
+            if head_is_ask {
+                break;
+            }
+            stats.transcript.remove(0);
+        }
     }
 }
 
@@ -102,6 +132,8 @@ pub struct RunOpts {
     /// 旧版 mxGraph 画布回退模式（drawio webapp 不可用）：提示词附带
     /// 2018 viewer 的形状拼写约束。
     pub legacy_viewer: bool,
+    /// Sampling temperature (`None` = chat default 0.2).
+    pub temperature: Option<f64>,
 }
 
 impl Default for RunOpts {
@@ -114,6 +146,7 @@ impl Default for RunOpts {
             budget_remaining: f64::INFINITY,
             max_turns: crate::config::default_max_turns(),
             legacy_viewer: false,
+            temperature: None,
         }
     }
 }
@@ -128,6 +161,7 @@ impl RunOpts {
             budget_remaining: f64::INFINITY,
             max_turns: s.max_turns.max(1),
             legacy_viewer: false,
+            temperature: s.temperature,
         }
     }
 }
@@ -177,8 +211,8 @@ JSON 必须合法：字符串里的换行写成 \n、双引号写成 \"。
 工具名只能从下方清单里选，不要发明新工具。
 
 ## 核心规则
-1. 文件是唯一真相：动手前用 read/locate 确认当前内容与准确行区间，
-   不要凭记忆猜行号。行号会随编辑漂移，优先用 cell:id。
+1. 文件是唯一真相：动手前用 read（range 或 query）确认当前内容与准确
+   行区间，不要凭记忆猜行号。行号会随编辑漂移，优先用 cell:id。
    读之前先想清楚要什么：能定位到 cell 就用 cell:id 一次读够，不要
    反复零碎 read（每次 read 都进上下文，浪费 token）。
 2. 用户消息可能附有「选中区段」（带行号的 xml 片段）——改动必须局限在
@@ -196,15 +230,12 @@ JSON 必须合法：字符串里的换行写成 \n、双引号写成 \"。
    刷图（截图占上下文）。
 6. 只有纯信息类问答（用户明确要求"直接回答/不要用工具"）可以直接
    回复；任何涉及画图、修改、检查的请求都必须通过工具完成。
-7. edit/draw 之后建议 check 一次验证引用完整；布局类任务收尾前
-   **建议**再调一次 check（含 lint 布局摘要）。若报结构错误（引用断裂
-   等）必须修；布局警告（重叠/交叉）修最明显的 1-2 处即可——残余的
-   轻微交叉/边缘重叠在说明里提一句就好，**不要陷入逐条清零的循环**
-   （反复小修浪费大量轮次，收益极低）。
-4. **动作最大化**：每轮只做一个动作，但动作要尽可能大——需要改动多个
-   cell 时用 edit 的批量 ranges 一次提交；画新图尽量一次 draw 整图
-   （含全部节点与连线，一次性规划好坐标）；小改动不要拆成多轮逐个做。
-   整个任务的轮数取决于你的动作粒度。## Draw.io 样式知识（与 drawio 编辑器互通）
+7. edit/draw 之后建议 check 一次（结构校验 + 布局 lint 摘要）。若报
+   结构错误（引用断裂等）必须修；布局警告（重叠/交叉）修最明显的
+   1-2 处即可——残余的轻微交叉/边缘重叠在说明里提一句就好，
+   **不要陷入逐条清零的循环**（反复小修浪费大量轮次，收益极低）。
+
+## Draw.io 样式知识（与 drawio 编辑器互通）
 - 常用形状：椭圆 shape=ellipse（width=height 即正圆；aspect=fixed 保持比例）；
   菱形 shape=rhombus；三角形 shape=triangle；六边形 shape=hexagon；
   圆柱 shape=cylinder；云 shape=cloud；泳道 shape=swimlane；
@@ -327,14 +358,25 @@ pub fn parse_envelope(raw: &str) -> Result<Value, String> {
 }
 
 /// Rough token estimate for prompt-size guarding (text chars ≈ 0.5 token
-/// for CJK-heavy prompts, images billed as a flat 900 tokens).
+/// for CJK-heavy prompts; images billed by pixel area, since vision
+/// providers commonly charge ~750px²/token — well above the old flat 900
+/// for full-page screenshots, so the floor keeps the guard conservative).
 fn estimate_tokens(msgs: &[Message]) -> u64 {
     let mut t = 0u64;
     for m in msgs {
         for p in &m.parts {
             match p {
                 Part::Text(s) => t += (s.chars().count() as u64).div_ceil(2),
-                Part::ImagePng(_) => t += 900,
+                Part::ImagePng(png) => {
+                    let mut est = 900u64;
+                    // PNG IHDR: big-endian width/height at bytes 16..24.
+                    if png.len() >= 24 {
+                        let w = u32::from_be_bytes([png[16], png[17], png[18], png[19]]) as u64;
+                        let h = u32::from_be_bytes([png[20], png[21], png[22], png[23]]) as u64;
+                        est = est.max(w * h / 750);
+                    }
+                    t += est;
+                }
             }
         }
     }
@@ -422,7 +464,10 @@ impl Harness {
                 ));
             }
 
-            let call_opts = CallOpts { no_think: opts.no_think };
+            let call_opts = CallOpts {
+                no_think: opts.no_think,
+                temperature: opts.temperature,
+            };
             let mut reply = None;
             let mut last_llm_err = None;
             for attempt in 0..=self.max_llm_retries {
@@ -506,7 +551,7 @@ impl Harness {
                         last_err = Some(e.clone());
                         history.push(Message::assistant(raw.clone()));
                         history.push(Message::user(format!(
-                            "你的上一条输出不是合法信封: {e}\n请只输出一个 JSON 信封，例如 {{\"tool\": \"locate\", \"args\": {{\"query\": \"x\"}}}} 或 {{\"reply\": \"…\", \"done\": true}}；不要 markdown 代码块、不要附带其他文字。"
+                            "你的上一条输出不是合法信封: {e}\n请只输出一个 JSON 信封，例如 {{\"tool\": \"read\", \"args\": {{\"query\": \"x\"}}}} 或 {{\"reply\": \"…\", \"done\": true}}；不要 markdown 代码块、不要附带其他文字。"
                         )));
                         continue;
                     }
@@ -621,6 +666,10 @@ impl Harness {
             // older ones in the transcript become "folded" text (the model
             // already acted on them; re-view if needed).
             fold_old_images(&mut history);
+            // Same for the biggest text payloads: old `read` results are
+            // folded to a stub once newer ones arrive — line numbers drift
+            // after every edit, so stale reads must be re-read anyway.
+            fold_old_reads(&mut history);
         }
         stats.add(&usage, spent);
         remember!();
@@ -661,6 +710,43 @@ fn fold_old_images(history: &mut [Message]) {
     }
 }
 
+/// Fold older `read` tool results (the largest text payloads in long
+/// sessions — up to 150 lines each) into a one-line stub, keeping the most
+/// recent [`KEEP_READS`] results verbatim. Safe by design: line numbers
+/// drift on every edit, so the prompt already tells the model not to trust
+/// stale reads.
+fn fold_old_reads(history: &mut [Message]) {
+    const KEEP_READS: usize = 2;
+    let read_idx: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m.role == "user"
+                && matches!(
+                    m.parts.first(),
+                    Some(Part::Text(t)) if t.starts_with("[工具结果 read]")
+                )
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if read_idx.len() <= KEEP_READS {
+        return;
+    }
+    for &i in read_idx.iter().take(read_idx.len() - KEEP_READS) {
+        let lines: usize = history[i]
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                Part::Text(t) => Some(t.lines().count()),
+                _ => None,
+            })
+            .sum();
+        history[i].parts = vec![Part::Text(format!(
+            "（早前的 read 结果已折叠，约 {lines} 行；行号已随编辑漂移，如需请重新 read）"
+        ))];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,19 +762,78 @@ mod tests {
         let legacy = system_prompt(&doc, true);
         assert!(legacy.contains("2018"));
         assert!(legacy.contains("旧版回退模式"));
-        assert!(p.contains(r#"{"tool": "locate", "args"#) || p.contains(r#"{"tool": "<工具名>""#), "信封示例必须是单层花括号");
+        assert!(p.contains(r#"{"tool": "<工具名>""#), "信封示例必须是单层花括号");
         assert!(p.contains("read   {"), "工具清单必须有 read");
         assert!(!p.contains("{{"), "提示词里不应残留双层花括号: {}", &p[p.len().saturating_sub(400)..]);
     }
 
     #[test]
+    fn system_prompt_is_internally_consistent() {
+        let doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let p = system_prompt(&doc, false);
+        // 规则 4「动作最大化」只出现一次（历史上曾因编辑事故重复）。
+        assert_eq!(
+            p.matches("动作最大化").count(),
+            1,
+            "规则 4 不应重复: {p}"
+        );
+        // 无「行尾直接粘上 markdown 标题」的坏格式。
+        assert!(!p.contains("。##"), "标题必须另起一行: {p}");
+        // 提示词不得向模型宣传不存在的工具（locate 已并入 read 的
+        // query 模式；lint 已并入 check）。
+        assert!(!p.contains("read/locate"), "locate 残留");
+        assert!(!p.contains("6. lint"), "lint 工具条目残留");
+        assert!(!p.contains(r#"{"tool": "locate""#), "示例不得用 locate");
+        // 纠错消息（运行期生成）示例也必须是合法工具。
+        // 工具清单与白名单一致：specs 里的编号工具逐个在白名单内。
+        let whitelist = ["read", "edit", "draw", "check", "view", "layout"];
+        let specs = Tools::tool_specs();
+        for w in whitelist {
+            assert!(specs.contains(w), "tool_specs 缺工具 {w}");
+        }
+        assert!(!specs.contains("lint   {}"), "tool_specs 不应再含 lint");
+    }
+
+    #[tokio::test]
+    async fn correction_message_example_uses_real_tool() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        // 触发纠错：先一次合法工具，再一条坏输出 → 纠错消息进入上下文。
+        let mut fake = FakeChat::new(vec![
+            r#"{"tool":"check","args":{}}"#,
+            "这不是信封",
+            r#"{"reply":"好","done":true}"#,
+        ]);
+        let _ = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "检查图", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await;
+        let sent: Vec<String> = fake
+            .snapshots
+            .iter()
+            .flat_map(|s| s.iter().map(|m| match &m.parts[0] {
+                Part::Text(t) => t.clone(),
+                _ => String::new(),
+            }))
+            .collect();
+        let correction = sent
+            .iter()
+            .find(|t| t.contains("不是合法信封"))
+            .expect("纠错消息应进入上下文");
+        assert!(
+            correction.contains(r#"{"tool": "read""#),
+            "纠错示例必须用真实工具: {correction}"
+        );
+        assert!(!correction.contains("locate"), "纠错示例不得用 locate");
+    }
+
+    #[test]
     fn envelope_prefers_envelope_over_reasoning_json() {
         // reasoning JSON first, real envelope second
-        let raw = r#"{"reasoning":"先看一下"}{"tool":"locate","args":{"query":"a"}}"#;
+        let raw = r#"{"reasoning":"先看一下"}{"tool":"read","args":{"query":"a"}}"#;
         let v = parse_envelope(raw).unwrap();
-        assert_eq!(v["tool"], "locate");
+        assert_eq!(v["tool"], "read");
         // two envelopes back to back -> first envelope wins
-        let raw2 = r#"{"tool":"view","args":{}}{"tool":"locate","args":{"query":"a"}}"#;
+        let raw2 = r#"{"tool":"view","args":{}}{"tool":"read","args":{"query":"a"}}"#;
         let v2 = parse_envelope(raw2).unwrap();
         assert_eq!(v2["tool"], "view");
         // surrounding prose + single envelope
@@ -746,16 +891,16 @@ mod tests {
 
     #[test]
     fn envelope_parses_plain_and_fenced() {
-        let v = parse_envelope(r#"{"tool":"locate","args":{"query":"a"}}"#).unwrap();
-        assert_eq!(v["tool"], "locate");
+        let v = parse_envelope(r#"{"tool":"read","args":{"query":"a"}}"#).unwrap();
+        assert_eq!(v["tool"], "read");
         let v = parse_envelope("```json\n{\"reply\":\"好\",\"done\":true}\n```").unwrap();
         assert_eq!(v["reply"], "好");
     }
 
     #[test]
     fn envelope_parses_with_surrounding_text() {
-        let v = parse_envelope("好的，我来查：{\"tool\":\"locate\",\"args\":{\"query\":\"订单\"}} 请稍等").unwrap();
-        assert_eq!(v["tool"], "locate");
+        let v = parse_envelope("好的，我来查：{\"tool\":\"read\",\"args\":{\"query\":\"订单\"}} 请稍等").unwrap();
+        assert_eq!(v["tool"], "read");
     }
 
     #[test]
@@ -1032,6 +1177,100 @@ mod tests {
             matches!(&m.parts[0], Part::Text(t) if t.contains("第 0 轮"))
         });
         assert!(oldest_gone, "最老一轮应被裁剪");
+    }
+
+    #[test]
+    fn memory_trim_never_starts_mid_ask() {
+        // 裁剪必须落在 ask 边界：幸存的 transcript 首条应是真实用户
+        // ask，而不是孤儿工具结果/纠错消息（其信封已被裁掉）。
+        let mut stats = SessionStats::default();
+        // ask 1: 大段内容（工具结果很长，撑爆 cap）
+        stats.transcript.push(Message::user("第一问：把 a 改绿"));
+        stats.transcript.push(Message::assistant(r#"{"tool":"edit","args":{}}"#));
+        stats.transcript
+            .push(Message::user(format!("[工具结果 edit]\n{}", "行".repeat(4_000))));
+        stats.transcript.push(Message::assistant(r#"{"reply":"done","done":true}"#));
+        // ask 2（将被保留）
+        stats.transcript.push(Message::user("第二问：把 b 改蓝"));
+        stats.transcript.push(Message::assistant(r#"{"reply":"ok","done":true}"#));
+        let cap = estimate_tokens(&stats.transcript[4..]); // 恰好容得下 ask 2
+        trim_memory(&mut stats, cap);
+        assert!(
+            !stats.transcript.is_empty(),
+            "cap 至少容得下一轮，不应裁空"
+        );
+        let head = &stats.transcript[0];
+        assert_eq!(head.role, "user", "首条应为用户 ask");
+        match &head.parts[0] {
+            Part::Text(t) => {
+                assert_eq!(t, "第二问：把 b 改蓝", "首条应是第二问完整开头");
+                assert!(!t.starts_with("[工具结果"), "不得以孤儿工具结果开头");
+            }
+            _ => panic!("应为文本 part"),
+        }
+        assert!(stats.transcript.len() == 2, "恰保留一轮 ask: {}", stats.transcript.len());
+    }
+
+    #[test]
+    fn fold_old_reads_keeps_two_newest() {
+        let history: Vec<Message> = vec![
+            Message::user("看下图"),
+            Message::assistant(r#"{"tool":"read","args":{"range":"1-5"}}"#),
+            Message::user(format!("[工具结果 read]\n{}", "旧内容\n".repeat(100))),
+            Message::assistant(r#"{"tool":"check","args":{}}"#),
+            Message::user("[工具结果 check]\ncells=3"),
+            Message::assistant(r#"{"tool":"read","args":{"range":"2-6"}}"#),
+            Message::user(format!("[工具结果 read]\n{}", "较新内容\n".repeat(100))),
+            Message::assistant(r#"{"tool":"read","args":{"range":"3-7"}}"#),
+            Message::user(format!("[工具结果 read]\n{}", "最新内容\n".repeat(100))),
+        ];
+        let mut slice = history.clone();
+        fold_old_reads(&mut slice);
+        let folded = &slice[2];
+        match &folded.parts[0] {
+            Part::Text(t) => {
+                assert!(t.contains("已折叠"), "最老的 read 应被折叠: {t}");
+                assert!(!t.contains("旧内容"), "正文应被移除");
+            }
+            _ => panic!("应为文本 part"),
+        }
+        // 最近两条 read 结果保留原文。
+        assert!(slice[6].parts.iter().any(|p| matches!(p, Part::Text(t) if t.contains("较新内容"))));
+        assert!(slice[8].parts.iter().any(|p| matches!(p, Part::Text(t) if t.contains("最新内容"))));
+        // 非 read 的工具结果不动。
+        assert!(slice[4].parts.iter().any(|p| matches!(p, Part::Text(t) if t.contains("cells=3"))));
+        // 不足 3 条 read 时不折叠。
+        let mut small = history.clone();
+        small.truncate(7); // 只含 2 条 read 结果
+        fold_old_reads(&mut small);
+        assert!(small[2].parts.iter().any(|p| matches!(p, Part::Text(t) if t.contains("旧内容"))));
+    }
+
+    #[test]
+    fn estimate_tokens_uses_png_dimensions() {
+        // 大图按像素面积估（不低于 900 下限）；小 png 字节仍回退 900。
+        let png = minimal_png(1600, 1200);
+        let est = estimate_tokens(&[Message::with_parts(
+            "user",
+            vec![Part::ImagePng(png)],
+        )]);
+        assert!(est >= 1600 * 1200 / 750, "应按面积估算: {est}");
+        let small = estimate_tokens(&[Message::with_parts(
+            "user",
+            vec![Part::ImagePng(minimal_png(100, 80))],
+        )]);
+        assert_eq!(small, 900, "小图回退旧的下限估算");
+    }
+
+    /// PNG signature + IHDR 头（宽高 big-endian），足够 estimate 解析。
+    fn minimal_png(w: u32, h: u32) -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        v.extend_from_slice(&[0, 0, 0, 13]); // IHDR length
+        v.extend_from_slice(b"IHDR");
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&[8, 6, 0, 0, 0]); // bit depth etc.
+        v
     }
 
     #[tokio::test]
