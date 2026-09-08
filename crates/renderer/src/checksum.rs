@@ -1,8 +1,7 @@
-//! SHA-256 verification for the bundled chrome-headless-shell binary.
+//! SHA-256 verification for the pinned chrome-headless-shell binary.
 //!
-//! Lives in the regular src tree so it can be unit-tested; build.rs pulls
-//! it in via `#[path = "src/checksum.rs"] mod checksum;` to use
-//! `verify_checksum`.
+//! Called at runtime from `chromium_ensure::download_chromium` after the
+//! zip is extracted; the CHECKSUMS table is the source of truth.
 
 use std::env;
 
@@ -45,7 +44,7 @@ pub fn verify_checksum(platform: &str, actual: &str) -> Result<(), String> {
             // platforms).
             if env::var("DRAWIO_AGENT_ACCEPT_NEW_CHECKSUM").is_ok() {
                 eprintln!(
-                    "cargo:warning=ACCEPTING UNPINNED chrome-headless-shell {platform}: {actual}. \
+                    "ACCEPTING UNPINNED chrome-headless-shell {platform}: {actual}. \
                      Bake this hash into crates/renderer/src/checksum.rs::CHECKSUMS."
                 );
                 Ok(())
@@ -59,7 +58,7 @@ pub fn verify_checksum(platform: &str, actual: &str) -> Result<(), String> {
             }
         }
         Some(exp) if exp == actual => {
-            eprintln!("cargo:warning=chrome-headless-shell {platform} SHA-256 verified ✓");
+            eprintln!("chrome-headless-shell {platform} SHA-256 verified ✓");
             Ok(())
         }
         Some(exp) => Err(format!(

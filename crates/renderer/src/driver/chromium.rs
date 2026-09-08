@@ -28,8 +28,9 @@ use base64::Engine as _;
 
 use crate::{RenderDriver, RenderError, RenderOptions};
 
-// Build-time bundled chrome-headless-shell (path + pinned version).
-include!(concat!(env!("OUT_DIR"), "/bundled_chromium.rs"));
+/// Budget for one `__doRender` evaluate (load + annotate + export inside
+/// the hot page). Generous on purpose: large diagrams on slow machines.
+const RENDER_EVALUATE_TIMEOUT: Duration = Duration::from_secs(45);
 
 // ---------------------------------------------------------------------------
 // Binary discovery
@@ -45,11 +46,6 @@ pub fn find_chromium() -> Option<PathBuf> {
         .map_err(|e| eprintln!("chromium 解析失败: {e}"))
         .ok()
         .flatten()
-}
-
-/// Returns the build-time resolved path to chrome-headless-shell, if any.
-pub fn bundled_chromium_path() -> Option<PathBuf> {
-    BUNDLED_CHROMIUM_PATH.map(PathBuf::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +95,9 @@ type PendingMap = HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, Render
 struct ChromiumInner {
     /// Keep the child pid so `Drop` can kill the process.
     _child_pid: u32,
+    /// Throwaway user-data-dir created for this launch; removed on Drop
+    /// (otherwise every browser launch leaks a profile into /tmp).
+    profile_dir: PathBuf,
     write: mpsc::Sender<Message>,
     next_id: Mutex<u64>,
     /// Pending request id -> oneshot response sender.
@@ -115,10 +114,14 @@ struct ChromiumInner {
 
 impl Drop for ChromiumInner {
     fn drop(&mut self) {
-        // Best-effort kill; not in async context here.
+        // Best-effort kill + profile cleanup; not in async context here.
+        #[cfg(unix)]
         let _ = std::process::Command::new("kill")
             .arg(self._child_pid.to_string())
             .output();
+        // Non-unix (Windows has no `kill` binary): the child dies with the
+        // parent process in practice; proper Job Objects are out of scope.
+        let _ = std::fs::remove_dir_all(&self.profile_dir);
     }
 }
 
@@ -249,6 +252,7 @@ impl HeadlessChromiumDriver {
 
         let inner = ChromiumInner {
             _child_pid: pid,
+            profile_dir: temp_profile,
             write: out_tx,
             next_id: Mutex::new(1),
             pending,
@@ -310,6 +314,19 @@ impl HeadlessChromiumDriver {
     }
 
     async fn send(&self, method: &str, params: Option<Value>) -> Result<Value, RenderError> {
+        self.send_with_timeout(method, params, Duration::from_secs(15)).await
+    }
+
+    /// Like [`Self::send`] but with a caller-chosen timeout. The default
+    /// 15s suits CDP control commands; long-running evaluates (a full
+    /// diagram export) need their own budget — an inner timeout shorter
+    /// than the caller's outer one would silently fire first.
+    async fn send_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout_budget: Duration,
+    ) -> Result<Value, RenderError> {
         let id = {
             let mut g = self.inner.next_id.lock().await;
             let id = *g;
@@ -339,7 +356,7 @@ impl HeadlessChromiumDriver {
             .await
             .map_err(|e| RenderError::Browser(format!("ws send: {e}")))?;
 
-        let resp = timeout(Duration::from_secs(15), rx)
+        let resp = timeout(timeout_budget, rx)
             .await
             .map_err(|_| RenderError::Page(format!("{method}: timeout")))?
             .map_err(|_| RenderError::Browser("response channel dropped".into()))??;
@@ -400,7 +417,8 @@ impl RenderDriver for HeadlessChromiumDriver {
         }
 
         // 2. 热路径渲染：__doRender 返回 Promise，CDP awaitPromise 等它
-        //    在应用内完成 load + export。
+        //    在应用内完成 load + export。超时预算给足（大图导出慢于
+        //    控制命令）；超时/失败都尽力带回页面诊断。
         let bg = if opts.background.is_empty() {
             "#ffffff"
         } else {
@@ -417,46 +435,20 @@ impl RenderDriver for HeadlessChromiumDriver {
                 opts.focus.iter().map(|f| serde_json::Value::String(f.clone())).collect()
             ),
         );
-        let result = match timeout(
-            Duration::from_secs(45),
-            self.send(
+        let result = match self
+            .send_with_timeout(
                 "Runtime.evaluate",
                 Some(json!({
                     "expression": expr,
                     "awaitPromise": true,
                     "returnByValue": true,
                 })),
-            ),
-        )
-        .await
+                RENDER_EVALUATE_TIMEOUT,
+            )
+            .await
         {
-            Ok(r) => match r {
-                Ok(r) => r,
-                Err(e) => {
-                    let diag = self
-                        .send(
-                            "Runtime.evaluate",
-                            Some(json!({
-                                "expression": "JSON.stringify(window.__diag || [])",
-                                "returnByValue": true,
-                            })),
-                        )
-                        .await
-                        .ok()
-                        .and_then(|r| {
-                            r.get("result")
-                                .and_then(|v| v.get("value"))
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .unwrap_or_else(|| "(no diag)".into());
-                    return Err(RenderError::Page(format!(
-                        "drawio export failed: {e}. page diag: {diag}"
-                    )));
-                }
-            },
-            Err(_) => {
-                // 超时：尽力读回页面诊断再报错
+            Ok(r) => r,
+            Err(e) => {
                 let diag = self
                     .send(
                         "Runtime.evaluate",
@@ -475,7 +467,7 @@ impl RenderDriver for HeadlessChromiumDriver {
                     })
                     .unwrap_or_else(|| "(no diag)".into());
                 return Err(RenderError::Page(format!(
-                    "drawio export timed out. page diag: {diag}"
+                    "drawio export failed: {e}. page diag: {diag}"
                 )));
             }
         };

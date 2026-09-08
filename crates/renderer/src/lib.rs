@@ -24,8 +24,7 @@ pub use drawio_app::{
 };
 
 pub use driver::{
-    bundled_chromium_path, find_chromium, HeadlessChromiumDriver, MockDriver,
-    PINNED_CHROMIUM_VERSION,
+    find_chromium, HeadlessChromiumDriver, MockDriver, PINNED_CHROMIUM_VERSION,
 };
 
 /// Render options for a single diagram export.

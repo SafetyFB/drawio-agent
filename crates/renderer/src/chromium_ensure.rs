@@ -41,8 +41,7 @@ fn zip_url(version: &str, platform: &str) -> String {
     )
 }
 
-/// Cache path of the bundled binary (may not exist yet). Mirrors the path
-/// build.rs emits into `BUNDLED_CHROMIUM_PATH`.
+/// Cache path of the bundled binary (may not exist yet).
 pub fn bundled_bin() -> Option<PathBuf> {
     let platform = platform_slug()?;
     Some(
@@ -274,19 +273,6 @@ pub fn resolve_chromium() -> Result<Option<PathBuf>, String> {
     // 4. Download on first use.
     if std::env::var("DRAWIO_AGENT_OFFLINE").is_ok() {
         eprintln!("DRAWIO_AGENT_OFFLINE=1 → 跳过 chrome-headless-shell 下载（未缓存且无系统浏览器）");
-        return Ok(None);
-    }
-    download_chromium().map(Some)
-}
-
-/// Ensure the bundled binary exists (download if needed); returns its path
-/// or None when offline/unavailable. Used when callers explicitly want the
-/// pinned binary rather than a system browser.
-pub fn ensure_chromium() -> Result<Option<PathBuf>, String> {
-    if bundled_cached() {
-        return Ok(bundled_bin());
-    }
-    if std::env::var("DRAWIO_AGENT_OFFLINE").is_ok() {
         return Ok(None);
     }
     download_chromium().map(Some)

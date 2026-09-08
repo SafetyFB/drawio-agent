@@ -1,12 +1,9 @@
-//! Integration tests against a real Chromium binary — currently DEFERRED.
+//! Integration test against a real Chromium binary.
 //!
-//! HeadlessChromiumDriver is a stub (see src/driver/chromium.rs). These
-//! tests exist as a record of the integration we want to run once the
-//! renderer is unblocked (Docker Chromium with `--use-mock-keychain`,
-//! browserless.io, frontend pre-render, or pure-Rust drawio-rs).
-//!
-//! All tests in this file are marked `#[ignore]` so they don't run by
-//! default. Run with `cargo test -- --ignored` once a renderer is wired up.
+//! Requires an actual browser: a cached chrome-headless-shell bundle, a
+//! system Chrome/Chromium/Edge, or `DRAWIO_AGENT_CHROMIUM_PATH`. Skipped by
+//! default (`#[ignore]`) so `cargo test` works on machines without any
+//! browser available; run with `cargo test -- --ignored` where one exists.
 
 use std::sync::Arc;
 
@@ -37,8 +34,7 @@ const SAMPLE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </mxfile>"#;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "HeadlessChromiumDriver is deferred (macOS keychain issue). \
-            See src/driver/chromium.rs docstring."]
+#[ignore = "needs a real browser (cached bundle / system chrome / explicit path)"]
 async fn chromium_renders_sample_xml_to_png() {
     let _ = find_chromium();
     let driver = HeadlessChromiumDriver::launch().await
@@ -54,4 +50,47 @@ async fn chromium_renders_sample_xml_to_png() {
         &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
         "output must start with PNG signature"
     );
+}
+
+/// E2E for the hot path: cold launch, then two warm renders (plain +
+/// annotate) with timings. The warm renders exercise the event-driven
+/// wrapper flow (`load` event → annotate → export) and the same-content
+/// cache in the harness layer is NOT involved here (that lives above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real browser (cached bundle / system chrome / explicit path)"]
+async fn chromium_hot_path_render_timings() {
+    let driver = HeadlessChromiumDriver::launch().await
+        .expect("chromium driver should launch");
+    let renderer = Renderer::new(Arc::new(driver));
+
+    let t0 = std::time::Instant::now();
+    let png = renderer
+        .render(SAMPLE_XML, &RenderOptions::default())
+        .await
+        .expect("cold render should succeed");
+    let cold = t0.elapsed();
+    assert_eq!(&png[..4], b"\x89PNG");
+
+    let t1 = std::time::Instant::now();
+    let png2 = renderer
+        .render(SAMPLE_XML, &RenderOptions::default())
+        .await
+        .expect("warm render should succeed");
+    let warm = t1.elapsed();
+    assert_eq!(&png2[..4], b"\x89PNG");
+
+    let t2 = std::time::Instant::now();
+    let opts = RenderOptions { annotate: true, ..Default::default() };
+    let png3 = renderer
+        .render(SAMPLE_XML, &opts)
+        .await
+        .expect("annotate render should succeed");
+    let warm_annotate = t2.elapsed();
+    assert_eq!(&png3[..4], b"\x89PNG");
+
+    println!("cold(启动+首次渲染): {cold:.1?}");
+    println!("warm(事件驱动热路径): {warm:.1?}");
+    println!("warm+annotate(徽章): {warm_annotate:.1?}");
+    // 热路径应明显快于冷启动（不做硬上限断言，慢机 CI 也应通过）。
+    assert!(warm < cold, "warm render should beat cold launch: {warm:.1?} vs {cold:.1?}");
 }

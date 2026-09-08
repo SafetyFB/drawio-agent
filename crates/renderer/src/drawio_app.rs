@@ -254,15 +254,4 @@ mod tests {
         assert!(!probe_war(&bad), "损坏文件应拒绝");
         fs::remove_dir_all(&tmp).ok();
     }
-
-    #[test]
-    fn sentinel_marks_cached() {
-        let tmp = std::env::temp_dir().join(format!("drawio-app-test-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&tmp).unwrap();
-        fs::write(tmp.join("index.html"), "<html>x</html>").unwrap();
-        fs::write(tmp.join(".sha256-ok"), "v").unwrap();
-        // 直接测判定函数：目录结构完整即视为已缓存（不依赖全局缓存路径）
-        assert!(tmp.join("index.html").is_file() && tmp.join(".sha256-ok").is_file());
-        fs::remove_dir_all(&tmp).ok();
-    }
 }

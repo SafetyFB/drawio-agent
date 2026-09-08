@@ -1,6 +1,6 @@
 //! Tests for chromium discovery ordering.
 
-use drawio_agent_renderer::{bundled_chromium_path, find_chromium, PINNED_CHROMIUM_VERSION};
+use drawio_agent_renderer::{find_chromium, PINNED_CHROMIUM_VERSION};
 
 #[test]
 fn pinned_version_is_exported_and_nonempty() {
@@ -34,16 +34,5 @@ fn find_chromium_returns_some_on_this_host() {
         let _ = found;
     } else {
         assert!(found.is_some(), "expected bundled or system chrome on dev host");
-    }
-}
-
-#[test]
-fn bundled_chromium_path_is_consistent() {
-    let a = bundled_chromium_path();
-    let b = bundled_chromium_path();
-    assert_eq!(a, b);
-    // If Some, it must point to an executable file.
-    if let Some(p) = a {
-        assert!(p.is_file(), "bundled path must be a file: {p:?}");
     }
 }

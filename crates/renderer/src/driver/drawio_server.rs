@@ -27,7 +27,6 @@ Draw.loadPlugin(function (ui) {
     if (d.event) diag('msg:' + d.event);
     if (d.action === 'export_annotate') {
       var crop = null;
-      var retries = 0;
       var ids = d.ids || [];
       if (ids.length) {
         var minX = 1e12, minY = 1e12, maxX = -1e12, maxY = -1e12;
@@ -181,51 +180,65 @@ const WRAPPER_HTML: &str = r#"<!DOCTYPE html><html><body style="margin:0">
       if (pendingResolve) { var rs = pendingResolve; pendingResolve = null; rs({ ok: true, png: window.__exportPng }); }
     }
   });
-  // 热路径：应用常驻，重复渲染只换 xml + 导出，不再重启 iframe
-  window.__doRender = function (xml, scale, border, background, annotate, focusIds) {
-    window.__exportDone = false;
-    window.__exportPng = undefined;
-    window.__crop = null;
-    var cropNeeded = !!(focusIds && focusIds.length);
-    var run = function () {
-      f.contentWindow.postMessage(JSON.stringify({ action: 'load', autosave: 1, xml: xml }), '*');
-      setTimeout(function () {
+    // 热路径：应用常驻，重复渲染只换 xml + 导出，不再重启 iframe
+    window.__doRender = function (xml, scale, border, background, annotate, focusIds) {
+      window.__exportDone = false;
+      window.__exportPng = undefined;
+      window.__crop = null;
+      var cropNeeded = !!(focusIds && focusIds.length);
+      var run = function () {
         // 徽章/裁剪信息桥：插件返回 crop 矩形（与导出图同一坐标空间的比例）
         var allowed = [];
         try {
           var idRe = /\bid="([^"]+)"/g, m2;
           while ((m2 = idRe.exec(xml))) allowed.push(m2[1]);
         } catch (e) {}
-        f.contentWindow.postMessage(JSON.stringify({
-          action: 'export_annotate', annotate: !!annotate, ids: focusIds || [],
-          allowed: allowed
-        }), '*');
-        setTimeout(function () {
-          // 导出 live model（徽章 overlay 已插入模型）
-          var doExport = function () {
-            var effBorder = cropNeeded ? 0 : (annotate ? Math.max(border, 24) : border);
-            f.contentWindow.postMessage(JSON.stringify({
-              action: 'export', format: 'png',
-              scale: scale, border: effBorder, background: background
-            }), '*');
-          };
-          // 等插件真正放好徽章（export_annotate_ready）再导出；5s 兜底
-          var doneFlag = false;
-          var onReady = function (ev) {
-            var dd = ev.data;
-            try { if (typeof dd === 'string') dd = JSON.parse(dd); } catch (e) {}
-            if (!dd || dd.event !== 'export_annotate_ready') return;
-            doneFlag = true;
-            window.removeEventListener('message', onReady);
-            doExport();
-          };
+        var doExport = function () {
+          var effBorder = cropNeeded ? 0 : (annotate ? Math.max(border, 24) : border);
+          f.contentWindow.postMessage(JSON.stringify({
+            action: 'export', format: 'png',
+            scale: scale, border: effBorder, background: background
+          }), '*');
+        };
+        // 等 export_annotate_ready 再导出（徽章已插入模型）；5s 兜底。
+        // 监听在发 export_annotate 之前注册——ready 到得再快也不会漏。
+        var doneFlag = false;
+        var onReady = function (ev) {
+          var dd = ev.data;
+          try { if (typeof dd === 'string') dd = JSON.parse(dd); } catch (e) {}
+          if (!dd || dd.event !== 'export_annotate_ready') return;
+          doneFlag = true;
+          window.removeEventListener('message', onReady);
+          doExport();
+        };
+        var sendAnnotate = function () {
           window.addEventListener('message', onReady);
+          f.contentWindow.postMessage(JSON.stringify({
+            action: 'export_annotate', annotate: !!annotate, ids: focusIds || [],
+            allowed: allowed
+          }), '*');
           setTimeout(function () {
             if (!doneFlag) { window.removeEventListener('message', onReady); doExport(); }
           }, 5000);
+        };
+        // 事件驱动：等 drawio 应用完 xml（{event:'load'}）再发 annotate，
+        // 免掉固定 600ms 盲等；600ms 兜底保证老版本不发 load 事件时
+        // 行为不差于原实现。
+        var loaded = false;
+        var onLoad = function (ev) {
+          var dd = ev.data;
+          try { if (typeof dd === 'string') dd = JSON.parse(dd); } catch (e) {}
+          if (!dd || dd.event !== 'load') return;
+          loaded = true;
+          window.removeEventListener('message', onLoad);
+          sendAnnotate();
+        };
+        window.addEventListener('message', onLoad);
+        f.contentWindow.postMessage(JSON.stringify({ action: 'load', autosave: 1, xml: xml }), '*');
+        setTimeout(function () {
+          if (!loaded) { window.removeEventListener('message', onLoad); sendAnnotate(); }
         }, 600);
-      }, 600);
-    };
+      };
     var cropToPng = function (b64) {
       if (!window.__crop) return Promise.resolve(b64);
       var img = new Image();
