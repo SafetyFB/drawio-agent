@@ -13,7 +13,7 @@ use drawio_harness::xmlfile::{check_doc, lines_in, XmlDoc};
 
 const HELP: &str = r#"drawio-harness REPL 命令：
   /view            渲染当前文件为 PNG 并打开（需 chromium）
-  /check           确定性校验（结构 / id 唯一 / 引用完整）
+  /check           确定性校验（结构 + 布局 lint 摘要）
   /xml [spec]      打印文件行（spec: 行号 / cell:id / @file:lines）
   /sel spec...     选中 cell（id / 行区间），注入下一轮对话上下文
   /undo            撤销上一次编辑

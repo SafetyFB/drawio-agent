@@ -36,6 +36,8 @@ pub enum XmlError {
     BlobDecode(String),
     #[error("bad range `{0}` (expect e.g. `120`, `120-156`, or `cell:abc`)")]
     BadRange(String),
+    #[error("edit 会产生断引用: {0}")]
+    BrokenRef(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -828,6 +830,8 @@ impl XmlDoc {
             });
         }
         let cells = index(&canonical)?;
+        // 引用完整性：只拒绝**新产生**的断引用（既有断引用不阻塞）。
+        reject_new_broken_refs(&self.text, &self.cells, &canonical, &cells)?;
         let after = content_map(&canonical, &cells);
 
         let mut report = EditReport {
@@ -924,6 +928,8 @@ impl XmlDoc {
             });
         }
         let cells = index(&canonical)?;
+        // 引用完整性：只拒绝**新产生**的断引用（既有断引用不阻塞）。
+        reject_new_broken_refs(&self.text, &self.cells, &canonical, &cells)?;
         let before = content_map(&self.text, &self.cells);
         let after = content_map(&canonical, &cells);
         let mut report = EditReport {
@@ -1055,6 +1061,103 @@ fn content_map(text: &str, cells: &[CellSpan]) -> HashMap<String, String> {
         );
     }
     m
+}
+
+/// mxCell 的 parent/source/target 引用完整性：返回断引用清单（形如
+/// ``edge `e1` references missing target cell `x` ``）。edit 校验用它
+/// 拒绝**新产生**的断引用——删节点必须连同引用它的边一起删（批量
+/// ranges 一次删净，最终态无断引用即可通过）；文件里既有的断引用
+/// 不阻塞编辑（外部手工改动可能已带入，不能把后续编辑永久卡死）。
+fn broken_refs(text: &str, cells: &[CellSpan]) -> Vec<String> {
+    let ids: BTreeSet<&str> = cells.iter().map(|c| c.id.as_str()).collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut reader = Reader::from_str(text);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                if e.name().as_ref() != b"mxCell" {
+                    continue;
+                }
+                let mut id = None;
+                let mut parent = None;
+                let mut source = None;
+                let mut target = None;
+                let mut edge = None;
+                for a in e.attributes() {
+                    let Ok(a) = a else { continue };
+                    let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+                    let val = a
+                        .unescape_value()
+                        .map(|v| v.into_owned())
+                        .unwrap_or_default();
+                    match key.as_str() {
+                        "id" => id = Some(val),
+                        "parent" => parent = Some(val),
+                        "source" => source = Some(val),
+                        "target" => target = Some(val),
+                        "edge" => edge = Some(val),
+                        _ => {}
+                    }
+                }
+                let Some(id) = id else { continue };
+                if edge.as_deref() == Some("1") {
+                    for (k, v) in [("source", &source), ("target", &target)] {
+                        if let Some(v) = v.as_deref() {
+                            if !ids.contains(v) {
+                                out.push(format!(
+                                    "edge `{id}` references missing {k} cell `{v}`"
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(p) = parent {
+                    if !ids.contains(p.as_str()) {
+                        out.push(format!(
+                            "cell `{id}` references missing parent `{p}`"
+                        ));
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {} // 解析错误在 canonicalize/index 阶段已被拦截
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 对比编辑前后：只在**新产生**断引用时报错（错误里点名悬空的
+/// cell，模型据此补删）。批量编辑对最终候选文本做这一校验——
+/// 「节点 + 连着它的边」一批删净即可通过，无需中间态合法。
+fn reject_new_broken_refs(
+    before_text: &str,
+    before_cells: &[CellSpan],
+    after_text: &str,
+    after_cells: &[CellSpan],
+) -> Result<(), XmlError> {
+    let before_refs = broken_refs(before_text, before_cells);
+    let after_refs = broken_refs(after_text, after_cells);
+    let new_broken: Vec<&String> = after_refs
+        .iter()
+        .filter(|r| !before_refs.contains(r))
+        .collect();
+    if new_broken.is_empty() {
+        return Ok(());
+    }
+    Err(XmlError::BrokenRef(format!(
+        "{}（删除节点/容器时，把它连着的边或子元素用批量 ranges 一起删：\
+         先 read {{\"query\": \"<id>\"}} 找引用，再一批删净）",
+        new_broken
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1352,6 +1455,55 @@ mod tests {
         assert!(doc.id_to_cell("e1").is_none());
         // d1, 0, 1, svc-a, svc-b survive
         assert_eq!(doc.cells.len(), 5);
+    }
+
+    #[test]
+    fn delete_referenced_vertex_is_rejected_with_actionable_error() {
+        // SAMPLE: e1 引用 svc-a/svc-b。只删 svc-a → 新断引用，拒绝且文件不动。
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let before = doc.text.clone();
+        let a = doc.id_to_cell("svc-a").unwrap().clone();
+        let err = doc
+            .apply_edit(a.start_line, a.end_line, "")
+            .unwrap_err();
+        assert!(err.to_string().contains("断引用"), "{err}");
+        assert!(
+            err.to_string().contains("e1") && err.to_string().contains("svc-a"),
+            "错误应点名悬空的边与缺失的 cell: {err}"
+        );
+        assert_eq!(doc.text, before, "拒绝时文件保持原样");
+        // 连边一起批量删：最终态无断引用，通过。
+        let e1 = doc.id_to_cell("e1").unwrap().clone();
+        let a = doc.id_to_cell("svc-a").unwrap().clone();
+        let rep = doc
+            .apply_edits(&[
+                (e1.start_line, e1.end_line, "".to_string()),
+                (a.start_line, a.end_line, "".to_string()),
+            ])
+            .unwrap();
+        assert_eq!(rep.removed, vec!["e1", "svc-a"]);
+        assert!(doc.id_to_cell("e1").is_none() && doc.id_to_cell("svc-a").is_none());
+    }
+
+    #[test]
+    fn pre_existing_broken_refs_do_not_block_unrelated_edits() {
+        // 外部手工改坏进来的断引用：不阻塞后续无关编辑（否则文件被永久卡死）。
+        let xml = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" vertex="1" parent="1"><mxGeometry x="0" y="0" width="10" height="10" as="geometry"/></mxCell><mxCell id="e" edge="1" parent="1" source="ghost" target="a"><mxGeometry relative="1" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+        let mut doc = XmlDoc::from_text(xml).unwrap(); // 加载不校验引用
+        // 无关编辑：改 a 的标签（不动引用结构）→ 通过。
+        let a = doc.id_to_cell("a").unwrap().clone();
+        let rep = doc
+            .apply_edit(
+                a.start_line,
+                a.end_line,
+                r#"<mxCell id="a" value="A2" vertex="1" parent="1"><mxGeometry x="0" y="0" width="10" height="10" as="geometry"/></mxCell>"#,
+            )
+            .unwrap();
+        assert_eq!(rep.changed, vec!["a"]);
+        // 但把断引用修掉（删掉悬空边）也允许。
+        let e = doc.id_to_cell("e").unwrap().clone();
+        doc.apply_edit(e.start_line, e.end_line, "").unwrap();
+        assert!(doc.id_to_cell("e").is_none());
     }
 
     #[test]

@@ -22,7 +22,7 @@ pretty-print 的 `.drawio` 文件。局部性靠「文件 + 行区间文本编�
   - 查询 `read`（`range` 读行区间 / `cells` 批量读多实体 / `query` 按文本搜
     cell / `outline` 全图概览——每实体一行「行区间 | id | 类型 | 标签」）
   - 内容 `edit`（单区间或批量 `ranges`，全或无原子落盘）、`draw`（整图重建）
-  - 几何 `layout`（`align` 对齐/等距、`move` 批量平移）
+  - 几何 `layout`（`move` 批量平移/绝对定位、`align` 对齐/等距；结果带新坐标）
   - 校验 `check`（结构 + 布局 lint 摘要：重叠/交叉/标签溢出/越界/分支平行）
   - 感知 `view`（截图，`annotate` id 徽章标注、`focus` 局部裁剪放大）
 
@@ -30,7 +30,7 @@ pretty-print 的 `.drawio` 文件。局部性靠「文件 + 行区间文本编�
 
 ```bash
 cargo build
-cargo test -p drawio-harness          # 81 tests
+cargo test -p drawio-harness          # 86 tests
 cargo test -p drawio-agent-renderer   # 校验/渲染测试
 ```
 

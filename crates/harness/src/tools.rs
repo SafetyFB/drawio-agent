@@ -15,6 +15,27 @@ use crate::xmlfile::{check_doc, lines_in, total_lines, CheckReport, EditReport, 
 /// (id, (x, y, w, h)) 几何元组，layout 工具内部用。
 type GeomEntry = (String, (f64, f64, f64, f64));
 
+/// 模型可调用的全部工具名。引擎白名单、`run` 分派、tool_specs 三处
+/// 共用（一致性由测试保证：specs 的编号条目必须与本清单完全一致）。
+pub const TOOL_NAMES: [&str; 6] = ["read", "edit", "draw", "check", "layout", "view"];
+
+/// move 单项语义：相对偏移（dx/dy），或绝对定位（x/y，None = 该轴
+/// 保持不变）。模型想「放到 (400,200)」就直接写绝对值，不必算 delta。
+#[derive(Debug, Clone, Copy)]
+enum MoveSpec {
+    Delta(f64, f64),
+    Place(Option<f64>, Option<f64>),
+}
+
+/// 坐标显示：整数不带小数，其余两位（与 set_geometry_line 的写盘格式一致）。
+fn fmt_coord(v: f64) -> String {
+    if (v - v.round()).abs() < 1e-9 {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{v:.2}")
+    }
+}
+
 
 #[derive(Debug, Clone, Default)]
 pub struct ToolOutput {
@@ -110,6 +131,9 @@ impl Tools {
    mxCell 要带 parent/vertex），新增 cell 用新的唯一 id，连线要有
    source/target。只改目标 cell，其余必须字节不变——系统校验后回报
    added/changed/removed 清单，出现越界改动会被警告。
+   **删除**：text 传空即删除该区间。删节点/容器时必须**连同引用它的
+   边/子元素一起删**（先 read {"query": "<id>"} 找到所有引用方，再批量
+   ranges 一批删净）——只删节点会因断引用被拒绝，错误里会点名悬空的边。
    **批量（ranges 数组）**：一次提交多个不重叠的区间（行号都按当前
    文件），全部通过才落盘、任一失败整体不动（全或无）。
    规则：需要改动 2 个及以上 cell 时**必须**用批量一次提交，禁止逐个
@@ -125,12 +149,16 @@ impl Tools {
    修最明显的 1-2 处即可，**不要逐条清零**（烧轮次收益极低）——
    视觉与语义层面的把关用 view 看图自己判断。
 
-5. layout {"move": {"ids": [...], "dx": n, "dy": n}}
-          或 {"move": [{"id": "a", "dx": 10, "dy": 0}, {"id": "b", "dx": -20, "dy": 5}]}
+5. layout {"move": {"ids": [...], "dx": n, "dy": n}}（统一偏移）
+          或 {"move": [{"id": "a", "x": 400, "y": 200},        （绝对定位：x/y 给哪个改哪个）
+                       {"id": "b", "dx": 0, "dy": -40}]}       （或相对偏移，可混用）
           或 {"align": {"ids": [...], "axis": "x"|"y", "mode": "left"|"right"|"center"|"top"|"bottom"|"middle"|"gap"}}
-   几何级工具：批量平移/对齐/等距分布多个 cell——涉及位置调整优先用它，
-   支持一次移动多个 cell、每个 cell 不同偏移量。只动 mxGeometry，
-   不碰文本/样式/连线（那些用 edit）。整批一次落盘，失败整体回滚。
+   几何级工具：移动/对齐/等距分布多个 cell。只动 mxGeometry，不碰
+   文本/样式/连线（那些用 edit）；整批一次落盘，失败整体回滚；
+   结果报告直接带每个 cell 的新坐标，不用再 read 确认。
+   何时用：**纯位置调整（改坐标/对齐/排布）一律优先 layout**，而不是
+   edit 重写整个 cell——放到哪直接给绝对 x/y，等距对齐交给 align 算，
+   不用自己做算术，也绝不会写坏 cell 结构。
 
 6. view   {} 或 {"annotate": true} 或 {"focus": ["svc-a", "db"]}
    渲染当前文件为截图并作为图像消息发给你——你会真正看到这张图。
@@ -162,7 +190,10 @@ impl Tools {
             "check" => self.check(doc),
             "layout" => self.layout(doc, args),
             "view" => self.view(doc, args).await,
-            other => Err(format!("未知工具 `{other}`。可用: read edit draw check view layout")),
+            other => Err(format!(
+                "未知工具 `{other}`。可用: {}",
+                TOOL_NAMES.join(" ")
+            )),
         }
     }
 
@@ -362,19 +393,41 @@ impl Tools {
     /// 不碰文本/样式/连线（那些走 edit）。整批计算 → 一次 apply_edits 落盘。
     fn layout(&self, doc: &mut XmlDoc, args: &Value) -> Result<ToolOutput, String> {
         let mut edits: Vec<(usize, usize, String)> = Vec::new();
+        // 参与本批移动/对齐的 cell：成功后回报结果坐标，闭环不用重读。
+        let mut moved_ids: Vec<String> = Vec::new();
         if let Some(m) = args.get("move") {
-            // 两种形态：统一偏移 {"ids":[...], "dx":n, "dy":n}
-            //         逐个偏移 [{"id":..,"dx":..,"dy":..}, ...]
-            let items: Vec<(String, f64, f64)> = if let Some(arr) = m.as_array() {
+            // 三种形态：统一偏移 {"ids":[...], "dx":n, "dy":n}
+            //         逐项相对 [{"id":..,"dx":..,"dy":..}, ...]
+            //         逐项绝对 [{"id":..,"x":..,"y":..}, ...]（x/y 给哪个改哪个）
+            let items: Vec<(String, MoveSpec)> = if let Some(arr) = m.as_array() {
                 arr.iter()
                     .map(|v| {
                         let id = v
                             .get("id")
                             .and_then(Value::as_str)
                             .ok_or_else(|| "move 数组项需要 id".to_string())?;
-                        let dx = v.get("dx").and_then(Value::as_f64).unwrap_or(0.0);
-                        let dy = v.get("dy").and_then(Value::as_f64).unwrap_or(0.0);
-                        Ok((id.to_string(), dx, dy))
+                        let has_delta = v.get("dx").is_some() || v.get("dy").is_some();
+                        let has_place = v.get("x").is_some() || v.get("y").is_some();
+                        let spec = match (has_delta, has_place) {
+                            (true, true) => {
+                                return Err("move 单项不能同时给 dx/dy 与 x/y".to_string())
+                            }
+                            (true, false) => MoveSpec::Delta(
+                                v.get("dx").and_then(Value::as_f64).unwrap_or(0.0),
+                                v.get("dy").and_then(Value::as_f64).unwrap_or(0.0),
+                            ),
+                            (false, true) => MoveSpec::Place(
+                                v.get("x").and_then(Value::as_f64),
+                                v.get("y").and_then(Value::as_f64),
+                            ),
+                            (false, false) => {
+                                return Err(
+                                    "move 数组项需要 dx/dy（相对偏移）或 x/y（绝对定位）"
+                                        .to_string(),
+                                )
+                            }
+                        };
+                        Ok((id.to_string(), spec))
                     })
                     .collect::<Result<Vec<_>, String>>()?
             } else {
@@ -387,21 +440,28 @@ impl Tools {
                     .collect();
                 let dx = m.get("dx").and_then(Value::as_f64).unwrap_or(0.0);
                 let dy = m.get("dy").and_then(Value::as_f64).unwrap_or(0.0);
-                ids.into_iter().map(|id| (id, dx, dy)).collect()
+                ids.into_iter()
+                    .map(|id| (id, MoveSpec::Delta(dx, dy)))
+                    .collect()
             };
             if items.is_empty() {
                 return Err("move 不能为空".to_string());
             }
-            for (id, dx, dy) in &items {
+            for (id, spec) in &items {
                 let (x, y, w, h) = doc
                     .geometry_of(id)
                     .ok_or_else(|| format!("cell `{id}` 不存在或其几何不可读"))?;
+                let (nx, ny) = match spec {
+                    MoveSpec::Delta(dx, dy) => (x + dx, y + dy),
+                    MoveSpec::Place(px, py) => (px.unwrap_or(x), py.unwrap_or(y)),
+                };
                 if let Some((ln, line)) = doc
-                    .set_geometry_line(id, x + dx, y + dy, w, h)
+                    .set_geometry_line(id, nx, ny, w, h)
                     .map_err(|e| format!("{e}"))?
                 {
                     edits.push((ln, ln, line));
                 }
+                moved_ids.push(id.clone());
             }
         } else if let Some(a) = args.get("align") {
             let ids: Vec<String> = a
@@ -492,6 +552,7 @@ impl Tools {
                 {
                     edits.push((ln, ln, line));
                 }
+                moved_ids.push(id.clone());
             }
         } else {
             return Err("layout 需要 move 或 align 参数".to_string());
@@ -503,9 +564,24 @@ impl Tools {
             Ok(report) if report.noop => Ok(ToolOutput::text("no-op：内容与当前文件相同，未修改。")),
             Ok(report) => {
                 doc.save().map_err(|e| format!("保存失败: {e}"))?;
+                // 结果坐标直接回报：模型不用再 read 确认（省一轮）。
+                let coords: Vec<String> = moved_ids
+                    .iter()
+                    .filter(|id| report.changed.iter().any(|c| c == *id))
+                    .filter_map(|id| {
+                        doc.geometry_of(id)
+                            .map(|(x, y, _, _)| format!("{}→({},{})", id, fmt_coord(x), fmt_coord(y)))
+                    })
+                    .collect();
+                let note = if coords.is_empty() {
+                    String::new()
+                } else {
+                    format!(" 新坐标: {}", coords.join(" "))
+                };
                 Ok(ToolOutput::text(format!(
-                    "布局已应用并保存。{}",
-                    report_summary(&report)
+                    "布局已应用并保存。{}{}",
+                    report_summary(&report),
+                    note
                 )))
             }
             Err(e) => Err(format!("布局被拒绝（文件未改动）: {e}")),
@@ -939,6 +1015,65 @@ mod tests {
         assert!(out.is_err());
         assert!(out.err().unwrap().contains("重叠"));
         assert_eq!(d.canonical(), before);
+    }
+
+    #[tokio::test]
+    async fn layout_move_place_absolute_coordinates() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        let out = t
+            .run(
+                &mut d,
+                "layout",
+                &serde_json::json!({
+                    "move": [{"id": "svc-a", "x": 400, "y": 200}]
+                }),
+            )
+            .await
+            .unwrap();
+        let ga = d.geometry_of("svc-a").unwrap();
+        assert_eq!((ga.0, ga.1), (400.0, 200.0), "绝对定位直达");
+        // 报告带结果坐标，闭环不用重读
+        assert!(out.text.contains("svc-a→(400,200)"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn layout_move_place_partial_axis_keeps_other() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        t.run(&mut d, "layout", &serde_json::json!({
+            "move": [{"id": "svc-a", "x": 500}]
+        })).await.unwrap();
+        let ga = d.geometry_of("svc-a").unwrap();
+        assert_eq!(ga.0, 500.0);
+        assert_eq!(ga.1, 60.0, "未给的轴保持不变");
+    }
+
+    #[tokio::test]
+    async fn layout_move_mixed_forms_and_rejects_conflict() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        // 绝对与相对可混用
+        t.run(&mut d, "layout", &serde_json::json!({
+            "move": [
+                {"id": "svc-a", "x": 300, "y": 100},
+                {"id": "svc-b", "dx": 40, "dy": 0}
+            ]
+        })).await.unwrap();
+        assert_eq!(d.geometry_of("svc-a").unwrap().0, 300.0);
+        assert_eq!(d.geometry_of("svc-b").unwrap().0, 300.0);
+        // 同一项同时给 dx 与 x → 报错且文件不动
+        let before = d.canonical().to_string();
+        let err = t.run(&mut d, "layout", &serde_json::json!({
+            "move": [{"id": "svc-a", "x": 1, "dx": 2}]
+        })).await.unwrap_err();
+        assert!(err.contains("同时"), "{err}");
+        assert_eq!(d.canonical(), before);
+        // 什么都没给 → 明确报错
+        let err2 = t.run(&mut d, "layout", &serde_json::json!({
+            "move": [{"id": "svc-a"}]
+        })).await.unwrap_err();
+        assert!(err2.contains("dx/dy"), "{err2}");
     }
 
     #[tokio::test]

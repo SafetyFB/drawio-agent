@@ -223,7 +223,9 @@ JSON 必须合法：字符串里的换行写成 \n、双引号写成 \"。
 4. **动作最大化**：每轮只做一个动作，但动作要尽可能大——需要改动多个
    cell 时用 edit 的批量 ranges 一次提交；画新图尽量一次 draw 整图
    （含全部节点与连线，一次性规划好坐标）；小改动不要拆成多轮逐个做。
-   整个任务的轮数取决于你的动作粒度。
+   整个任务的轮数取决于你的动作粒度。纯几何调整（只改位置/对齐/等距，
+   不动文本样式连线）优先 layout：move 可直接给绝对 x/y，不用重写
+   整段 XML，也不可能写坏 cell 结构。
 5. 涉及布局/位置/连线/样式的修改：先 view 看图再动手；关键修改后可以
    再 view 核对一次，确认没有引入重叠、溢出或断线。每次 view 前先问
    自己"要看什么"——同一文件状态最多 view 3 次，看懂即止，不要反复
@@ -624,7 +626,7 @@ impl Harness {
             // Tool whitelist + fast fail: a model that hallucinates tool
             // names (e.g. `{"tool":"reply"}`) would otherwise loop until
             // max_turns.
-            if !["read", "edit", "draw", "check", "view", "layout"].contains(&name) {
+            if !crate::tools::TOOL_NAMES.contains(&name) {
                 bad_tools += 1;
                 if bad_tools >= 2 {
                     stats.add(&usage, spent);
@@ -635,8 +637,9 @@ impl Harness {
                 }
                 history.push(Message::assistant(raw.clone()));
                 history.push(Message::user(format!(
-                    "`{name}` 不是可用工具。可用工具: read edit draw check view layout。\
-                     每轮只输出一个 JSON 信封；完成后用 {{\"reply\": \"...\", \"done\": true}} 结束。"
+                    "`{name}` 不是可用工具。可用工具: {}。\
+                     每轮只输出一个 JSON 信封；完成后用 {{\"reply\": \"...\", \"done\": true}} 结束。",
+                    crate::tools::TOOL_NAMES.join(" ")
                 )));
                 continue;
             }
@@ -785,12 +788,26 @@ mod tests {
         assert!(!p.contains("6. lint"), "lint 工具条目残留");
         assert!(!p.contains(r#"{"tool": "locate""#), "示例不得用 locate");
         // 纠错消息（运行期生成）示例也必须是合法工具。
-        // 工具清单与白名单一致：specs 里的编号工具逐个在白名单内。
-        let whitelist = ["read", "edit", "draw", "check", "view", "layout"];
+        // 工具清单与白名单一致：specs 里的编号条目逐个在白名单内。
         let specs = Tools::tool_specs();
-        for w in whitelist {
-            assert!(specs.contains(w), "tool_specs 缺工具 {w}");
+        // 解析 specs 的编号条目（首行含 r#" 前缀，剥掉）。
+        let mut spec_tools: Vec<String> = Vec::new();
+        for line in specs.lines() {
+            let t = line.trim_start().trim_start_matches(r#"r#""#);
+            let mut it = t.split_whitespace();
+            if let (Some(first), Some(word)) = (it.next(), it.next()) {
+                let b = first.as_bytes();
+                // 形如 "N." 的单数字编号
+                if b.len() == 2 && b[0].is_ascii_digit() && b[1] == b'.' {
+                    spec_tools.push(word.to_string());
+                }
+            }
         }
+        assert_eq!(
+            spec_tools,
+            crate::tools::TOOL_NAMES.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "tool_specs 编号条目必须与白名单完全一致（顺序含在内）"
+        );
         assert!(!specs.contains("lint   {}"), "tool_specs 不应再含 lint");
     }
 
