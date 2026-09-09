@@ -902,13 +902,12 @@ async fn api_chat_stream(
                 if let Ok(mut v) = events.lock() {
                     v.push(json!({ "type": "ask_sep" }));
                 }
+                // 流上发 ask_sep（前端已渲染自检分隔条；此前发的 tool-note
+                // 类型前端 switch 不认识，直接被 default 丢弃——自检轮在
+                // 实时聊天里不可见）
                 let _ = tx
                     .send(
-                        format!(
-                            "{}\n",
-                            json!({ "type": "tool-note", "text": "（自动自检）本轮已改图但未 view——追加一次质量自检…" })
-                        )
-                        .into_bytes(),
+                        format!("{}\n", json!({ "type": "ask_sep" })).into_bytes(),
                     )
                     .await;
                 // 第二监视器（同一取消语义）
