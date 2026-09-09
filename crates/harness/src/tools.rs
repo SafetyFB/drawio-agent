@@ -79,6 +79,11 @@ pub struct Tools {
     /// 反复刷同一状态是常见浪费）。人工 `open` 路径不缓存（用户显式
     /// 要求渲染并落盘打开）。
     last_view: Option<u64>,
+    /// 同组目标 layout 微调计数，键为「op:排序后目标 ids」，自上次成功
+    /// edit/draw 起算。E2E 实测：模型为消交叉对同一组节点 ±40px 反复
+    /// nudge（参数每次都变，turn_loop 的同参守卫抓不到），7 连发烧尽
+    /// 预算。第 3 次拒绝并给策略建议。
+    nudge_counts: std::collections::HashMap<String, u32>,
 }
 
 impl std::fmt::Debug for Tools {
@@ -112,13 +117,13 @@ const MAX_READ_LINES: usize = 150;
 
 impl Tools {
     pub fn new(render: bool) -> Self {
-        Self { render, renderer: None, last_view: None }
+        Self { render, renderer: None, last_view: None, nudge_counts: Default::default() }
     }
 
     /// Test seam: inject a canned renderer (e.g. built on
     /// `drawio_agent_renderer::MockDriver`) so `view` works without chromium.
     pub fn with_renderer(renderer: drawio_agent_renderer::Renderer) -> Self {
-        Self { render: true, renderer: Some(Arc::new(renderer)), last_view: None }
+        Self { render: true, renderer: Some(Arc::new(renderer)), last_view: None, nudge_counts: Default::default() }
     }
 
 /// Tool docs embedded in the system prompt.
@@ -350,7 +355,33 @@ impl Tools {
 
     /// 几何级工具：align（对齐/等距）与 move（平移）。只动 mxGeometry，
     /// 不碰文本/样式/连线（那些走 edit）。整批计算 → 一次 apply_edits 落盘。
-    fn layout(&self, doc: &mut XmlDoc, args: &Value) -> Result<ToolOutput, String> {
+    /// 同组目标微调守卫：自上次成功 edit/draw 起，对同一组 cell 的第 3 次
+    /// layout 调用拒绝（前两次放行，参数不同也算——±40px 换参数绕不过）。
+    /// 局部平移解决不了交叉/重叠，模型需要「加拐点 / 重排 / 接受残余」
+    /// 的策略提示而不是继续烧轮次（E2E 实测 7 连发）。
+    fn check_nudge(&mut self, op: &str, ids: &[String]) -> Result<(), String> {
+        let mut sorted = ids.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        let cnt = self
+            .nudge_counts
+            .entry(format!("{op}:{}", sorted.join(",")))
+            .or_insert(0);
+        if *cnt >= 2 {
+            return Err(format!(
+                "同一组节点（{}）已连续 layout {} 次仍未收敛——小步平移解决不了问题，继续只会烧轮次。换一种做法：\
+                 1) 用 check 看警告明细，用 edit 给边加拐点（<Array as=\"points\"> 放 mxGeometry 内）或改锚点比例；\
+                 2) 重排节点顺序（edit 调整或 draw 重画）；\
+                 3) 接受残余警告并总结收尾。残余轻微交叉是可接受的。",
+                sorted.join(","),
+                *cnt
+            ));
+        }
+        *cnt += 1;
+        Ok(())
+    }
+
+    fn layout(&mut self, doc: &mut XmlDoc, args: &Value) -> Result<ToolOutput, String> {
         let mut edits: Vec<(usize, usize, String)> = Vec::new();
         // 参与本批移动/对齐的 cell：成功后回报结果坐标，闭环不用重读。
         let mut moved_ids: Vec<String> = Vec::new();
@@ -406,6 +437,8 @@ impl Tools {
             if items.is_empty() {
                 return Err("move 不能为空".to_string());
             }
+            let ids_for_key: Vec<String> = items.iter().map(|(id, _)| id.clone()).collect();
+            self.check_nudge("move", &ids_for_key)?;
             for (id, spec) in &items {
                 let (x, y, w, h) = doc
                     .geometry_of(id)
@@ -435,6 +468,7 @@ impl Tools {
             if ids.len() < 2 {
                 return Err("align 至少需要 2 个 cell".to_string());
             }
+            self.check_nudge("align", &ids)?;
             let mut geoms: Vec<GeomEntry> = Vec::new();
             for id in &ids {
                 let g = doc
@@ -635,6 +669,8 @@ impl Tools {
                 }
                 Ok(report) => {
                     doc.save().map_err(|e| format!("保存失败: {e}"))?;
+                    // 内容变了：同组微调计数重置（edit 后重新布局是合法的新策略）
+                    self.nudge_counts.clear();
                     Ok(ToolOutput::text(format!(
                         "编辑已应用并保存。{}",
                         report_summary(&report)
@@ -683,6 +719,8 @@ impl Tools {
             Ok(report) if report.noop => Ok(ToolOutput::text("no-op：内容与当前文件相同，未修改。")),
             Ok(report) => {
                 doc.save().map_err(|e| format!("保存失败: {e}"))?;
+                // 内容变了：同组微调计数重置（edit 后重新布局是合法的新策略）
+                self.nudge_counts.clear();
                 Ok(ToolOutput::text(format!(
                     "编辑已应用并保存。{}",
                     report_summary(&report)
@@ -1231,7 +1269,40 @@ mod tests {
         let mut tools = Tools::with_renderer(renderer);
         let out = tools.view(&d, &serde_json::json!({})).await.unwrap();
         assert!(out.text.contains("布局 lint：1 条警告（重叠 1"), "{}", out.text);
-        assert!(out.text.contains("运行 check 看明细"), "{}", out.text);
+        assert!(out.text.contains("不要为清零反复微调"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn layout_nudge_guard_rejects_third_same_group_call() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        // 同组 [svc-a] 两次放行（参数每次不同也没用），第 3 次拒绝并给策略
+        for x in [100.0, 140.0] {
+            t.run(&mut d, "layout", &serde_json::json!({
+                "move": [{"id": "svc-a", "x": x, "y": 60}]
+            })).await.unwrap();
+        }
+        let err = t
+            .run(&mut d, "layout", &serde_json::json!({
+                "move": [{"id": "svc-a", "x": 180.0, "y": 60}]
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("仍未收敛"), "{err}");
+        assert!(err.contains("拐点"), "拒绝信息应给替代策略: {err}");
+        // 不同组不受影响
+        t.run(&mut d, "layout", &serde_json::json!({
+            "move": [{"id": "svc-b", "x": 400, "y": 60}]
+        })).await.unwrap();
+        // 成功 edit 后计数重置：同组可再次 layout
+        let edit_env = serde_json::json!({
+            "range": "cell:svc-a",
+            "text": r#"<mxCell id="svc-a" value="A2" vertex="1" parent="1"><mxGeometry x="100" y="60" width="160" height="60" as="geometry"/></mxCell>"#
+        });
+        t.run(&mut d, "edit", &edit_env).await.unwrap();
+        t.run(&mut d, "layout", &serde_json::json!({
+            "move": [{"id": "svc-a", "x": 60, "y": 60}]
+        })).await.unwrap();
     }
 
     #[tokio::test]

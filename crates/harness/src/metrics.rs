@@ -644,7 +644,9 @@ pub fn lint_one_liner(report: &Report) -> String {
         return "布局 lint：无警告".to_string();
     }
     format!(
-        "布局 lint：{total} 条警告（重叠 {} · 交叉 {} · 标签溢出 {} · 越界 {} · 分支未平行 {}）——运行 check 看明细",
+        "布局 lint：{total} 条警告（重叠 {} · 交叉 {} · 标签溢出 {} · 越界 {} · 分支未平行 {}）\
+         ——修最明显的 1-2 处即可，残余可接受并在总结说明；不要为清零反复微调布局\
+         （交叉靠平移消除不了时：给边加拐点或重排节点）",
         s.overlaps,
         s.crossings,
         s.label_overflows,
