@@ -25,8 +25,11 @@ pub const TOOL_META: &[(&str, &str)] = &[
     ),
     (
         "draw",
-        r#"{"xml": "<mxfile>…</mxfile>"}
-    整图重建（新画一张图或大改布局时用）。xml 必须是完整 mxfile。"#,
+        r#"{"xml": "<mxGraphModel>…</mxGraphModel>"}
+    整图重建（新画一张图或大改布局时用）。推荐直接给 mxGraphModel
+    （系统自动补 mxfile/diagram 外壳）；给完整 mxfile 也行。
+    mxGraphModel 内必须有 <root>（含锚点 0/1）。开闭标签必须逐层配对——
+    漏闭标签（如少写 </mxGraphModel>）会被解析拒绝，错误里带正确骨架。"#,
     ),
     (
         "check",

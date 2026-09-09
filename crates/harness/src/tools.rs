@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::xmlfile::{check_doc, lines_in, total_lines, CheckReport, EditReport, XmlDoc};
+use crate::xmlfile::{check_doc, lines_in, total_lines, CheckReport, EditReport, XmlDoc, XmlError};
 
 /// Result of executing one tool: free-form text fed back to the model,
 /// optionally carrying an image (the `view` tool returns the screenshot so
@@ -610,8 +610,9 @@ impl Tools {
                 .get("xml")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "draw 需要参数 xml".to_string())?;
+            let xml = wrap_bare_graph_model(xml);
             let (start, end) = (1usize, total_lines(doc.canonical()));
-            return match doc.apply_edit(start, end, xml) {
+            return match doc.apply_edit(start, end, &xml) {
                 Ok(report) if report.noop => {
                     Ok(ToolOutput::text("no-op：内容与当前文件相同，未修改。"))
                 }
@@ -622,7 +623,7 @@ impl Tools {
                         report_summary(&report)
                     )))
                 }
-                Err(e) => Err(format!("编辑被拒绝（文件未改动）: {e}")),
+                Err(e) => Err(format!("draw 被拒绝（文件未改动）: {e}\n{}", reject_hint(&e))),
             };
         }
         // 批量：ranges=[{range,text},...] 一次全做（全或无）；兼容旧单区间
@@ -671,7 +672,8 @@ impl Tools {
                 )))
             }
             Err(e) => Err(format!(
-                "编辑被拒绝（文件未改动）: {e}\n正确形态示例（单 cell 自洽 XML，含完整属性）：\n<mxCell id=\"新id\" value=\"标签\" vertex=\"1\" parent=\"1\"><mxGeometry x=\"40\" y=\"60\" width=\"120\" height=\"60\" as=\"geometry\"/></mxCell>\n连线需 vertex→edge：source/target=已有 cell id、父级 parent=\"1\"。"
+                "编辑被拒绝（文件未改动）: {e}\n{}",
+                reject_hint(&e)
             )),
         }
     }
@@ -846,6 +848,38 @@ fn range_str(a: usize, b: usize) -> String {
 
 pub fn check_text(text: &str) -> Result<CheckReport, String> {
     check_doc(text).map_err(|e| e.to_string())
+}
+
+/// draw 的宽容输入：mxfile/diagram 两层包裹是纯样板、对语义无贡献，
+/// 而模型经常只给 mxGraphModel。根元素恰为 mxGraphModel 时自动补全外壳；
+/// 其余形态原样交给 canonicalize 校验。
+fn wrap_bare_graph_model(xml: &str) -> String {
+    let t = xml.trim();
+    if t.starts_with("<mxGraphModel") && t.ends_with("</mxGraphModel>") {
+        format!(
+            "<mxfile host=\"app.diagrams.net\"><diagram id=\"page-1\" name=\"Page-1\">{t}</diagram></mxfile>"
+        )
+    } else {
+        xml.to_string()
+    }
+}
+
+/// 编辑被拒绝时的教学提示：解析失败（标签不配对是最常见死因）给整文件
+/// 骨架；其余（断引用等）给单 cell 正确形态——错误体本身已指明具体问题。
+fn reject_hint(e: &XmlError) -> &'static str {
+    match e {
+        XmlError::Xml(_) | XmlError::BlobDecode(_) => concat!(
+            "XML 解析失败：开闭标签必须逐层配对。整文件四层结构：\n",
+            "<mxfile><diagram id=\"d\" name=\"Page-1\"><mxGraphModel><root>…</root></mxGraphModel></diagram></mxfile>\n",
+            "常见死因：漏写 </mxGraphModel> 或 </diagram>；逐层数一遍闭合。"
+        ),
+        _ => concat!(
+            "正确形态示例（单 cell 自洽 XML，含完整属性）：\n",
+            "<mxCell id=\"新id\" value=\"标签\" vertex=\"1\" parent=\"1\">",
+            "<mxGeometry x=\"40\" y=\"60\" width=\"120\" height=\"60\" as=\"geometry\"/></mxCell>\n",
+            "连线需 vertex→edge：source/target=已有 cell id、父级 parent=\"1\"。"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1116,6 +1150,36 @@ mod tests {
         let out = t.run(&mut d, "draw", &serde_json::json!({ "xml": xml })).await.unwrap();
         assert!(out.text.contains("added=[n1]"), "{}", out.text);
         assert!(d.id_to_cell("svc-a").is_none());
+    }
+
+    #[tokio::test]
+    async fn draw_accepts_bare_mxgraphmodel_and_wraps() {
+        let mut d = doc();
+        let mut t = Tools::new(false);
+        let xml = r#"<mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="n1" value="Bare" vertex="1" parent="1"><mxGeometry x="0" y="0" width="100" height="50" as="geometry"/></mxCell></root></mxGraphModel>"#;
+        let out = t.run(&mut d, "draw", &serde_json::json!({ "xml": xml })).await.unwrap();
+        assert!(out.text.contains("added=[n1]"), "{}", out.text);
+        assert!(
+            d.canonical().starts_with("<mxfile"),
+            "裸 mxGraphModel 应被自动包上 mxfile 外壳: {}",
+            &d.canonical()[..80]
+        );
+        assert!(d.canonical().contains("diagram id=\"page-1\""));
+    }
+
+    #[tokio::test]
+    async fn draw_parse_error_teaches_skeleton() {
+        let mut d = doc();
+        let before = d.canonical().to_string();
+        let mut t = Tools::new(false);
+        // 漏写 </mxGraphModel>——模型最常见的标签配对死因（线上实测）
+        let xml = r#"<mxfile><diagram id="d2"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></diagram></mxfile>"#;
+        let err = t
+            .run(&mut d, "draw", &serde_json::json!({ "xml": xml }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("</mxGraphModel>"), "拒绝信息应教四层骨架: {err}");
+        assert_eq!(d.canonical(), before);
     }
 
     #[tokio::test]

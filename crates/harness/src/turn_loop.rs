@@ -322,7 +322,7 @@ use serde_json::{Value, json};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{Harness, RunOpts, SessionStats, TurnOutcome};
+    use crate::engine::{Harness, RunOpts, SessionStats};
     use crate::xmlfile::XmlDoc;
     use std::collections::VecDeque;
 
