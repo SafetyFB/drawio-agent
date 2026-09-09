@@ -606,15 +606,37 @@ impl Tools {
             // 求解）；渲染器不可用/失败时回退到确定性候选路径路由。
             // ids 先校验（存在且为边）；libavoid 全图求解，ids 仅用于
             // 让模型表达意图与先期报错。
+            // ids 可选：缺省 = 全图所有边（libavoid 本就是全图求解）；
+            // 提供时先校验（存在且为边），拼错立即报错而不是静默忽略。
             let ids: Vec<String> = r
                 .get("ids")
                 .and_then(Value::as_array)
-                .ok_or_else(|| "route 需要 ids 数组".to_string())?
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
-            if ids.is_empty() {
-                return Err("route ids 不能为空".to_string());
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !ids.is_empty() {
+                for id in &ids {
+                    let bad = match doc.id_to_cell(id) {
+                        None => Some("不存在".to_string()),
+                        Some(span) => {
+                            let slice =
+                                lines_in(doc.canonical(), span.start_line, span.end_line);
+                            let is_edge = slice
+                                .lines()
+                                .find(|l| l.contains("<mxCell"))
+                                .and_then(|l| attr_value(l, "edge"))
+                                .as_deref()
+                                == Some("1");
+                            (!is_edge).then(|| "不是边（edge）".to_string())
+                        }
+                    };
+                    if let Some(reason) = bad {
+                        return Err(format!("`{id}` {reason}，route 只作用于边"));
+                    }
+                }
             }
             if self.render {
                 if let Ok(renderer) = self.ensure_renderer().await {
@@ -676,6 +698,15 @@ impl Tools {
                     })
                     .map(|c| (c.x, c.y, c.w, c.h))
                     .collect()
+            };
+            // 兜底缺省同样作用于全图
+            let ids = if ids.is_empty() {
+                geom.iter()
+                    .filter(|c| c.is_edge)
+                    .map(|c| c.id.clone())
+                    .collect()
+            } else {
+                ids
             };
             for id in &ids {
                 let span = doc
@@ -1731,6 +1762,21 @@ mod tests {
         // 拐点必须在障碍矩形（y 10..40）之外：绕上 y=-65 或绕下 y=115
         let has_detour = text.contains("y=\"-65\"") || text.contains("y=\"115\"");
         assert!(has_detour, "拐点应绕开障碍: {text}");
+    }
+
+    #[tokio::test]
+    async fn layout_route_without_ids_targets_all_edges() {
+        let xml = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" vertex="1" parent="1"><mxGeometry x="0" y="0" width="100" height="50" as="geometry"/></mxCell><mxCell id="b" value="B" vertex="1" parent="1"><mxGeometry x="400" y="0" width="100" height="50" as="geometry"/></mxCell><mxCell id="e1" edge="1" parent="1" source="a" target="b"><mxGeometry relative="1" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+        let mut d = XmlDoc::from_text(xml).unwrap();
+        let mut t = Tools::new(false);
+        let out = t.run(&mut d, "layout", &serde_json::json!({ "route": {} })).await.unwrap();
+        let text = d.canonical();
+        assert!(text.contains("edgeStyle=orthogonalEdgeStyle"), "{}", out.text);
+        // 校验路径：拼错的 id 立即报错
+        let err = t.run(&mut d, "layout", &serde_json::json!({ "route": { "ids": ["ghost"] } })).await.unwrap_err();
+        assert!(err.contains("不存在"), "{err}");
+        let err2 = t.run(&mut d, "layout", &serde_json::json!({ "route": { "ids": ["a"] } })).await.unwrap_err();
+        assert!(err2.contains("不是边"), "{err2}");
     }
 
     #[tokio::test]

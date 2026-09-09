@@ -46,7 +46,7 @@ pub const TOOL_META: &[(&str, &str)] = &[
         r#"{"move": {"ids": [...], "dx": n, "dy": n}}（统一偏移）
           或 {"move": [{"id": "a", "x": 400, "y": 200}, {"id": "b", "dx": 0, "dy": -40}]}（绝对/相对可混用）
           或 {"align": {"ids": [...], "axis": "x"|"y", "mode": "left"|"right"|"center"|"top"|"bottom"|"middle"|"gap"}}
-          或 {"route": {"ids": ["e1", …]}}（libavoid 避障布线：保证线不穿过节点）
+          或 {"route": {}}（全图避障布线；也可 {"route": {"ids": [...]}} 先校验指定边）
     几何级工具：移动/对齐/等距分布多个 cell，或避障布线。只动 mxGeometry/style，不碰文本与结构（那些用 edit）；整批一次落盘，失败整体回滚；结果报告直接带每个 cell 的新坐标，不用再 read 确认。
     align 组合约束：axis=x 配 left/right/center，axis=y 配 top/bottom/middle，gap 两轴均可（沿轴等距分布）。
     route 的边界：只管走线、不管布局——它保证不穿节点，但节点本身位置不合理（层次不清/间距拥挤）时布线仍会乱。**先用 move/align 把节点排顺，再 route 一次**；不要靠逐边手调锚点去救乱的布局。
