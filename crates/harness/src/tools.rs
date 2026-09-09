@@ -630,7 +630,8 @@ impl Tools {
                     return Err(format!("`{id}` 不是边（edge），route 只作用于边"));
                 }
                 // 样式正交化（幂等）
-                if !cell_line.contains("edgeStyle=orthogonalEdgeStyle") {
+                let is_ortho = cell_line.contains("edgeStyle=orthogonalEdgeStyle");
+                if !is_ortho {
                     let new_line = if cell_line.contains("style=\"") {
                         cell_line.replacen(
                             "style=\"",
@@ -667,8 +668,12 @@ impl Tools {
                             e.source.clone().unwrap_or_default(),
                             e.target.clone().unwrap_or_default(),
                         );
-                        let bends =
-                            route_waypoints(src, dst, &obstacles_for(&s_id, &d_id));
+                        let bends = route_waypoints(
+                            src,
+                            dst,
+                            &obstacles_for(&s_id, &d_id),
+                            !is_ortho, // 本次被正交化的边必须钉死拐点
+                        );
                         if !bends.is_empty()
                             && geo_line.trim_end().ends_with("/>")
                         {
@@ -1102,6 +1107,7 @@ fn route_waypoints(
     src: (f64, f64, f64, f64),
     dst: (f64, f64, f64, f64),
     obstacles: &[(f64, f64, f64, f64)],
+    allow_direct: bool,
 ) -> Vec<(f64, f64)> {
     const MARGIN: f64 = 15.0;
     let sc = (src.0 + src.2 / 2.0, src.1 + src.3 / 2.0);
@@ -1133,17 +1139,22 @@ fn route_waypoints(
         .fold((f64::MAX, f64::MIN), |(lo, hi), r| {
             (lo.min(r.1), hi.max(r.1 + r.3))
         });
-    let candidates: Vec<Vec<(f64, f64)>> = vec![
-        vec![],                                       // 直连（无需拐点）
-        vec![(sc.0, tc.1)],                           // L：先竖后横
-        vec![(tc.0, sc.1)],                           // L：先横后竖
-        vec![(sc.0, my), (tc.0, my)],                 // Z：经水平中线
-        vec![(mx, sc.1), (mx, tc.1)],                 // Z：经垂直中线
+    let mut candidates: Vec<Vec<(f64, f64)>> = vec![
+        vec![(sc.0, tc.1)],                               // L：先竖后横
+        vec![(tc.0, sc.1)],                               // L：先横后竖
+        vec![(sc.0, my), (tc.0, my)],                     // Z：经水平中线
+        vec![(mx, sc.1), (mx, tc.1)],                     // Z：经垂直中线
         vec![(sc.0, min_y - 60.0), (tc.0, min_y - 60.0)], // 绕上方
         vec![(sc.0, max_y + 60.0), (tc.0, max_y + 60.0)], // 绕下方
         vec![(max_x + 50.0, sc.1), (max_x + 50.0, tc.1)], // 绕右侧通道
         vec![(min_x - 50.0, sc.1), (min_x - 50.0, tc.1)], // 绕左侧通道
     ];
+    // 直连候选仅在两种情况下有效：普通直线边（渲染器会按直线画）；
+    // 或端点轴对齐（正交渲染也是直线）。正交边且两端错位时渲染器会
+    // 自选拐弯（可能拐进节点）——必须显式钉死拐点，不能留空。
+    if allow_direct || sc.0 == tc.0 || sc.1 == tc.1 {
+        candidates.insert(0, vec![]);
+    }
     candidates
         .into_iter()
         .find(|b| path_ok(b))
