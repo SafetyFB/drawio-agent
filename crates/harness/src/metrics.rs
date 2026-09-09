@@ -67,6 +67,8 @@ pub struct Report {
 type ParseGeom = (Vec<GeomCell>, Option<(f64, f64)>);
 
 /// 解析 canonical XML 中的 cell 几何（mxCell + mxGeometry + mxPoint）。
+use std::collections::HashMap;
+
 pub fn parse_geom(xml: &str) -> Result<ParseGeom, String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -229,6 +231,44 @@ pub fn parse_geom(xml: &str) -> Result<ParseGeom, String> {
             Err(e) => return Err(format!("xml parse error: {e}")),
         }
         buf.clear();
+    }
+    // 绝对坐标解析：mxGraph 里容器子元素的 x/y 是**相对父容器原点**的。
+    // 不换算的话，跨父比较（重叠/交叉/越界/route 避障）全部失真——
+    // 实测容器图里 lint 会漏报「边穿节点」。沿父链累加偏移；边不参与
+    // 偏移链（边几何无坐标语义）。父链带访问守卫防环。
+    {
+        let idx: HashMap<&str, usize> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.id.as_str(), i))
+            .collect();
+        let abs = |start: usize| -> (f64, f64) {
+            let (mut dx, mut dy) = (0.0, 0.0);
+            let mut cur = Some(start);
+            let mut guard = 0;
+            while let Some(ci) = cur {
+                let c = &cells[ci];
+                if c.is_edge {
+                    break;
+                }
+                dx += c.x;
+                dy += c.y;
+                cur = idx.get(c.parent.as_str()).copied();
+                guard += 1;
+                if guard > 64 {
+                    break;
+                }
+            }
+            (dx, dy)
+        };
+        let offs: Vec<(f64, f64)> = (0..cells.len()).map(abs).collect();
+        // 链和已含 cell 自身坐标 → 直接赋值（不是累加）
+        for (c, &(dx, dy)) in cells.iter_mut().zip(&offs) {
+            if !c.is_edge {
+                c.x = dx;
+                c.y = dy;
+            }
+        }
     }
     Ok((cells, page))
 }
@@ -836,6 +876,23 @@ mod tests {
     }
 
     #[test]
+    fn container_children_get_absolute_coordinates() {
+        // 容器子元素的 x/y 是相对父容器的——parse_geom 必须换算成绝对
+        // 坐标，否则跨父的重叠/交叉/避障全部失真（E2E 实测：泳道图里
+        // 边穿节点而 lint 报 issues=0）。
+        let xml = doc(
+            "<mxCell id=\"pool\" value=\"P\" vertex=\"1\" parent=\"1\"><mxGeometry x=\"100\" y=\"200\" width=\"400\" height=\"200\" as=\"geometry\"/></mxCell>\
+             <mxCell id=\"kid\" value=\"K\" vertex=\"1\" parent=\"pool\"><mxGeometry x=\"10\" y=\"20\" width=\"80\" height=\"40\" as=\"geometry\"/></mxCell>",
+        );
+        let (cells, _) = parse_geom(&xml).unwrap();
+        let kid = cells.iter().find(|c| c.id == "kid").unwrap();
+        let pool = cells.iter().find(|c| c.id == "pool").unwrap();
+        assert_eq!(pool.x, 100.0);
+        assert_eq!(kid.x, 110.0, "子元素坐标应为绝对坐标 100+10");
+        assert_eq!(kid.y, 220.0, "子元素坐标应为绝对坐标 200+20");
+    }
+
+    #[test]
     fn label_overflow_estimate() {
         let xml = doc(&vertex("a", 0.0, 0.0, 30.0, 40.0, "很长很长的标签"));
         let r = analyze(&xml).unwrap();
@@ -928,3 +985,4 @@ mod tests {
         assert_eq!(r.errors[0].kind, "broken_ref");
     }
 }
+
