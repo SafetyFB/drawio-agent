@@ -40,6 +40,7 @@ pub const TOOL_META: &[(&str, &str)] = &[
           或 {"move": [{"id": "a", "x": 400, "y": 200}, {"id": "b", "dx": 0, "dy": -40}]}（绝对/相对可混用）
           或 {"align": {"ids": [...], "axis": "x"|"y", "mode": "left"|"right"|"center"|"top"|"bottom"|"middle"|"gap"}}
     几何级工具：移动/对齐/等距分布多个 cell。只动 mxGeometry，不碰文本/样式/连线（那些用 edit）；整批一次落盘，失败整体回滚；结果报告直接带每个 cell 的新坐标，不用再 read 确认。
+    align 组合约束：axis=x 配 left/right/center，axis=y 配 top/bottom/middle，gap 两轴均可（沿轴等距分布）。
     何时用：**纯位置调整（改坐标/对齐/排布）一律优先 layout**，而不是 edit 重写整个 cell——放到哪直接给绝对 x/y，等距对齐交给 align 算，不用自己做算术，也绝不会写坏 cell 结构。"#,
     ),
     (

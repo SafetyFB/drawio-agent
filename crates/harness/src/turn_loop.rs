@@ -247,7 +247,7 @@ impl HarnessRunExt for Harness {
                         history.push(Message::assistant(raw.clone()));
                         history.push(Message::user(
                             "信封缺少 tool 或 reply 字段。请只输出一个 JSON 信封：\
-                             {{\"tool\": \"<工具名>\", \"args\": {{…}}}} 或 {{\"reply\": \"…\", \"done\": true}}."
+                             {{\"tool\": \"<工具名>\", \"args\": {{…}}}} 或 {{\"reply\": \"…\", \"done\": true}}。"
                                 .to_string(),
                         ));
                         continue;

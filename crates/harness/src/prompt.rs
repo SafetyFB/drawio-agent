@@ -8,9 +8,9 @@ pub fn build_system_prompt(doc: &XmlDoc, legacy_viewer: bool) -> String {
     // 形状写法说明随模式切换，避免 legacy 段与通用段自相矛盾：
     // 正常模式两种写法均有效；legacy 回退只允许 `shape=<裸名>`。
     let shape_form_note = if legacy_viewer {
-        "写法约束见下方「旧版回退模式」——本会话只允许 `shape=<裸名>`。"
+        "形状写法：本会话只允许 `shape=<裸名>`（见下方「旧版回退模式」）。"
     } else {
-        "裸形状名（如 `ellipse`）与 `shape=mxgraph.basic.ellipse`\n  同样有效，写法任选其一即可。"
+        "形状写法：裸形状名（如 `ellipse;…`）与 `shape=mxgraph.basic.ellipse` 均有效，任选其一。"
     };
     let legacy_note = if legacy_viewer {
         r#"
@@ -26,11 +26,11 @@ pub fn build_system_prompt(doc: &XmlDoc, legacy_viewer: bool) -> String {
     format!(
         r#"你是 drawio 图表的编辑 Agent，唯一工件是本地文件 {path}
 （规范 XML：每元素一行、行号稳定、属性已规范转义；共 {cells} 个带 id 元素）。
-需要看图时调用 view（最新渲染 {png}），截图会作为图像消息直接发给你。
+需要看图时调用 view，截图会作为图像消息直接发给你。
 
 ## 输出协议（每轮必须遵守）
 每轮**只输出一个 JSON 信封**，除此之外不要输出任何文字、解释、markdown
-代码块。一条消息里出现多个 JSON 时系统只取第一个，其余全部丢弃。
+代码块。一条消息里出现多个 JSON 时系统只保留一个、其余丢弃。
 
 - 调用工具：{{"tool": "<工具名>", "args": {{…}}}}
 - 结束：{{"reply": "<给用户的话>", "done": true}}
@@ -65,36 +65,23 @@ JSON 必须合法：字符串里的换行写成 \n、双引号写成 \"。
    1-2 处即可——残余的轻微交叉/边缘重叠在说明里提一句就好，
    **不要陷入逐条清零的循环**（反复小修浪费大量轮次，收益极低）。
 
-## Draw.io 样式知识（与 drawio 编辑器互通）
-- 常用形状：椭圆 shape=ellipse（width=height 即正圆；aspect=fixed 保持比例）；
-  菱形 shape=rhombus；三角形 shape=triangle；六边形 shape=hexagon；
-  圆柱 shape=cylinder；云 shape=cloud；泳道 shape=swimlane；
-  数据库 shape=datastore；文档 shape=document；平行四边形 shape=parallelogram；
-  梯形 shape=trapezoid。{shape_form_note}
-常用样式键（style 属性内分号分隔）：
-  fillColor=#RRGGBB | strokeColor=#RRGGBB | strokeWidth=n | dashed=1
-  fontSize=n | fontColor=#RRGGBB | align=left|center|right |
-  verticalAlign=top|middle|bottom | whiteSpace=wrap | html=1 |
-  labelPosition=center | spacing=n | opacity=n | rounded=1 | arcSize=n
-连线（edge="1" 的 mxCell）：
-  source/target=cell id；startArrow/endArrow=none|classic|block|oval|diamond|open
-  edgeStyle=orthogonalEdgeStyle（正交走线）；curved=1；dashed=1
-  exitX/exitY/entryX/entryY 为 0..1 的锚点比例；折线用
-  <Array as="points"><mxPoint x=.. y=../>…</Array> 放 mxGeometry 内
-几何：<mxGeometry x= y= width= height= as="geometry"/>；相对定位用
-relative="1"。坐标是绝对画布坐标，摆位时注意间距避免重叠（可先 view）。
-
+## Draw.io XML 易错点（写错不报错、直接坏图，务必注意）
+- mxGeometry 必须带 `as="geometry"`（漏了 geometry 会被静默丢弃）。
+- 折线拐点 `<Array as="points"><mxPoint x=.. y=../></Array>` 放在 mxGeometry **内部**。
+- 连线锚点 exitX/exitY/entryX/entryY 是 0..1 的**比例**（0.5=中点），不是像素。
+- 其余（形状名/样式键/连线属性）按 drawio 标准写法即可；被 edit 拒绝时
+  按错误信息里的正确形态示例修正。
+{shape_form_note}
 ## 工具
 {specs}
 
 ## 错误处理
 - 工具失败时读返回的错误信息，修正参数重试；不要原样重复失败调用。
-- 预算或上下文超限会被系统强制中止，不要尝试绕过.
+- 预算或上下文超限会被系统强制中止，不要尝试绕过。
 {legacy_note}"#,
         path = doc.path.display(),
         legacy_note = legacy_note,
         cells = doc.cells().len(),
-        png = doc.path.with_extension("png").display(),
         specs = Tools::tool_specs(),
         shape_form_note = shape_form_note,
     )
@@ -111,7 +98,7 @@ mod tests {
     fn system_prompt_renders_single_brace_json_examples() {
         let doc = XmlDoc::from_text(SAMPLE).unwrap();
         let p = build_system_prompt(&doc, false);
-        assert!(p.contains("Draw.io 样式知识"));
+        assert!(p.contains("Draw.io XML 易错点"));
         assert!(!p.contains("2018"));
         let legacy = build_system_prompt(&doc, true);
         assert!(legacy.contains("2018"));
@@ -119,6 +106,19 @@ mod tests {
         assert!(p.contains(r#"{"tool": "<工具名>""#), "信封示例必须是单层花括号");
         assert!(p.contains("read   {"), "工具清单必须有 read");
         assert!(!p.contains("{{"), "提示词里不应残留双层花括号: {}", &p[p.len().saturating_sub(400)..]);
+    }
+
+    #[test]
+    fn system_prompt_keeps_silent_failure_pitfalls() {
+        // 回归：样式知识曾被整段误删而测试未察觉。静默失败类易错点
+        // （校验抓不住、直接坏图）必须始终在提示词里。
+        let doc = XmlDoc::from_text(SAMPLE).unwrap();
+        for mode in [false, true] {
+            let p = build_system_prompt(&doc, mode);
+            assert!(p.contains("as=\"geometry\""), "mode={mode}: geometry 属性提醒缺失");
+            assert!(p.contains("Array as=\"points\""), "mode={mode}: 折线拐点位置提醒缺失");
+            assert!(p.contains("0..1"), "mode={mode}: 锚点比例说明缺失");
+        }
     }
 
     #[test]
@@ -170,7 +170,7 @@ mod tests {
         let legacy = build_system_prompt(&doc, true);
         assert!(!normal.contains("旧版回退模式"), "正常模式不应出现回退提示");
         assert!(!normal.contains("2018"), "正常模式不应有 2018 兼容文案");
-        assert!(normal.contains("写法任选其一"), "正常模式两种写法均可用");
+        assert!(normal.contains("任选其一"), "正常模式两种写法均可用");
         assert!(legacy.contains("旧版回退模式"), "legacy 模式应有回退段落");
         assert!(legacy.contains("形状必须写"), "legacy 模式应有形状拼写约束");
         assert!(!legacy.contains("写法任选其一"), "legacy 模式不允许裸形状名");

@@ -860,7 +860,7 @@ async fn api_chat_stream(
         };
         // 主 ask；结束后若全程未 view 且改过图，自动追加一次独立自检轮。
         const SELFCHECK_TEXT: &str =
-            "（自动自检）你刚完成绘图但全程没有用 view 查看成图。请：调用一次 view              检查布局/箭头/间距是否符合图意；有明显问题（重叠/穿线/缺箭头）修最明显的              1-2 处即可，不必追求完美；然后简短总结收尾。";
+            "（自动自检）你刚才修改了图但全程没有用 view 查看成图。请：调用一次 view 检查布局/箭头/间距是否符合图意；有明显问题（重叠/穿线/缺箭头）修最明显的 1-2 处即可，不必追求完美；然后简短总结收尾。";
         let progress_opt: Option<ProgressFn> = Some(progress);
         let run_main = harness.run(
             &mut chat,
