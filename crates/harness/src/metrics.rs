@@ -22,6 +22,8 @@ pub struct GeomCell {
     pub value: String,
     pub font_size: f64,
     pub is_edge: bool,
+    /// style 原文（判断正交路由等）
+    pub style: String,
     pub source: Option<String>,
     pub target: Option<String>,
     /// 折线拐点（edge 专属，模型坐标）
@@ -49,6 +51,8 @@ pub struct Stats {
     pub near_aligned_pairs: usize,
     /// 同一源的分支节点未按流向平行摆放（来自人类校准反馈）
     pub branch_misaligned: usize,
+    /// 长直边（无正交路由）数量——斜穿遮挡的主因
+    pub straight_edges: usize,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -110,6 +114,7 @@ pub fn parse_geom(xml: &str) -> Result<ParseGeom, String> {
                                 b"source" => c.source = Some(val),
                                 b"target" => c.target = Some(val),
                                 b"edge" => c.is_edge = val == "1",
+                                b"style" => c.style = val,
                                 _ => {}
                             }
                         }
@@ -261,7 +266,7 @@ fn seg_intersect(
 }
 
 /// 线段与矩形相交（Liang-Barsky），排除端点接触
-fn seg_rect_intersect(
+pub(crate) fn seg_rect_intersect(
     (x1, y1): (f64, f64),
     (x2, y2): (f64, f64),
     r: (f64, f64, f64, f64),
@@ -327,7 +332,7 @@ fn edge_segments(
 }
 
 /// 祖先链（用于跳过容器与子元素的"重叠"误报）
-fn is_ancestor(a: &str, b: &str, cells: &[GeomCell]) -> bool {
+pub(crate) fn is_ancestor(a: &str, b: &str, cells: &[GeomCell]) -> bool {
     let mut cur = b;
     let mut guard = 0;
     while guard < 64 {
@@ -416,6 +421,42 @@ pub fn analyze(xml: &str) -> Result<Report, String> {
         }
     }
     report.stats.overlaps = report.warnings.len();
+
+    // warnings: 长直边（无正交路由）——斜穿泳道/其它边/节点标题是
+    // 「线乱、遮挡」的主因（E2E 实测）。只报长边（中心距 > 300px），
+    // 短直边无害不制造噪音。已有拐点的边不算（模型已在手动路由）。
+    let center_of = |id: &Option<String>| -> Option<(f64, f64)> {
+        let id = id.as_deref()?;
+        cells
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| (c.x + c.w / 2.0, c.y + c.h / 2.0))
+    };
+    for e in &edges {
+        if !e.is_edge || e.style.contains("edgeStyle=orthogonalEdgeStyle") || !e.points.is_empty()
+        {
+            continue;
+        }
+        if let (Some((sx, sy)), Some((tx, ty))) = (center_of(&e.source), center_of(&e.target)) {
+            let dist = ((tx - sx).powi(2) + (ty - sy).powi(2)).sqrt();
+            if dist > 300.0 {
+                report.warnings.push(Issue {
+                    severity: "warning",
+                    kind: "straight_edge",
+                    ids: vec![e.id.clone()],
+                    detail: format!(
+                        "长直边（跨距 {dist:.0}px）无正交路由，斜穿易遮挡——layout {{\"route\":{{\"ids\":[\"{}\"]}}}} 可一键正交化",
+                        e.id
+                    ),
+                });
+            }
+        }
+    }
+    report.stats.straight_edges = report
+        .warnings
+        .iter()
+        .filter(|w| w.kind == "straight_edge")
+        .count();
 
     // warnings: 交叉（edge×edge 与 edge×顶点矩形）
     type Seg = (String, Vec<((f64, f64), (f64, f64))>);
@@ -644,14 +685,15 @@ pub fn lint_one_liner(report: &Report) -> String {
         return "布局 lint：无警告".to_string();
     }
     format!(
-        "布局 lint：{total} 条警告（重叠 {} · 交叉 {} · 标签溢出 {} · 越界 {} · 分支未平行 {}）\
+        "布局 lint：{total} 条警告（重叠 {} · 交叉 {} · 标签溢出 {} · 越界 {} · 分支未平行 {} · 直线边 {}）\
          ——修最明显的 1-2 处即可，残余可接受并在总结说明；不要为清零反复微调布局\
          （交叉靠平移消除不了时：给边加拐点或重排节点）",
         s.overlaps,
         s.crossings,
         s.label_overflows,
         s.out_of_bounds,
-        s.branch_misaligned
+        s.branch_misaligned,
+        s.straight_edges
     )
 }
 
@@ -661,13 +703,14 @@ pub fn lint_one_liner(report: &Report) -> String {
 pub fn lint_summary_text(report: &Report) -> String {
     let s = &report.stats;
     let mut out = format!(
-        "布局 lint：{} 条警告（重叠 {} · 交叉 {} · 标签溢出 {} · 越界 {} · 分支未平行 {}）",
+        "布局 lint：{} 条警告（重叠 {} · 交叉 {} · 标签溢出 {} · 越界 {} · 分支未平行 {} · 直线边 {}）",
         report.warnings.len(),
         s.overlaps,
         s.crossings,
         s.label_overflows,
         s.out_of_bounds,
-        s.branch_misaligned
+        s.branch_misaligned,
+        s.straight_edges
     );
     if report.warnings.is_empty() {
         out.push_str("——未触发重叠/交叉/溢出/越界。");
@@ -797,6 +840,31 @@ mod tests {
         let xml = doc(&vertex("a", 0.0, 0.0, 30.0, 40.0, "很长很长的标签"));
         let r = analyze(&xml).unwrap();
         assert!(r.stats.label_overflows >= 1);
+    }
+
+    #[test]
+    fn long_straight_edge_flagged_plain_style_not_orthogonal() {
+        // 长直边（跨距 > 300px）且无正交路由 → 直线边告警
+        let plain = "<mxCell id=\"e\" edge=\"1\" parent=\"1\" source=\"a\" target=\"b\"><mxGeometry relative=\"1\" as=\"geometry\"/></mxCell>";
+        let xml = doc(&format!(
+            "{}{}{}",
+            vertex("a", 0.0, 100.0, 100.0, 50.0, "A"),
+            vertex("b", 500.0, 100.0, 100.0, 50.0, "B"),
+            plain
+        ));
+        let r = analyze(&xml).unwrap();
+        assert!(r.stats.straight_edges >= 1, "{:?}", r.stats);
+        assert!(r.warnings.iter().any(|w| w.kind == "straight_edge"));
+        // 正交路由的边不告警
+        let ortho = "<mxCell id=\"e\" style=\"edgeStyle=orthogonalEdgeStyle;\" edge=\"1\" parent=\"1\" source=\"a\" target=\"b\"><mxGeometry relative=\"1\" as=\"geometry\"/></mxCell>";
+        let xml2 = doc(&format!(
+            "{}{}{}",
+            vertex("a", 0.0, 100.0, 100.0, 50.0, "A"),
+            vertex("b", 500.0, 100.0, 100.0, 50.0, "B"),
+            ortho
+        ));
+        let r2 = analyze(&xml2).unwrap();
+        assert_eq!(r2.stats.straight_edges, 0, "{:?}", r2.stats);
     }
 
     #[test]

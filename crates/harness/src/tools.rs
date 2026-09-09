@@ -583,8 +583,131 @@ impl Tools {
                 }
                 moved_ids.push(id.clone());
             }
+        } else if let Some(r) = args.get("route") {
+            // 正交化路由：给选中的边批量加 edgeStyle=orthogonalEdgeStyle，
+            // 并确定性计算避障拐点（候选路径逐段与节点矩形求交）。直线边
+            // 斜穿泳道/其它边是「线乱、遮挡」的主因（E2E 实测）。
+            let ids: Vec<String> = r
+                .get("ids")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "route 需要 ids 数组".to_string())?
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            if ids.is_empty() {
+                return Err("route ids 不能为空".to_string());
+            }
+            let (geom, _page) = crate::metrics::parse_geom(doc.canonical())
+                .map_err(|e| format!("布局分析失败: {e}"))?;
+            let rect_of = |id: &str| -> Option<(f64, f64, f64, f64)> {
+                geom
+                    .iter()
+                    .find(|c| c.id == id && !c.is_edge && c.w > 0.0)
+                    .map(|c| (c.x, c.y, c.w, c.h))
+            };
+            // 障碍 = 除源/目标及其祖先链（泳道容器）外的所有顶点
+            let obstacles_for = |src: &str, dst: &str| -> Vec<(f64, f64, f64, f64)> {
+                geom
+                    .iter()
+                    .filter(|c| !c.is_edge && c.w > 0.0 && c.id != src && c.id != dst)
+                    .filter(|c| {
+                        !crate::metrics::is_ancestor(&c.id, src, &geom)
+                            && !crate::metrics::is_ancestor(&c.id, dst, &geom)
+                    })
+                    .map(|c| (c.x, c.y, c.w, c.h))
+                    .collect()
+            };
+            for id in &ids {
+                let span = doc
+                    .id_to_cell(id)
+                    .ok_or_else(|| format!("cell `{id}` 不存在"))?;
+                let slice = lines_in(doc.canonical(), span.start_line, span.end_line);
+                let cell_line = slice
+                    .lines()
+                    .find(|l| l.contains("<mxCell"))
+                    .ok_or_else(|| format!("cell `{id}` 无法解析"))?;
+                if attr_value(cell_line, "edge").as_deref() != Some("1") {
+                    return Err(format!("`{id}` 不是边（edge），route 只作用于边"));
+                }
+                // 样式正交化（幂等）
+                if !cell_line.contains("edgeStyle=orthogonalEdgeStyle") {
+                    let new_line = if cell_line.contains("style=\"") {
+                        cell_line.replacen(
+                            "style=\"",
+                            "style=\"edgeStyle=orthogonalEdgeStyle;",
+                            1,
+                        )
+                    } else {
+                        cell_line.replacen(
+                            " edge=\"1\"",
+                            " style=\"edgeStyle=orthogonalEdgeStyle;\" edge=\"1\"",
+                            1,
+                        )
+                    };
+                    let ln = span.start_line
+                        + slice.lines().position(|l| l == cell_line).unwrap_or(0);
+                    edits.push((ln, ln, new_line));
+                    moved_ids.push(id.clone());
+                }
+                // 避障拐点：已有拐点的边尊重手动路由不动；两端必须是
+                // 可读几何的顶点；mxGeometry 已有子元素时不安全重写，跳过
+                let edge_geom = geom.iter().find(|c| c.id == *id);
+                let already_routed = edge_geom.is_some_and(|e| !e.points.is_empty());
+                let geo_line = slice
+                    .lines()
+                    .find(|l| l.contains("<mxGeometry"))
+                    .unwrap_or("");
+                if !already_routed {
+                    if let (Some(e), Some(src), Some(dst)) = (
+                        edge_geom,
+                        e_src_tgt(edge_geom, 0).and_then(|s| rect_of(&s)),
+                        e_src_tgt(edge_geom, 1).and_then(|d| rect_of(&d)),
+                    ) {
+                        let (s_id, d_id) = (
+                            e.source.clone().unwrap_or_default(),
+                            e.target.clone().unwrap_or_default(),
+                        );
+                        let bends =
+                            route_waypoints(src, dst, &obstacles_for(&s_id, &d_id));
+                        if !bends.is_empty()
+                            && geo_line.trim_end().ends_with("/>")
+                        {
+                            let indent =
+                                geo_line.len() - geo_line.trim_start().len();
+                            let pad = |n: usize| " ".repeat(n);
+                            let mut repl = format!(
+                                "{}<mxGeometry relative=\"1\" as=\"geometry\">",
+                                pad(indent)
+                            );
+                            repl.push_str(&format!(
+                                "\n{}<Array as=\"points\">",
+                                pad(indent + 1)
+                            ));
+                            for (x, y) in &bends {
+                                repl.push_str(&format!(
+                                    "\n{}<mxPoint x=\"{}\" y=\"{}\"/>",
+                                    pad(indent + 2),
+                                    fmt_coord(*x),
+                                    fmt_coord(*y)
+                                ));
+                            }
+                            repl.push_str(&format!("\n{}</Array>", pad(indent + 1)));
+                            repl.push_str(&format!(
+                                "\n{}</mxGeometry>",
+                                pad(indent)
+                            ));
+                            let ln = span.start_line
+                                + slice
+                                    .lines()
+                                    .position(|l| l.contains("<mxGeometry"))
+                                    .unwrap_or(0);
+                            edits.push((ln, ln, repl));
+                        }
+                    }
+                }
+            }
         } else {
-            return Err("layout 需要 move 或 align 参数".to_string());
+            return Err("layout 需要 move / align / route 参数".to_string());
         }
         if edits.is_empty() {
             return Ok(ToolOutput::text(
@@ -969,6 +1092,71 @@ pub fn report_summary(r: &EditReport) -> String {
         ));
     }
     s
+}
+
+/// route 的确定性避障拐点计算：候选路径（直连 → L 形 → Z 形 → 绕侧
+/// 通道）逐段与障碍矩形（全部非源/目标的顶点，含泳道容器，外扩安全
+/// 边距）求交，选第一条无碰撞路径的拐点；全部被堵则返回空——交由
+/// drawio 渲染器的正交路由兜底（渲染器无真避障）。
+fn route_waypoints(
+    src: (f64, f64, f64, f64),
+    dst: (f64, f64, f64, f64),
+    obstacles: &[(f64, f64, f64, f64)],
+) -> Vec<(f64, f64)> {
+    const MARGIN: f64 = 15.0;
+    let sc = (src.0 + src.2 / 2.0, src.1 + src.3 / 2.0);
+    let tc = (dst.0 + dst.2 / 2.0, dst.1 + dst.3 / 2.0);
+    let inflated: Vec<(f64, f64, f64, f64)> = obstacles
+        .iter()
+        .map(|&(x, y, w, h)| (x - MARGIN, y - MARGIN, w + 2.0 * MARGIN, h + 2.0 * MARGIN))
+        .collect();
+    let seg_clear = |p: (f64, f64), q: (f64, f64)| {
+        !inflated
+            .iter()
+            .any(|&r| crate::metrics::seg_rect_intersect(p, q, r))
+    };
+    let path_ok = |bends: &[(f64, f64)]| -> bool {
+        let mut pts = vec![sc];
+        pts.extend(bends.iter().copied());
+        pts.push(tc);
+        pts.windows(2).all(|w| seg_clear(w[0], w[1]))
+    };
+    let mx = (sc.0 + tc.0) / 2.0;
+    let my = (sc.1 + tc.1) / 2.0;
+    let (min_x, max_x) = inflated
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(lo, hi), r| {
+            (lo.min(r.0), hi.max(r.0 + r.2))
+        });
+    let (min_y, max_y) = inflated
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(lo, hi), r| {
+            (lo.min(r.1), hi.max(r.1 + r.3))
+        });
+    let candidates: Vec<Vec<(f64, f64)>> = vec![
+        vec![],                                       // 直连（无需拐点）
+        vec![(sc.0, tc.1)],                           // L：先竖后横
+        vec![(tc.0, sc.1)],                           // L：先横后竖
+        vec![(sc.0, my), (tc.0, my)],                 // Z：经水平中线
+        vec![(mx, sc.1), (mx, tc.1)],                 // Z：经垂直中线
+        vec![(sc.0, min_y - 60.0), (tc.0, min_y - 60.0)], // 绕上方
+        vec![(sc.0, max_y + 60.0), (tc.0, max_y + 60.0)], // 绕下方
+        vec![(max_x + 50.0, sc.1), (max_x + 50.0, tc.1)], // 绕右侧通道
+        vec![(min_x - 50.0, sc.1), (min_x - 50.0, tc.1)], // 绕左侧通道
+    ];
+    candidates
+        .into_iter()
+        .find(|b| path_ok(b))
+        .unwrap_or_default()
+}
+
+/// 从 GeomCell 提取 source/target id（idx=0 取 source，1 取 target）。
+fn e_src_tgt(e: Option<&crate::metrics::GeomCell>, idx: usize) -> Option<String> {
+    let e = e?;
+    match idx {
+        0 => e.source.clone(),
+        _ => e.target.clone(),
+    }
 }
 
 fn attr_value(slice: &str, key: &str) -> Option<String> {
@@ -1456,6 +1644,44 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("边（edge）"), "{err}");
         assert!(err.contains("拐点"), "错误应给可执行替代方案: {err}");
+    }
+
+    #[tokio::test]
+    async fn layout_route_sets_orthogonal_and_avoids_obstacles() {
+        // 直连路径上有障碍 → 必须给出绕行拐点（绕上/绕下），且样式正交化
+        let xml = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" vertex="1" parent="1"><mxGeometry x="0" y="0" width="100" height="50" as="geometry"/></mxCell><mxCell id="b" value="B" vertex="1" parent="1"><mxGeometry x="400" y="0" width="100" height="50" as="geometry"/></mxCell><mxCell id="obs" value="挡路" vertex="1" parent="1"><mxGeometry x="150" y="10" width="100" height="30" as="geometry"/></mxCell><mxCell id="e" style="endArrow=classic" edge="1" parent="1" source="a" target="b"><mxGeometry relative="1" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+        let mut d = XmlDoc::from_text(xml).unwrap();
+        let mut t = Tools::new(false);
+        let out = t
+            .run(&mut d, "layout", &serde_json::json!({ "route": { "ids": ["e"] } }))
+            .await
+            .unwrap();
+        let text = d.canonical();
+        assert!(text.contains("edgeStyle=orthogonalEdgeStyle"), "{out:?}");
+        assert!(text.contains("<Array as=\"points\""), "应有避障拐点: {out:?}");
+        // 拐点必须在障碍矩形（y 10..40）之外：绕上 y=-65 或绕下 y=115
+        let has_detour = text.contains("y=\"-65\"") || text.contains("y=\"115\"");
+        assert!(has_detour, "拐点应绕开障碍: {text}");
+    }
+
+    #[tokio::test]
+    async fn layout_route_clear_path_skips_waypoints() {
+        // 无障碍直连：只正交化样式，不加多余拐点
+        let xml = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" vertex="1" parent="1"><mxGeometry x="0" y="0" width="100" height="50" as="geometry"/></mxCell><mxCell id="b" value="B" vertex="1" parent="1"><mxGeometry x="400" y="0" width="100" height="50" as="geometry"/></mxCell><mxCell id="e" edge="1" parent="1" source="a" target="b"><mxGeometry relative="1" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+        let mut d = XmlDoc::from_text(xml).unwrap();
+        let mut t = Tools::new(false);
+        t.run(&mut d, "layout", &serde_json::json!({ "route": { "ids": ["e"] } }))
+            .await
+            .unwrap();
+        let text = d.canonical();
+        assert!(text.contains("edgeStyle=orthogonalEdgeStyle"));
+        assert!(!text.contains("<Array as=\"points\""), "直连无障碍不应加拐点: {text}");
+        // 幂等：再跑一次 → no-op
+        let out = t
+            .run(&mut d, "layout", &serde_json::json!({ "route": { "ids": ["e"] } }))
+            .await
+            .unwrap();
+        assert!(out.text.contains("no-op"), "{}", out.text);
     }
 
     #[tokio::test]

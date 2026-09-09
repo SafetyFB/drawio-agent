@@ -29,7 +29,9 @@ pub const TOOL_META: &[(&str, &str)] = &[
     整图重建（新画一张图或大改布局时用）。推荐直接给 mxGraphModel
     （系统自动补 mxfile/diagram 外壳）；给完整 mxfile 也行。
     mxGraphModel 内必须有 <root>（含锚点 0/1）。开闭标签必须逐层配对——
-    漏闭标签（如少写 </mxGraphModel>）会被解析拒绝，错误里带正确骨架。"#,
+    漏闭标签（如少写 </mxGraphModel>）会被解析拒绝，错误里带正确骨架。
+    边建议 style 带 edgeStyle=orthogonalEdgeStyle（正交走线）——裸边是
+    直线，在多层图里会斜穿泳道和其它边造成遮挡。"#,
     ),
     (
         "check",
@@ -42,9 +44,10 @@ pub const TOOL_META: &[(&str, &str)] = &[
         r#"{"move": {"ids": [...], "dx": n, "dy": n}}（统一偏移）
           或 {"move": [{"id": "a", "x": 400, "y": 200}, {"id": "b", "dx": 0, "dy": -40}]}（绝对/相对可混用）
           或 {"align": {"ids": [...], "axis": "x"|"y", "mode": "left"|"right"|"center"|"top"|"bottom"|"middle"|"gap"}}
-    几何级工具：移动/对齐/等距分布多个 cell。只动 mxGeometry，不碰文本/样式/连线（那些用 edit）；整批一次落盘，失败整体回滚；结果报告直接带每个 cell 的新坐标，不用再 read 确认。
+          或 {"route": {"ids": ["e1", …]}}（给边批量加正交路由，消除斜线穿越遮挡）
+    几何级工具：移动/对齐/等距分布多个 cell，或正交化边。只动 mxGeometry/style，不碰文本与结构（那些用 edit）；整批一次落盘，失败整体回滚；结果报告直接带每个 cell 的新坐标，不用再 read 确认。
     align 组合约束：axis=x 配 left/right/center，axis=y 配 top/bottom/middle，gap 两轴均可（沿轴等距分布）。
-    何时用：**纯位置调整（改坐标/对齐/排布）一律优先 layout**，而不是 edit 重写整个 cell——放到哪直接给绝对 x/y，等距对齐交给 align 算，不用自己做算术，也绝不会写坏 cell 结构。"#,
+    何时用：**纯位置调整（改坐标/对齐/排布）一律优先 layout**，而不是 edit 重写整个 cell——放到哪直接给绝对 x/y，等距对齐交给 align 算，不用自己做算术，也绝不会写坏 cell 结构。线乱/遮挡时优先 route 批量正交化。"#,
     ),
     (
         "view",
