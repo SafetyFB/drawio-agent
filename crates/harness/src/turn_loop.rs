@@ -201,6 +201,28 @@ impl HarnessRunExt for Harness {
                         )));
                         continue;
                     }
+                    // 纠错后模型仍坚持输出纯文本（整段无花括号）——几乎总是
+                    // 收尾总结（E2E 实测：终点线前协议漂移，散文复读是策略
+                    // 不动点，硬报错会把已完成并落盘的任务变成「对话出错」，
+                    // 还丢掉模型那句可用的总结）。按收尾接受并附注；带花括号
+                    // 但解析失败的才维持硬错误（那可能是真截断）。
+                    if !raw.contains('{') {
+                        stats.add(&usage, spent);
+                        remember!();
+                        let reply = format!(
+                            "{}\n\n（系统提示：模型未按 JSON 信封协议输出，以上为模型原文，已按任务结束处理；已完成的修改都保留在文件里。）",
+                            crate::envelope::strip_fences(&raw).trim()
+                        );
+                        emit!(EngineEvent::Final { reply: reply.clone() });
+                        envelopes.push(raw.clone());
+                        return Ok(TurnOutcome {
+                            reply,
+                            tool_calls,
+                            envelopes,
+                            usage,
+                            cost_yuan: spent,
+                        });
+                    }
                     stats.add(&usage, spent);
                     remember!();
                     return Err(e);
@@ -564,6 +586,28 @@ mod tests {
             .unwrap();
         assert_eq!(out.tool_calls, 2, "no-op layout 与 edit 都真实执行");
         assert!(doc.text.contains("A v2"));
+    }
+
+    #[tokio::test]
+    async fn prose_wrapup_after_tools_is_salvaged_not_aborted() {
+        // E2E 实测：工具跑完后模型在终点线前输出纯文本总结（无信封）。
+        // 纠错一次后仍坚持散文 → 按收尾接受（附注），不得把已完成的任务
+        // 变成「对话出错」。
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        let prose = "已将背景层的不透明度从50降低到30，边框颜色调浅为#cccccc，这样背景层既能指示分层，又不会遮挡节点和连线。";
+        let mut fake = FakeChat::new(vec![
+            r#"{"tool":"check","args":{}}"#,
+            prose,
+            prose,
+        ]);
+        let out = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "调淡背景层", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert_eq!(out.tool_calls, 1);
+        assert!(out.reply.contains("背景层"), "{}", out.reply);
+        assert!(out.reply.contains("未按 JSON 信封协议"), "{}", out.reply);
     }
 
     #[tokio::test]
