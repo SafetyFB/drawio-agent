@@ -80,6 +80,12 @@ pub trait RenderDriver: Send + Sync {
         xml: &str,
         opts: &RenderOptions,
     ) -> Result<Vec<u8>, RenderError>;
+
+    /// libavoid 避障正交布线（可选能力）：返回改写后的完整 mxfile XML。
+    /// 默认不支持（mock 等轻量驱动）——调用方应回退到确定性兜底路由。
+    async fn reroute(&self, _xml: &str) -> Result<String, RenderError> {
+        Err(RenderError::Export("reroute unsupported by this driver".into()))
+    }
 }
 
 /// The main entry point. Holds a shared driver and forwards calls.
@@ -122,5 +128,11 @@ impl Renderer {
             let _ = std::fs::write(dir.join(name), &png);
         }
         Ok(png)
+    }
+
+    /// libavoid 避障正交布线：驱动支持时返回改写后的完整 mxfile XML；
+    /// 不支持/失败由调用方回退到确定性兜底路由。
+    pub async fn reroute(&self, xml: &str) -> Result<String, RenderError> {
+        self.driver.reroute(xml).await
     }
 }

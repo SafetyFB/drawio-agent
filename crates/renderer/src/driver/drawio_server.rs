@@ -117,6 +117,26 @@ Draw.loadPlugin(function (ui) {
         placeBadges();
       }
     }
+    if (d.action === 'export_reroute') {
+      // libavoid 避障正交布线：LibavoidRouting.run（App 内置 WASM 路由器，
+      // 与编辑器「布局-正交布线」菜单同一实现）→ 回传改写后的完整 XML。
+      var done = function (ok, xml, err) {
+        parent.postMessage({ event: 'export_reroute_done', ok: ok, xml: xml, error: err }, '*');
+      };
+      var ready = window.__libavoidReady;
+      if (!ready) { done(false, null, 'libavoid script not loaded'); return; }
+      ready.then(function (Avoid) {
+        if (!Avoid) { done(false, null, 'libavoid WASM unavailable'); return; }
+        try {
+          LibavoidRouting.run(ui, {}, function (applied) {
+            try {
+              var xml = ui.getFileData ? ui.getFileData() : mxUtils.getXml(ui.editor.getGraphXml());
+              done(!!applied, xml, null);
+            } catch (e) { done(false, null, String(e)); }
+          });
+        } catch (e) { done(false, null, String(e)); }
+      }, function (e) { done(false, null, String(e)); });
+    }
     if (d.action === 'export_annotate_clear') {
       for (var i = 0; i < overlays.length; i++) g.model.remove(overlays[i]);
       overlays = [];
@@ -154,6 +174,7 @@ const WRAPPER_HTML: &str = r#"<!DOCTYPE html><html><body style="margin:0">
   var booted = false;
   var pendingRun = null;
   var pendingResolve = null;
+  var pendingReroute = null;
   window.addEventListener('message', function (ev) {
     var d = ev.data;
     try { if (typeof d === 'string') d = JSON.parse(d); } catch (e) {}
@@ -171,6 +192,10 @@ const WRAPPER_HTML: &str = r#"<!DOCTYPE html><html><body style="margin:0">
       window.__crop = d.crop || null;
       diag('annotate_ready crop=' + JSON.stringify(window.__crop));
     }
+    if (d.event === 'export_reroute_done') {
+      window.__reroute = d;
+      if (pendingReroute) { var rr = pendingReroute; pendingReroute = null; rr(d); }
+    }
     if (d.event === 'export') {
       var data = d.data || '';
       var m = data.match(/^data:image\/png;base64,([\s\S]*)$/);
@@ -179,6 +204,41 @@ const WRAPPER_HTML: &str = r#"<!DOCTYPE html><html><body style="margin:0">
       if (pendingResolve) { var rs = pendingResolve; pendingResolve = null; rs({ ok: true, png: window.__exportPng }); }
     }
   });
+    // 避障布线：加载 xml → 插件内 LibavoidRouting.run → 回传改写后的
+    // 完整 XML。与 __doRender 同一事件驱动模式（load 事件就绪后再发，
+    // 600ms 兜底给老版本）。
+    window.__doReroute = function (xml) {
+      return new Promise(function (resolve) {
+        var proceed = function () {
+          window.__reroute = null;
+          pendingReroute = function (d) {
+            resolve({ ok: !!d.ok, xml: d.xml || null, err: d.error || null });
+          };
+          f.contentWindow.postMessage(JSON.stringify({ action: 'export_reroute' }), '*');
+          // 兜底：30s 无回执（libavoid 求解通常 <1s，给慢机余量）
+          setTimeout(function () {
+            if (pendingReroute) {
+              pendingReroute = null;
+              resolve({ ok: false, err: 'no reroute event within 30s; diag=' + window.__diag.join(' | ') });
+            }
+          }, 30000);
+        };
+        var loaded = false;
+        var onLoad = function (ev) {
+          var dd = ev.data;
+          try { if (typeof dd === 'string') dd = JSON.parse(dd); } catch (e) {}
+          if (!dd || dd.event !== 'load') return;
+          loaded = true;
+          window.removeEventListener('message', onLoad);
+          proceed();
+        };
+        window.addEventListener('message', onLoad);
+        f.contentWindow.postMessage(JSON.stringify({ action: 'load', autosave: 1, xml: xml }), '*');
+        setTimeout(function () {
+          if (!loaded) { window.removeEventListener('message', onLoad); proceed(); }
+        }, 600);
+      });
+    };
     // 热路径：应用常驻，重复渲染只换 xml + 导出，不再重启 iframe
     window.__doRender = function (xml, scale, border, background, annotate, focusIds) {
       window.__exportDone = false;

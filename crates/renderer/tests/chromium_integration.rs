@@ -94,3 +94,28 @@ async fn chromium_hot_path_render_timings() {
     // 热路径应明显快于冷启动（不做硬上限断言，慢机 CI 也应通过）。
     assert!(warm < cold, "warm render should beat cold launch: {warm:.1?} vs {cold:.1?}");
 }
+
+/// libavoid 避障布线（drawio 内置 LibavoidRouting，headless 经插件执行）。
+/// 直连路径上有障碍节点 → 改写后的 XML 应带正交样式与避障拐点。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real browser (cached bundle / system chrome / explicit path)"]
+async fn chromium_libavoid_reroute_writes_waypoints() {
+    let _port = drawio_agent_renderer::init_static_server()
+        .await
+        .expect("static server should start (webapp cached)");
+    let driver = HeadlessChromiumDriver::launch().await
+        .expect("chromium driver should launch");
+    let renderer = Renderer::new(std::sync::Arc::new(driver));
+    let xml = r#"<mxfile host="app.diagrams.net"><diagram id="d" name="Page-1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="40" y="60" width="120" height="60" as="geometry"/></mxCell><mxCell id="b" value="B" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="500" y="60" width="120" height="60" as="geometry"/></mxCell><mxCell id="obs" value="挡路" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="280" y="70" width="100" height="40" as="geometry"/></mxCell><mxCell id="e" edge="1" parent="1" source="a" target="b"><mxGeometry relative="1" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+    let out = renderer.reroute(xml).await.expect("libavoid reroute should succeed");
+    println!("rerouted xml bytes: {}", out.len());
+    let path = std::env::temp_dir().join("e2e_libavoid_out.xml");
+    std::fs::write(&path, &out).unwrap();
+    println!("written to {}", path.display());
+    // 正交样式与拐点应出现；若 libavoid 未启用则明确失败便于诊断
+    assert!(
+        out.contains("orthogonalEdgeStyle") || out.contains("<Array"),
+        "期望正交样式或拐点，输出前 400 字节: {}",
+        &out[..out.len().min(400)]
+    );
+}

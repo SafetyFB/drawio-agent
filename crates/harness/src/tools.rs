@@ -171,7 +171,7 @@ impl Tools {
             "edit" => self.edit(doc, args, false),
             "draw" => self.edit(doc, args, true),
             "check" => self.check(doc),
-            "layout" => self.layout(doc, args),
+            "layout" => self.layout(doc, args).await,
             "view" => self.view(doc, args).await,
             other => Err(format!(
                 "未知工具 `{other}`。可用: {}",
@@ -400,7 +400,7 @@ impl Tools {
         Ok(())
     }
 
-    fn layout(&mut self, doc: &mut XmlDoc, args: &Value) -> Result<ToolOutput, String> {
+    async fn layout(&mut self, doc: &mut XmlDoc, args: &Value) -> Result<ToolOutput, String> {
         let mut edits: Vec<(usize, usize, String)> = Vec::new();
         // 参与本批移动/对齐的 cell：成功后回报结果坐标，闭环不用重读。
         let mut moved_ids: Vec<String> = Vec::new();
@@ -584,9 +584,11 @@ impl Tools {
                 moved_ids.push(id.clone());
             }
         } else if let Some(r) = args.get("route") {
-            // 正交化路由：给选中的边批量加 edgeStyle=orthogonalEdgeStyle，
-            // 并确定性计算避障拐点（候选路径逐段与节点矩形求交）。直线边
-            // 斜穿泳道/其它边是「线乱、遮挡」的主因（E2E 实测）。
+            // 正交化路由。首选 libavoid（drawio 内置 WASM 避障路由器，
+            // 与编辑器「布局-正交布线」同一实现，走 headless 渲染页面
+            // 求解）；渲染器不可用/失败时回退到确定性候选路径路由。
+            // ids 先校验（存在且为边）；libavoid 全图求解，ids 仅用于
+            // 让模型表达意图与先期报错。
             let ids: Vec<String> = r
                 .get("ids")
                 .and_then(Value::as_array)
@@ -597,6 +599,34 @@ impl Tools {
             if ids.is_empty() {
                 return Err("route ids 不能为空".to_string());
             }
+            if let Some(renderer) = &self.renderer {
+                match renderer.reroute(doc.canonical()).await {
+                    Ok(new_xml) => {
+                        let (start, end) = (1usize, total_lines(doc.canonical()));
+                        return match doc.apply_edit(start, end, &new_xml) {
+                            Ok(report) if report.noop => Ok(ToolOutput::text(
+                                "no-op：libavoid 布线后无变化，布局已是正交且无遮挡。",
+                            )),
+                            Ok(report) => {
+                                doc.save().map_err(|e| format!("保存失败: {e}"))?;
+                                self.edit_streak = 0;
+                                self.last_edit_key = None;
+                                self.nudge_counts.clear();
+                                Ok(ToolOutput::text(format!(
+                                    "已应用 libavoid 避障布线并保存。{}",
+                                    report_summary(&report)
+                                )))
+                            }
+                            Err(e) => Err(format!(
+                                "libavoid 布线结果被拒绝（文件未改动）: {e}\n{}",
+                                reject_hint(&e)
+                            )),
+                        };
+                    }
+                    Err(_) => { /* 回退到确定性路由 */ }
+                }
+            }
+            // 确定性兜底：候选路径逐段与节点矩形求交（无浏览器时可用）。
             let (geom, _page) = crate::metrics::parse_geom(doc.canonical())
                 .map_err(|e| format!("布局分析失败: {e}"))?;
             let rect_of = |id: &str| -> Option<(f64, f64, f64, f64)> {

@@ -362,6 +362,52 @@ impl HeadlessChromiumDriver {
             .map_err(|_| RenderError::Browser("response channel dropped".into()))??;
         Ok(resp)
     }
+    /// 首次导航到 wrapper 页并等应用就绪；之后进程/页面常驻（render /
+    /// reroute 共用同一热页面）。
+    async fn ensure_page(&self) -> Result<(), RenderError> {
+        if self.inner.page_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        let url = crate::driver::drawio_server::export_page_url();
+        self.send("Page.enable", None).await?;
+        self.send("Page.navigate", Some(json!({ "url": url }))).await?;
+        let mut ready = false;
+        for _ in 0..600 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            match self
+                .send(
+                    "Runtime.evaluate",
+                    Some(json!({
+                        "expression": "window.__ready === true",
+                        "returnByValue": true,
+                    })),
+                )
+                .await
+            {
+                Ok(r) => {
+                    if r.get("result")
+                        .and_then(|v| v.get("value"))
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+                    {
+                        ready = true;
+                        break;
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        if !ready {
+            return Err(RenderError::Page(
+                "drawio webapp did not become ready (offline? app not cached?)".into(),
+            ));
+        }
+        self.inner
+            .page_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
 }
 
 #[async_trait]
@@ -373,50 +419,9 @@ impl RenderDriver for HeadlessChromiumDriver {
 
         // 渲染串行化（同进程共享一个热页面）。
         let _guard = self.inner.render_lock.lock().await;
+        self.ensure_page().await?;
 
-        // 1. 首次：导航到 wrapper 页并等应用就绪；之后进程/页面常驻，
-        //    每次渲染只换 xml + 导出（省掉进程启动与应用加载）。
-        if !self.inner.page_ready.load(std::sync::atomic::Ordering::Acquire) {
-            let url = crate::driver::drawio_server::export_page_url();
-            self.send("Page.enable", None).await?;
-            self.send("Page.navigate", Some(json!({ "url": url }))).await?;
-            let mut ready = false;
-            for _ in 0..600 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                match self
-                    .send(
-                        "Runtime.evaluate",
-                        Some(json!({
-                            "expression": "window.__ready === true",
-                            "returnByValue": true,
-                        })),
-                    )
-                    .await
-                {
-                    Ok(r) => {
-                        if r.get("result")
-                            .and_then(|v| v.get("value"))
-                            .and_then(|v| v.as_bool())
-                            == Some(true)
-                        {
-                            ready = true;
-                            break;
-                        }
-                    }
-                    Err(_) => continue,
-                }
-            }
-            if !ready {
-                return Err(RenderError::Page(
-                    "drawio webapp did not become ready (offline? app not cached?)".into(),
-                ));
-            }
-            self.inner
-                .page_ready
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-
-        // 2. 热路径渲染：__doRender 返回 Promise，CDP awaitPromise 等它
+        // 热路径渲染：__doRender 返回 Promise，CDP awaitPromise 等它
         //    在应用内完成 load + export。超时预算给足（大图导出慢于
         //    控制命令）；超时/失败都尽力带回页面诊断。
         let bg = if opts.background.is_empty() {
@@ -499,6 +504,81 @@ impl RenderDriver for HeadlessChromiumDriver {
         }
         info!(target: "renderer", bytes = png.len(), "drawio export ok");
         Ok(png)
+    }
+
+    /// libavoid 避障正交布线：在常驻页面里执行 drawio 内置的
+    /// `LibavoidRouting.run`（与编辑器「布局-正交布线」菜单同一实现，
+    /// 含共享路径分离与真避障），返回改写后的完整 mxfile XML。
+    /// 与 render 共享串行锁与热页面。
+    async fn reroute(&self, xml: &str) -> Result<String, RenderError> {
+        if xml.trim().is_empty() {
+            return Err(RenderError::Xml("empty xml".into()));
+        }
+        let _guard = self.inner.render_lock.lock().await;
+        self.ensure_page().await?;
+        let expr = format!(
+            "window.__doReroute({})",
+            serde_json::Value::String(xml.to_string())
+        );
+        let result = match self
+            .send_with_timeout(
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression": expr,
+                    "awaitPromise": true,
+                    "returnByValue": true,
+                })),
+                RENDER_EVALUATE_TIMEOUT,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let diag = self
+                    .send(
+                        "Runtime.evaluate",
+                        Some(json!({
+                            "expression": "JSON.stringify(window.__diag || [])",
+                            "returnByValue": true,
+                        })),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|r| {
+                        r.get("result")
+                            .and_then(|v| v.get("value"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| "(no diag)".into());
+                return Err(RenderError::Page(format!(
+                    "libavoid reroute failed: {e}. page diag: {diag}"
+                )));
+            }
+        };
+        if let Some(exception) = result.get("exceptionDetails") {
+            if !exception.is_null() {
+                return Err(RenderError::Xml(format!("__doReroute threw: {exception}")));
+            }
+        }
+        let value = result
+            .get("result")
+            .and_then(|v| v.get("value"))
+            .cloned()
+            .unwrap_or(json!({}));
+        if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let msg = value
+                .get("err")
+                .and_then(|v| v.as_str())
+                .unwrap_or("reroute failed");
+            return Err(RenderError::Export(msg.to_string()));
+        }
+        let xml = value
+            .get("xml")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RenderError::Export("no xml in reroute result".into()))?;
+        info!(target: "renderer", bytes = xml.len(), "libavoid reroute ok");
+        Ok(xml.to_string())
     }
 }
 
