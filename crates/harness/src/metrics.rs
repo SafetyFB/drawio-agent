@@ -447,7 +447,7 @@ pub fn analyze(xml: &str) -> Result<Report, String> {
         }
         // edge × vertex 矩形（跳过自己的源/目标）
         let (id_e, se) = &segs[i];
-        let edge = edges.iter().find(|e| e.id == *id_e).unwrap();
+        let edge = edges.iter().find(|e| e.id == *id_e).expect("edge from segs must exist in edges");
         for v in &vertices {
             if edge.source.as_deref() == Some(v.id.as_str())
                 || edge.target.as_deref() == Some(v.id.as_str())

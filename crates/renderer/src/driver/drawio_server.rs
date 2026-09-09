@@ -4,14 +4,13 @@
 //! protocol. The headless browser navigates to the wrapper with the xml
 //! in the URL fragment; no per-call server state.
 
-use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::oneshot;
 
 use crate::drawio_app::ensure_drawio_app;
-static PORT: OnceLock<u16> = OnceLock::new();
 
 /// 导出侧插件：徽章标注（碰撞避让）+ 裁剪矩形信息 + overlay XML 回传。
 /// headless 页面专用（renderer 内部静态服务器提供；用户浏览器用的是
@@ -295,52 +294,71 @@ pub fn export_page_url() -> String {
     format!("http://127.0.0.1:{}/__harness_export.html", port())
 }
 
+/// Get the static server port. Must be initialized via `init_static_server()` first.
 fn port() -> u16 {
-    *PORT.get_or_init(|| {
-        std::thread::spawn(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("static server runtime");
-            rt.block_on(run_server());
-        });
-        // Port is published by the server thread once bound. The first
-        // caller blocks briefly until available.
-        let mut tries = 0;
-        loop {
-            let p = SERVER_PORT.load(std::sync::atomic::Ordering::Acquire);
-            if p != 0 {
-                return p;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            tries += 1;
-            if tries > 250 {
-                panic!("drawio static server did not bind");
-            }
-        }
-    })
+    let p = SERVER_PORT.load(Ordering::Acquire);
+    if p == 0 {
+        eprintln!("WARNING: static server port not initialized, using fallback");
+    }
+    p
 }
 
-static SERVER_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+/// Initialize the static server. Must be called before any rendering operations.
+/// Returns the port the server is listening on.
+pub async fn init_static_server() -> Result<u16, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    
+    // Spawn the server in a separate task
+    tokio::spawn(async move {
+        run_server_with_port(tx).await;
+    });
+    
+    // Wait for the server to be ready
+    match rx.await {
+        Ok(Ok(port)) => Ok(port),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("static server thread died".into()),
+    }
+}
 
-async fn run_server() {
+static SERVER_PORT: AtomicU16 = AtomicU16::new(0);
+
+async fn run_server_with_port(tx: oneshot::Sender<Result<u16, String>>) {
     let Some(app_dir) = ensure_drawio_app().unwrap_or_else(|e| {
         eprintln!("drawio renderer: webapp 不可用: {e}");
         None
     }) else {
         // 无 app：仍启动一个空服务器，所有请求 503（driver 侧报清晰错误）
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        SERVER_PORT.store(listener.local_addr().unwrap().port(), std::sync::atomic::Ordering::Release);
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = tx.send(Err(format!("bind failed: {e}")));
+                return;
+            }
+        };
+        let port = listener.local_addr().unwrap().port();
+        SERVER_PORT.store(port, Ordering::Release);
+        let _ = tx.send(Ok(port));
         loop {
-            let (mut sock, _) = listener.accept().await.unwrap();
+            let (mut sock, _) = match listener.accept().await {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
             tokio::spawn(async move {
                 let _ = sock.write_all(b"HTTP/1.1 503 drawio webapp unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
             });
         }
     };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr: SocketAddr = listener.local_addr().unwrap();
-    SERVER_PORT.store(addr.port(), std::sync::atomic::Ordering::Release);
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = tx.send(Err(format!("bind failed: {e}")));
+            return;
+        }
+    };
+    let port = listener.local_addr().unwrap().port();
+    SERVER_PORT.store(port, Ordering::Release);
+    let _ = tx.send(Ok(port));
     loop {
         let (sock, _) = match listener.accept().await {
             Ok(x) => x,

@@ -15,9 +15,18 @@ use crate::xmlfile::{check_doc, lines_in, total_lines, CheckReport, EditReport, 
 /// (id, (x, y, w, h)) 几何元组，layout 工具内部用。
 type GeomEntry = (String, (f64, f64, f64, f64));
 
-/// 模型可调用的全部工具名。引擎白名单、`run` 分派、tool_specs 三处
-/// 共用（一致性由测试保证：specs 的编号条目必须与本清单完全一致）。
-pub const TOOL_NAMES: [&str; 6] = ["read", "edit", "draw", "check", "layout", "view"];
+// Tool metadata is defined in tools_meta.rs (shared with build.rs)
+include!("tools_meta.rs");
+
+/// 模型可调用的全部工具名（从 TOOL_META 派生，保证同步）。
+pub const TOOL_NAMES: [&str; 6] = [
+    TOOL_META[0].0,
+    TOOL_META[1].0,
+    TOOL_META[2].0,
+    TOOL_META[3].0,
+    TOOL_META[4].0,
+    TOOL_META[5].0,
+];
 
 /// move 单项语义：相对偏移（dx/dy），或绝对定位（x/y，None = 该轴
 /// 保持不变）。模型想「放到 (400,200)」就直接写绝对值，不必算 delta。
@@ -112,66 +121,16 @@ impl Tools {
         Self { render: true, renderer: Some(Arc::new(renderer)), last_view: None }
     }
 
-    /// Tool docs embedded in the system prompt.
+/// Tool docs embedded in the system prompt.
     pub fn tool_specs() -> &'static str {
-        r#"1. read   {"range": "120-156" | "cell:svc-a" | "120"}
-          或 {"cells": ["svc-a", "e3", "40-80"]}（批量：一次读多个 cell/区间）
-          或 {"query": "order"}（按文本搜 cell，返回命中 cell 与 @行区间，
-           最多 12 条——把用户说的概念映射到文件位置）
-          或 {"outline": true}（全图概览：每实体一行「行区间 | id | 类型 |
-           标签」，大图先概览再精读；实体多时加 "offset" 分页续读）
-   返回文件中指定区间的原文（带行号——这些行号就是 edit 的行号）。
-   改之前先读；范围尽量小（单次超 150 行会截断并给出续读 range）。
-   行号会随编辑漂移，优先用 cell:id。
-
-2. edit   {"range": "120-156" | "cell:svc-a", "text": "<完整 XML 片段>"}
-          或批量 {"ranges": [{"range": "...", "text": "..."}, ...]}
-   把 range 覆盖的行整体替换为 text。text 必须是**完整自洽的 XML**：
-   开闭标签齐全、属性完整（如 mxGeometry 要带 as="geometry"、
-   mxCell 要带 parent/vertex），新增 cell 用新的唯一 id，连线要有
-   source/target。只改目标 cell，其余必须字节不变——系统校验后回报
-   added/changed/removed 清单，出现越界改动会被警告。
-   **删除**：text 传空即删除该区间。删节点/容器时必须**连同引用它的
-   边/子元素一起删**（先 read {"query": "<id>"} 找到所有引用方，再批量
-   ranges 一批删净）——只删节点会因断引用被拒绝，错误里会点名悬空的边。
-   **批量（ranges 数组）**：一次提交多个不重叠的区间（行号都按当前
-   文件），全部通过才落盘、任一失败整体不动（全或无）。
-   规则：需要改动 2 个及以上 cell 时**必须**用批量一次提交，禁止逐个
-   cell 单独 edit（那会浪费大量轮次——已有实测反馈）。
-
-3. draw   {"xml": "<mxfile>…</mxfile>"}
-   整图重建（新画一张图或大改布局时用）。xml 必须是完整 mxfile。
-
-4. check  {}
-   确定性校验：结构（XML 合法、id 唯一、parent/source/target 引用完整）
-   + 布局 lint 摘要（重叠/连线交叉/标签溢出/越界/分支未平行）。
-   edit/draw 之后建议调用。结构错误（引用断裂等）必须修；布局警告
-   修最明显的 1-2 处即可，**不要逐条清零**（烧轮次收益极低）——
-   视觉与语义层面的把关用 view 看图自己判断。
-
-5. layout {"move": {"ids": [...], "dx": n, "dy": n}}（统一偏移）
-          或 {"move": [{"id": "a", "x": 400, "y": 200},        （绝对定位：x/y 给哪个改哪个）
-                       {"id": "b", "dx": 0, "dy": -40}]}       （或相对偏移，可混用）
-          或 {"align": {"ids": [...], "axis": "x"|"y", "mode": "left"|"right"|"center"|"top"|"bottom"|"middle"|"gap"}}
-   几何级工具：移动/对齐/等距分布多个 cell。只动 mxGeometry，不碰
-   文本/样式/连线（那些用 edit）；整批一次落盘，失败整体回滚；
-   结果报告直接带每个 cell 的新坐标，不用再 read 确认。
-   何时用：**纯位置调整（改坐标/对齐/排布）一律优先 layout**，而不是
-   edit 重写整个 cell——放到哪直接给绝对 x/y，等距对齐交给 align 算，
-   不用自己做算术，也绝不会写坏 cell 结构。
-
-6. view   {} 或 {"annotate": true} 或 {"focus": ["svc-a", "db"]}
-   渲染当前文件为截图并作为图像消息发给你——你会真正看到这张图。
-   - annotate=true：图上叠加红色小徽章标注 cell id（密集处自动避让），
-     用于把视觉元素与 cell id 对应起来
-   - focus=[id...]：只渲染这些 cell 的局部放大图（密集区域看细节用）
-   检查：节点重叠、文字溢出框体、连线错位/穿框、箭头方向、布局失衡。
-   看完再决定改哪里；不要连续重复调用（上一张图已经在你的上下文里，
-   文件未变时重复 view 不会产生新图）。
-   画布坐标与 xml 行区间没有 1:1 对应：定位用 read query，几何值用 read。
-
-任务完成用输出协议的结束信封 {"reply": "<给用户的总结>", "done": true}
-（reply 会直接展示给用户）。"#
+        // Generated from TOOL_META at compile time via a const function.
+        // This ensures TOOL_NAMES and tool_specs are always in sync.
+        const SPECS: &str = {
+            // We use a const fn to build the string at compile time
+            // The actual generation is done by the macro below
+            include_str!(concat!(env!("OUT_DIR"), "/tool_specs.txt"))
+        };
+        SPECS
     }
 
     /// Run one tool. `name` comes straight from the model envelope; args are
@@ -301,14 +260,14 @@ impl Tools {
     fn outline(&self, doc: &XmlDoc, offset: usize) -> Result<ToolOutput, String> {
         let text = doc.canonical();
         let is_leaf = |c: &crate::xmlfile::CellSpan| {
-            !doc.cells.iter().any(|o| {
+            !doc.cells().iter().any(|o| {
                 o.id != c.id && o.start_line > c.start_line && o.start_line <= c.end_line
             })
         };
         let mut rows: Vec<String> = Vec::new();
         let mut n_vertex = 0usize;
         let mut n_edge = 0usize;
-        for c in &doc.cells {
+        for c in doc.cells() {
             if c.id == "0" || c.id == "1" {
                 continue;
             }
@@ -511,9 +470,9 @@ impl Tools {
                 let horizontal = axis == "x";
                 let mut sorted: Vec<&GeomEntry> = geoms_ref.iter().collect();
                 if horizontal {
-                    sorted.sort_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap());
+                    sorted.sort_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).expect("f64 comparable"));
                 } else {
-                    sorted.sort_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap());
+                    sorted.sort_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).expect("f64 comparable"));
                 }
                 let total_len: f64 = if horizontal {
                     sorted.iter().map(|(_, g)| g.2).sum()
@@ -521,9 +480,9 @@ impl Tools {
                     sorted.iter().map(|(_, g)| g.3).sum()
                 };
                 let span = if horizontal {
-                    sorted.last().unwrap().1 .0 + sorted.last().unwrap().1 .2 - sorted.first().unwrap().1 .0
+                    sorted.last().expect("sorted non-empty").1 .0 + sorted.last().unwrap().1 .2 - sorted.first().unwrap().1 .0
                 } else {
-                    sorted.last().unwrap().1 .1 + sorted.last().unwrap().1 .3 - sorted.first().unwrap().1 .1
+                    sorted.last().expect("sorted non-empty").1 .1 + sorted.last().unwrap().1 .3 - sorted.first().unwrap().1 .1
                 };
                 let gap = ((span - total_len) / (sorted.len().saturating_sub(1) as f64)).max(0.0);
                 let mut cursor = if horizontal { sorted[0].1 .0 } else { sorted[0].1 .1 };
@@ -594,12 +553,12 @@ impl Tools {
         // 只报叶子 cell：容器（diagram 等）的 span 覆盖所有子元素，
         // 总会命中，属于噪音。
         let is_leaf = |c: &crate::xmlfile::CellSpan| {
-            !doc.cells.iter().any(|o| {
+            !doc.cells().iter().any(|o| {
                 o.id != c.id && o.start_line > c.start_line && o.start_line <= c.end_line
             })
         };
         let mut hits: Vec<String> = Vec::new();
-        for c in doc.cells.iter().filter(|c| is_leaf(c)) {
+        for c in doc.cells().iter().filter(|c| is_leaf(c)) {
             let slice = lines_in(text, c.start_line, c.end_line);
             if slice.to_lowercase().contains(&q) {
                 // find first matching line inside the cell for display
@@ -629,7 +588,7 @@ impl Tools {
         if hits.is_empty() {
             Ok(ToolOutput::text(format!(
                 "没有找到包含 `{query}` 的 cell（共 {} 个 cell）",
-                doc.cells.len()
+                doc.cells().len()
             )))
         } else {
             let total = hits.len();
@@ -791,7 +750,7 @@ impl Tools {
                 if !open {
                     self.last_view = Some(view_hash);
                 }
-                let mut text = format!("渲染成功 ({} bytes, cells={})", png.len(), doc.cells.len());
+                let mut text = format!("渲染成功 ({} bytes, cells={})", png.len(), doc.cells().len());
                 if open {
                     let stem = file_stem(doc).replace(".xml", "").replace(".drawio", "");
                     let png_path = doc
@@ -801,7 +760,7 @@ impl Tools {
                         .join(format!("{stem}.png"));
                     if std::fs::write(&png_path, &png).is_ok() {
                         open_with_system_viewer(&png_path);
-                        text = format!("已渲染并打开 {} ({}, cells={})", png_path.display(), png.len(), doc.cells.len());
+                        text = format!("已渲染并打开 {} ({}, cells={})", png_path.display(), png.len(), doc.cells().len());
                     }
                 }
                 Ok(ToolOutput::with_image(text, png))

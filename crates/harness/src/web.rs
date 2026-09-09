@@ -28,6 +28,7 @@ use tokio_stream::StreamExt;
 use crate::chat::{Chat, OpenAiChat};
 use crate::config::{self, LlmSettings};
 use crate::engine::{EngineEvent, Harness, ProgressFn, TurnOutcome};
+use crate::turn_loop::HarnessRunExt;
 use crate::history::{self, HistoryRec};
 use crate::refs;
 use crate::tools::Tools;
@@ -121,7 +122,7 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if let Ok(doc) = XmlDoc::load(first) {
+        if let Ok(doc) = XmlDoc::load_with_legacy(first, !drawio_agent_renderer::drawio_app_cached()) {
             let mut stats = crate::engine::SessionStats::default();
             history::load_session_state(first, &mut stats);
             current = Some(name.clone());
@@ -176,6 +177,17 @@ pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
         Some(c) => println!("渲染宿主已就绪: {}", c.display()),
         None => println!("渲染宿主不可用（离线且无系统浏览器）——view/导出将报错"),
     }
+    // Initialize the static server for rendering (must be done before any rendering)
+    let _render_port = match drawio_agent_renderer::driver::drawio_server::init_static_server().await {
+        Ok(p) => {
+            println!("静态渲染服务器已启动: http://127.0.0.1:{p}");
+            p
+        }
+        Err(e) => {
+            eprintln!("静态渲染服务器启动失败: {e}");
+            0
+        }
+    };
     let app_state = AppState {
         big: state,
         cancel,
@@ -421,7 +433,7 @@ async fn api_state(State(app): State<AppState>) -> Json<serde_json::Value> {
         "busy": false,
         "build": build_id(),
         "lines": ss.doc.canonical().lines().count(),
-        "cells": ss.doc.cells.len(),
+        "cells": ss.doc.cells().len(),
         "llm_ready": st.llm_ready(),
         "drawio_app": app.drawio.is_some(),
         "render": st.tools.render,
@@ -521,10 +533,10 @@ async fn api_reload(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde_json::
     let Some(cur) = st.current.clone() else { return current_err() };
     let Some(ss) = st.sessions.get_mut(&cur) else { return busy_err() };
     let path = ss.doc.path.clone();
-    match XmlDoc::load(&path) {
+match XmlDoc::load_with_legacy(&path, !drawio_agent_renderer::drawio_app_cached()) {
         Ok(d) => {
             ss.doc = d;
-            Json(json!({ "ok": true, "cells": ss.doc.cells.len() }))
+            Json(json!({ "ok": true, "cells": ss.doc.cells().len() }))
         }
         Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }
@@ -736,7 +748,7 @@ async fn api_chat_stream(
     let cfg = config::effective_settings().unwrap_or_default();
     // 短暂持锁：检查忙/配置/会话，把会话"拿走"。槽位为空 = 忙，
     // 这是唯一的并发信号；归还发生在任务收尾（所有退出路径都走同一条）。
-    let taken = {
+    let (cur, ss, mut chat, mut tools, budget_yuan) = {
         let mut st = st.lock().await;
         if st.running.is_some() {
             return Json(json!({
@@ -759,21 +771,37 @@ async fn api_chat_stream(
             }))
             .into_response();
         };
-        let ss = st.sessions.remove(&cur).expect("current session is loaded");
+        let ss = match st.sessions.remove(&cur) {
+            Some(ss) => ss,
+            None => {
+                return Json(json!({
+                    "type": "error",
+                    "error": "会话未加载"
+                })).into_response();
+            }
+        };
         let budget = cfg.budget_yuan;
         st.budget_yuan = budget;
         st.running = Some(cur.clone());
         st.snapshot = RunningSnapshot {
             name: cur.clone(),
-            cells: ss.doc.cells.len(),
+            cells: ss.doc.cells().len(),
             lines: ss.doc.canonical().lines().count(),
             usage_in: ss.stats.usage.input_tokens,
             usage_out: ss.stats.usage.output_tokens,
             cost_yuan: ss.stats.cost_yuan,
         };
-        (cur, ss, st.chat.clone().expect("checked"), st.tools.clone(), budget)
+        let chat = match st.chat.clone() {
+            Some(c) => c,
+            None => {
+                return Json(json!({
+                    "type": "error",
+                    "error": "LLM 未配置"
+                })).into_response();
+            }
+        };
+        (cur, ss, chat, st.tools.clone(), budget)
     };
-    let (cur, ss, mut chat, mut tools, budget_yuan) = taken;
     let SessionState { mut doc, mut stats } = ss;
 
     // 模型 view 复用共享热 chromium（与人工导出同一进程，懒启动一次、
@@ -1005,7 +1033,7 @@ async fn api_chat_stream(
                 st.running = None;
                 st.snapshot = RunningSnapshot {
                     name: cur.clone(),
-                    cells: doc.cells.len(),
+                    cells: doc.cells().len(),
                     lines: doc.canonical().lines().count(),
                     usage_in: stats.usage.input_tokens,
                     usage_out: stats.usage.output_tokens,
@@ -1155,7 +1183,7 @@ async fn api_sessions_list(State(st): State<Arc<Mutex<WebState>>>) -> Json<serde
                 .unwrap_or_default();
             let running = st.running.as_deref() == Some(name.as_str());
             let (cells, loaded) = match st.sessions.get(&name) {
-                Some(ss) => (Some(ss.doc.cells.len()), true),
+                Some(ss) => (Some(ss.doc.cells().len()), true),
                 None if running => (Some(st.snapshot.cells), true),
                 None => (None, false),
             };
@@ -1204,8 +1232,8 @@ async fn api_sessions_create(
         .and_then(|v| v.as_str())
         .map(|x| x.to_string());
     let doc = match template {
-        Some(xml) => XmlDoc::from_text_at(&xml, &path).map_err(|e| e.to_string()),
-        None => XmlDoc::from_text_at(crate::EMPTY_TEMPLATE, &path).map_err(|e| e.to_string()),
+        Some(xml) => XmlDoc::from_text_at_with_legacy(&xml, &path, !drawio_agent_renderer::drawio_app_cached()).map_err(|e| e.to_string()),
+        None => XmlDoc::from_text_at_with_legacy(crate::EMPTY_TEMPLATE, &path, !drawio_agent_renderer::drawio_app_cached()).map_err(|e| e.to_string()),
     };
     let doc = match doc {
         Ok(d) => d,
@@ -1243,7 +1271,7 @@ async fn api_sessions_switch(
         if !path.exists() {
             return Json(json!({ "ok": false, "error": format!("会话不存在: {name}") }));
         }
-        let doc = match XmlDoc::load(&path) {
+        let doc = match XmlDoc::load_with_legacy(&path, !drawio_agent_renderer::drawio_app_cached()) {
             Ok(d) => d,
             Err(e) => return Json(json!({ "ok": false, "error": format!("加载失败: {e}") })),
         };
@@ -1252,11 +1280,14 @@ async fn api_sessions_switch(
         st.sessions.insert(name.clone(), SessionState { doc, stats });
     }
     st.current = Some(name.clone());
-    let ss = st.sessions.get(&name).expect("just inserted");
+    let ss = match st.sessions.get(&name) {
+        Some(ss) => ss,
+        None => return Json(json!({ "ok": false, "error": "会话加载失败" })),
+    };
     Json(json!({
         "ok": true,
         "current": name,
-        "cells": ss.doc.cells.len(),
+        "cells": ss.doc.cells().len(),
         "lines": ss.doc.canonical().lines().count(),
         "note": "已切换到会话（文件）"
     }))
@@ -1316,7 +1347,7 @@ async fn ensure_shared_renderer(
             Err(e) => return Err(format!("chromium 启动失败: {e}")),
         }
     }
-    let driver = slot.clone().expect("driver just ensured");
+    let driver = slot.clone().ok_or_else(|| "driver not initialized".to_string())?;
     Ok(Arc::new(drawio_agent_renderer::Renderer::new(driver)))
 }
 
@@ -1386,9 +1417,9 @@ async fn api_manual(
     let Some(cur) = st.current.clone() else { return current_err() };
     let Some(ss) = st.sessions.get_mut(&cur) else { return busy_err() };
     let path = ss.doc.path.clone();
-    match XmlDoc::from_text_at(&req.xml, &path) {
+    match XmlDoc::from_text_at_with_legacy(&req.xml, &path, !drawio_agent_renderer::drawio_app_cached()) {
         Ok(d) => {
-            let cells = d.cells.len();
+            let cells = d.cells().len();
             let lines = d.canonical().lines().count();
             ss.doc = d;
             let _ = ss.doc.save();

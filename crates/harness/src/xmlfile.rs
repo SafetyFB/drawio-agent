@@ -15,6 +15,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use base64::Engine;
 use flate2::read::DeflateDecoder;
@@ -71,7 +72,7 @@ enum Node {
 /// Whitespace-only text nodes are dropped (canonical layout owns all
 /// whitespace). Attribute values and text are unescaped here, so emitting
 /// code can escape with a single policy and roundtrips are exact.
-fn parse_nodes(xml: &str) -> Result<Vec<Node>, XmlError> {
+fn parse_nodes(xml: &str, legacy_mode: bool) -> Result<Vec<Node>, XmlError> {
     let mut reader = Reader::from_str(xml);
     let mut buf = Vec::new();
     let mut events: Vec<quick_xml::events::Event<'static>> = Vec::new();
@@ -86,7 +87,7 @@ fn parse_nodes(xml: &str) -> Result<Vec<Node>, XmlError> {
     let mut i = 0usize;
     let mut nodes = Vec::new();
     while i < events.len() {
-        if let Some(n) = build_node(&events, &mut i)? {
+        if let Some(n) = build_node(&events, &mut i, legacy_mode)? {
             nodes.push(n);
         }
     }
@@ -99,11 +100,12 @@ fn parse_nodes(xml: &str) -> Result<Vec<Node>, XmlError> {
 fn build_node(
     events: &[quick_xml::events::Event<'static>],
     i: &mut usize,
+    legacy_mode: bool,
 ) -> Result<Option<Node>, XmlError> {
     let ev = &events[*i];
     match ev {
         Event::Start(e) => {
-            let mut node = elem_node(e)?;
+            let mut node = elem_node(e, legacy_mode)?;
             *i += 1;
             // Children until the matching </tag>.
             let open = String::from_utf8_lossy(e.name().as_ref()).into_owned();
@@ -120,7 +122,7 @@ fn build_node(
                         break;
                     }
                     _ => {
-                        if let Some(child) = build_node(events, i)? {
+                        if let Some(child) = build_node(events, i, legacy_mode)? {
                             if let Node::Elem {
                                 children, ..
                             } = &mut node
@@ -135,7 +137,7 @@ fn build_node(
         }
         Event::Empty(e) => {
             *i += 1;
-            let mut node = elem_node(e)?;
+            let mut node = elem_node(e, legacy_mode)?;
             if let Node::Elem { self_closing, .. } = &mut node {
                 *self_closing = true;
             }
@@ -269,7 +271,7 @@ fn normalize_style(style: &str) -> String {
 }
 
 /// Node from a Start/Empty event, with unescaped attribute values.
-fn elem_node(e: &quick_xml::events::BytesStart<'_>) -> Result<Node, XmlError> {
+fn elem_node(e: &quick_xml::events::BytesStart<'_>, legacy_mode: bool) -> Result<Node, XmlError> {
     let tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
     let mut attrs = Vec::new();
     for a in e.attributes() {
@@ -279,8 +281,10 @@ fn elem_node(e: &quick_xml::events::BytesStart<'_>) -> Result<Node, XmlError> {
             .unescape_value()
             .map_err(|e| XmlError::Xml(format!("bad entity in `{key}`: {e}")))?
             .into_owned();
-        // mxCell 的 style 属性做 shape 归一化（viewer 兼容）
-        if tag == "mxCell" && key == "style" {
+        // mxCell 的 style 属性做 shape 归一化 —— 仅在 2018 回退模式下
+        // （drawio webapp 未缓存、浏览器画布回退到旧 viewer 时）才改写；
+        // 正常模式保持用户/模型写的样式字节不变。
+        if legacy_mode && tag == "mxCell" && key == "style" {
             value = normalize_style(&value);
         }
         attrs.push((key, value));
@@ -393,22 +397,22 @@ fn inflate_diagram_blob(blob: &str) -> Result<String, XmlError> {
 
 /// Expand any `compressed="true"` `<diagram>` payloads in a parsed tree and
 /// flip the attribute to `compressed="false"`.
-fn expand_diagrams(nodes: &mut [Node]) -> Result<(), XmlError> {
+fn expand_diagrams(nodes: &mut [Node], legacy_mode: bool) -> Result<(), XmlError> {
     for n in nodes {
         match n {
             Node::Elem { tag, attrs, children, .. } if tag == "mxfile" => {
                 for child in children {
-                    expand_diagram(child)?;
+                    expand_diagram(child, legacy_mode)?;
                 }
             }
-            Node::Elem { tag, .. } if tag == "diagram" => expand_diagram(n)?,
+            Node::Elem { tag, .. } if tag == "diagram" => expand_diagram(n, legacy_mode)?,
             _ => {}
         }
     }
     Ok(())
 }
 
-fn expand_diagram(n: &mut Node) -> Result<(), XmlError> {
+fn expand_diagram(n: &mut Node, legacy_mode: bool) -> Result<(), XmlError> {
     let Node::Elem { attrs, children, .. } = n else { return Ok(()) };
     let compressed = attrs
         .iter()
@@ -435,7 +439,7 @@ fn expand_diagram(n: &mut Node) -> Result<(), XmlError> {
     if inner.trim().is_empty() {
         children.clear();
     } else {
-        let parsed = parse_nodes(&inner).map_err(|e| {
+        let parsed = parse_nodes(&inner, legacy_mode).map_err(|e| {
             XmlError::BlobDecode(format!("expanded diagram is not valid XML: {e}"))
         })?;
         *children = parsed;
@@ -455,9 +459,13 @@ fn expand_diagram(n: &mut Node) -> Result<(), XmlError> {
 /// Parse + re-emit in canonical layout. Idempotent: canonical input maps to
 /// itself byte-for-byte (asserted in tests). Attribute order is preserved;
 /// entity escaping is normalized to one canonical policy.
-pub fn canonicalize(xml: &str) -> Result<String, XmlError> {
-    let mut roots = parse_nodes(xml)?;
-    expand_diagrams(&mut roots)?;
+///
+/// `legacy_mode` = 2018 回退兼容：为 true 时才把 mxCell style 里的形状写法
+/// 归一化成旧 viewer 认识的 `shape=<裸名>`；为 false（正常模式）时样式
+/// 字节级保留，不做任何兼容性改写。
+pub fn canonicalize(xml: &str, legacy_mode: bool) -> Result<String, XmlError> {
+    let mut roots = parse_nodes(xml, legacy_mode)?;
+    expand_diagrams(&mut roots, legacy_mode)?;
     let mut em = Emitter {
         out: String::new(),
     };
@@ -652,15 +660,27 @@ pub struct EditReport {
 pub struct XmlDoc {
     pub path: PathBuf,
     pub text: String,
-    pub cells: Vec<CellSpan>,
+    /// Span index (cell id -> line range), built lazily on first access and
+    /// invalidated whenever `text` changes. `text` is the single source of
+    /// truth; this is a pure cache.
+    cells: OnceLock<Vec<CellSpan>>,
     /// Rolling undo stack of previous canonical texts (most recent first).
     history: Vec<String>,
+    /// 2018 回退兼容模式。构造时确定，之后 apply_edit/apply_edits 沿用，
+    /// 保证同一文档生命周期内规范化行为一致。
+    legacy_mode: bool,
 }
 
 impl XmlDoc {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, XmlError> {
+        Self::load_with_legacy(path, false)
+    }
+
+    /// Load with explicit legacy mode（生产入口：传
+    /// `!drawio_agent_renderer::drawio_app_cached()`）。
+    pub fn load_with_legacy(path: impl AsRef<Path>, legacy_mode: bool) -> Result<Self, XmlError> {
         let raw = std::fs::read_to_string(path.as_ref())?;
-        let mut doc = Self::from_text(&raw)?;
+        let mut doc = Self::from_text_with_legacy(&raw, legacy_mode)?;
         doc.path = path.as_ref().to_path_buf();
         Ok(doc)
     }
@@ -678,7 +698,7 @@ impl XmlDoc {
     /// 返回 (该行行号, 新行文本)——布局工具只替换这一行，不碰 cell 其余行。
     pub fn set_geometry_line(&self, id: &str, x: f64, y: f64, w: f64, h: f64) -> Result<Option<(usize, String)>, XmlError> {
         let span = self
-            .cells
+            .cells()
             .iter()
             .find(|c| c.id == id)
             .ok_or_else(|| XmlError::BadRange(format!("cell `{id}` 不存在")))?;
@@ -757,15 +777,22 @@ impl XmlDoc {
         &self.text
     }
 
-    /// Parse canonicalize+index in memory (no disk).
+    /// Parse canonicalize+index in memory (no disk). Normal mode
+    /// (legacy_mode=false)——测试与内存文档用，行为确定性优先。
     pub fn from_text(text: &str) -> Result<Self, XmlError> {
-        let text = canonicalize(text)?;
+        Self::from_text_with_legacy(text, false)
+    }
+
+    /// Parse with explicit legacy mode (2018 回退兼容).
+    pub fn from_text_with_legacy(text: &str, legacy_mode: bool) -> Result<Self, XmlError> {
+        let text = canonicalize(text, legacy_mode)?;
         let cells = index(&text)?;
         Ok(Self {
             path: PathBuf::from(Self::MEMORY_SENTINEL),
             text,
-            cells,
+            cells: OnceLock::from(cells),
             history: Vec::new(),
+            legacy_mode,
         })
     }
 
@@ -778,8 +805,27 @@ impl XmlDoc {
         Ok(d)
     }
 
+    /// Like [`Self::from_text_at`] but with explicit legacy mode.
+    pub fn from_text_at_with_legacy(
+        text: &str,
+        path: impl AsRef<Path>,
+        legacy_mode: bool,
+    ) -> Result<Self, XmlError> {
+        let mut d = Self::from_text_with_legacy(text, legacy_mode)?;
+        d.path = path.as_ref().to_path_buf();
+        Ok(d)
+    }
+
     pub fn id_to_cell(&self, id: &str) -> Option<&CellSpan> {
-        self.cells.iter().find(|c| c.id == id)
+        self.cells().iter().find(|c| c.id == id)
+    }
+
+    /// Cell spans, lazily built from `text` on first access. After any edit
+    /// the field is replaced with a fresh `OnceLock`, so this never returns
+    /// a stale index.
+    pub fn cells(&self) -> &Vec<CellSpan> {
+        self.cells
+            .get_or_init(|| index(&self.text).expect("canonical text must be indexable"))
     }
 
     /// Resolve a user/model range spec. Accepted forms: `120`, `120-156`,
@@ -829,9 +875,9 @@ impl XmlDoc {
                 "{start}-{end} (file has {total} lines)"
             )));
         }
-        let before = content_map(&self.text, &self.cells);
+        let before = content_map(&self.text, self.cells());
         let candidate = replace_lines(&self.text, start, end, replacement);
-        let canonical = canonicalize(&candidate)?;
+        let canonical = canonicalize(&candidate, self.legacy_mode)?;
         if canonical == self.text {
             return Ok(EditReport {
                 noop: true,
@@ -841,7 +887,7 @@ impl XmlDoc {
         }
         let cells = index(&canonical)?;
         // 引用完整性：只拒绝**新产生**的断引用（既有断引用不阻塞）。
-        reject_new_broken_refs(&self.text, &self.cells, &canonical, &cells)?;
+        reject_new_broken_refs(&self.text, self.cells(), &canonical, &cells)?;
         let after = content_map(&canonical, &cells);
 
         let mut report = EditReport {
@@ -883,7 +929,7 @@ impl XmlDoc {
         if self.history.len() > 10 {
             self.history.remove(0);
         }
-        self.cells = cells;
+        self.cells = OnceLock::from(cells);
         Ok(report)
     }
 
@@ -929,7 +975,7 @@ impl XmlDoc {
         for (start, end, text) in desc {
             candidate = replace_lines(&candidate, *start, *end, text);
         }
-        let canonical = canonicalize(&candidate)?;
+        let canonical = canonicalize(&candidate, self.legacy_mode)?;
         if canonical == self.text {
             return Ok(EditReport {
                 noop: true,
@@ -939,8 +985,8 @@ impl XmlDoc {
         }
         let cells = index(&canonical)?;
         // 引用完整性：只拒绝**新产生**的断引用（既有断引用不阻塞）。
-        reject_new_broken_refs(&self.text, &self.cells, &canonical, &cells)?;
-        let before = content_map(&self.text, &self.cells);
+        reject_new_broken_refs(&self.text, self.cells(), &canonical, &cells)?;
+        let before = content_map(&self.text, self.cells());
         let after = content_map(&canonical, &cells);
         let mut report = EditReport {
             noop: false,
@@ -980,14 +1026,14 @@ impl XmlDoc {
         if self.history.len() > 10 {
             self.history.remove(0);
         }
-        self.cells = cells;
+        self.cells = OnceLock::from(cells);
         Ok(report)
     }
 
     pub fn undo(&mut self) -> Option<String> {
         let prev = self.history.pop()?;
         self.text = prev;
-        self.cells = index(&self.text).ok()?;
+        self.cells = OnceLock::from(index(&self.text).ok()?);
         Some(self.text.clone())
     }
 
@@ -1297,7 +1343,7 @@ mod tests {
 
     #[test]
     fn canonical_layout_one_element_per_line() {
-        let c = canonicalize(SAMPLE).unwrap();
+        let c = canonicalize(SAMPLE, false).unwrap();
         // Every markup open tag owns exactly one line (no lines with
         // multiple elements, no closing tag sharing a line).
         assert!(c.starts_with("<mxfile host=\"app.diagrams.net\">\n"));
@@ -1311,24 +1357,24 @@ mod tests {
     fn decl_never_stacks_and_corrupted_decl_is_repaired() {
         // Valid decl stays valid and does not multiply across load-save
         // cycles (each cycle used to add one more `xml ` prefix).
-        let c1 = canonicalize("<?xml version=\"1.0\" encoding=\"UTF-8\"?><mxfile><diagram id=\"d\"/></mxfile>").unwrap();
+        let c1 = canonicalize("<?xml version=\"1.0\" encoding=\"UTF-8\"?><mxfile><diagram id=\"d\"/></mxfile>", false).unwrap();
         assert!(c1.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"), "{c1}");
-        let c2 = canonicalize(&c1).unwrap();
+        let c2 = canonicalize(&c1, false).unwrap();
         assert_eq!(c1, c2, "second save must not alter the decl");
         // A file corrupted by the old bug gets repaired in one pass.
         let bad = "<?xml xml xml xml version=\"1.0\"?><mxfile><diagram id=\"d\"/></mxfile>";
-        let fixed = canonicalize(bad).unwrap();
+        let fixed = canonicalize(bad, false).unwrap();
         assert!(fixed.starts_with("<?xml version=\"1.0\""), "{fixed}");
         assert!(!fixed.contains("xml xml xml"));
         // No decl in the input -> none added (byte-shape stays predictable).
-        let none = canonicalize("<mxfile><diagram id=\"d\"/></mxfile>").unwrap();
+        let none = canonicalize("<mxfile><diagram id=\"d\"/></mxfile>", false).unwrap();
         assert!(!none.starts_with("<?xml"));
     }
 
     #[test]
     fn canonical_is_idempotent() {
-        let c1 = canonicalize(SAMPLE).unwrap();
-        assert_eq!(canonicalize(&c1).unwrap(), c1);
+        let c1 = canonicalize(SAMPLE, false).unwrap();
+        assert_eq!(canonicalize(&c1, false).unwrap(), c1);
     }
 
     #[test]
@@ -1364,30 +1410,56 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_converts_modern_shape_forms() {
+    fn canonicalize_shape_normalization_gated_by_legacy_mode() {
         let xml = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="c" value="" style="ellipse;whiteSpace=wrap;html=1;" vertex="1" parent="1"><mxGeometry x="0" y="0" width="40" height="40" as="geometry"/></mxCell><mxCell id="d2" value="" style="shape=mxgraph.basic.ellipse;whiteSpace=wrap;html=1;" vertex="1" parent="1"><mxGeometry x="60" y="0" width="40" height="40" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
-        let c = canonicalize(xml).unwrap();
-        assert!(c.contains(r#"style="shape=ellipse;whiteSpace=wrap;html=1;""#), "{c}");
-        assert!(!c.contains("mxgraph.basic"), "{c}");
+        // 正常模式（false）：样式字节级保留，不做任何 2018 兼容改写。
+        let modern = canonicalize(xml, false).unwrap();
+        assert!(modern.contains(r#"style="ellipse;whiteSpace=wrap;html=1;""#), "{modern}");
+        assert!(modern.contains(r#"style="shape=mxgraph.basic.ellipse;whiteSpace=wrap;html=1;""#), "{modern}");
         // 幂等
-        assert_eq!(canonicalize(&c).unwrap(), c);
+        assert_eq!(canonicalize(&modern, false).unwrap(), modern);
+        // 2018 回退模式（true）：裸形状名补 shape= 前缀，命名空间归一化为裸名。
+        let legacy = canonicalize(xml, true).unwrap();
+        assert_eq!(legacy.matches("shape=ellipse").count(), 2, "{legacy}");
+        assert!(!legacy.contains("mxgraph.basic"), "{legacy}");
+        // legacy 输出再过 legacy 规范化仍幂等。
+        assert_eq!(canonicalize(&legacy, true).unwrap(), legacy);
+    }
+
+    #[test]
+    fn xmldoc_legacy_mode_consistent_across_edits() {
+        // 同一文档生命周期内编辑沿用构造时的兼容模式：
+        // 正常模式写入现代样式不被改写；legacy 模式才归一化。
+        let xml = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" style="rounded=1" vertex="1" parent="1"><mxGeometry x="0" y="0" width="40" height="40" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+        let modern_style = r#"<mxCell id="b" value="B" style="ellipse;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="60" y="0" width="40" height="40" as="geometry"/></mxCell>"#;
+
+        let mut doc = XmlDoc::from_text(xml).unwrap(); // 默认正常模式
+        let total = total_lines(&doc.text);
+        doc.apply_edit(total, total, modern_style).unwrap();
+        assert!(doc.text.contains(r#"style="ellipse;whiteSpace=wrap;""#), "{}", doc.text);
+        assert!(!doc.text.contains("shape=ellipse"), "{}", doc.text);
+
+        let mut ldoc = XmlDoc::from_text_with_legacy(xml, true).unwrap();
+        let total = total_lines(&ldoc.text);
+        ldoc.apply_edit(total, total, modern_style).unwrap();
+        assert!(ldoc.text.contains("shape=ellipse"), "{}", ldoc.text);
     }
 
     #[test]
     fn multiline_label_roundtrips_byte_exact() {
-        let c1 = canonicalize(SAMPLE).unwrap();
+        let c1 = canonicalize(SAMPLE, false).unwrap();
         assert!(c1.contains("Billing&#10;Service"));
         assert!(!c1.contains("&amp;#10;"), "double-escaped entity");
-        assert_eq!(canonicalize(&c1).unwrap(), c1);
+        assert_eq!(canonicalize(&c1, false).unwrap(), c1);
     }
 
     #[test]
     fn attr_order_and_unknown_content_preserved() {
         let xml = r#"<mxfile host="h" agent="a"><diagram id="z"><mxGraphModel><root><mxCell id="1" value="a &amp; b &lt;c&gt; &quot;d&quot;" vertex="1"><mxGeometry x="1" y="2" width="3" height="4" as="geometry"><Array as="points"><mxPoint x="0" y="0"/></Array></mxGeometry></mxCell></root></mxGraphModel></diagram></mxfile>"#;
-        let c1 = canonicalize(xml).unwrap();
+        let c1 = canonicalize(xml, false).unwrap();
         assert!(c1.contains("a &amp; b &lt;c&gt; &quot;d&quot;"));
         assert!(c1.contains("<Array as=\"points\">"));
-        assert_eq!(canonicalize(&c1).unwrap(), c1);
+        assert_eq!(canonicalize(&c1, false).unwrap(), c1);
     }
 
     #[test]
@@ -1400,16 +1472,16 @@ mod tests {
         let file = format!(
             r#"<mxfile host="app.diagrams.net"><diagram id="d1" name="p" compressed="true">{compressed}</diagram></mxfile>"#
         );
-        let c = canonicalize(&file).unwrap();
+        let c = canonicalize(&file, false).unwrap();
         assert!(c.contains("compressed=\"false\""));
         assert!(c.contains("<mxGraphModel dx=\"700\">"));
         assert!(c.contains("<mxCell id=\"0\"/>"));
-        assert_eq!(canonicalize(&c).unwrap(), c);
+        assert_eq!(canonicalize(&c, false).unwrap(), c);
     }
 
     #[test]
     fn index_finds_cell_line_ranges() {
-        let c = canonicalize(SAMPLE).unwrap();
+        let c = canonicalize(SAMPLE, false).unwrap();
         let cells = index(&c).unwrap();
         let a = cells.iter().find(|x| x.id == "svc-a").unwrap();
         assert_eq!(a.tag, "mxCell");
@@ -1482,7 +1554,7 @@ mod tests {
         assert!(rep.changed.is_empty());
         assert!(doc.id_to_cell("e1").is_none());
         // d1, 0, 1, svc-a, svc-b survive
-        assert_eq!(doc.cells.len(), 5);
+        assert_eq!(doc.cells().len(), 5);
     }
 
     #[test]
@@ -1580,13 +1652,13 @@ mod tests {
     #[test]
     fn index_rejects_duplicate_ids() {
         let xml = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="c" vertex="1" parent="0"/><mxCell id="c" vertex="1" parent="0"/></root></mxGraphModel></diagram></mxfile>"#;
-        assert!(index(&canonicalize(xml).unwrap()).is_err());
+        assert!(index(&canonicalize(xml, false).unwrap()).is_err());
     }
 
     #[test]
     fn check_reports_broken_refs() {
         let xml = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="c" vertex="1" parent="9"/><mxCell id="e" edge="1" parent="1" source="c" target="ghost"/></root></mxGraphModel></diagram></mxfile>"#;
-        let report = check_doc(&canonicalize(xml).unwrap()).unwrap();
+        let report = check_doc(&canonicalize(xml, false).unwrap()).unwrap();
         assert!(report.issues.iter().any(|i| i.contains("parent `9`")));
         assert!(report.issues.iter().any(|i| i.contains("missing target")));
         assert!(!report.issues.iter().any(|i| i.contains("source")));

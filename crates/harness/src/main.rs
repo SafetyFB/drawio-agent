@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use drawio_harness::chat::{Chat, OpenAiChat};
 use drawio_harness::history::{self, HistoryRec, SessionBundle};
 use drawio_harness::engine::Harness;
+use drawio_harness::turn_loop::HarnessRunExt;
 use drawio_harness::refs;
 use drawio_harness::tools::Tools;
 use drawio_harness::xmlfile::{check_doc, lines_in, XmlDoc};
@@ -31,18 +32,24 @@ fn numbered(text: &str, start: usize) -> String {
 }
 
 fn print_doc_summary(doc: &XmlDoc) {
-    let cells = doc.cells.iter().filter(|c| c.tag == "mxCell").count();
+    let cells = doc.cells().iter().filter(|c| c.tag == "mxCell").count();
     println!(
         "已加载 {}: {} 行, {} 个元素（其中 {} 个 mxCell）",
         doc.path.display(),
         doc.canonical().lines().count(),
-        doc.cells.len(),
+        doc.cells().len(),
         cells
     );
 }
 
 fn main() {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("tokio runtime: {e}");
+            std::process::exit(1);
+        }
+    };
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!(
@@ -102,7 +109,13 @@ fn main() {
                             "failed_asks": failures,
                         });
                     }
-                    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                    match serde_json::to_string_pretty(&out) {
+    Ok(s) => println!("{}", s),
+    Err(e) => {
+        eprintln!("json serialize: {e}");
+        std::process::exit(1);
+    }
+}
                 }
                 Err(e) => {
                     eprintln!("metrics 失败: {e}");
@@ -178,7 +191,10 @@ fn main() {
         };
         let path = PathBuf::from(file);
         if !path.exists() {
-            std::fs::write(&path, drawio_harness::EMPTY_TEMPLATE).expect("写文件失败");
+            if let Err(e) = std::fs::write(&path, drawio_harness::EMPTY_TEMPLATE) {
+                eprintln!("写文件失败: {e}");
+                std::process::exit(1);
+            }
             println!("已创建空图 {}", path.display());
         }
         (path, args[2..].to_vec())
@@ -196,7 +212,7 @@ fn main() {
         std::process::exit(2);
     }
 
-    let doc = match XmlDoc::load(&path) {
+    let doc = match XmlDoc::load_with_legacy(&path, !drawio_agent_renderer::drawio_app_cached()) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("加载失败: {e}");
@@ -401,7 +417,7 @@ fn main() {
                     let path = path.clone();
                     rt.block_on(async move {
                         let mut r = st.lock().await;
-                        match XmlDoc::load(&path) {
+                        match XmlDoc::load_with_legacy(&path, !drawio_agent_renderer::drawio_app_cached()) {
                             Ok(d) => {
                                 r.doc = d;
                                 println!("已重新加载。");
@@ -520,7 +536,7 @@ fn main() {
                             }
                         };
                         let p = r.doc.path.clone();
-                        match XmlDoc::from_text_at(&bundle.xml, &p) {
+                        match XmlDoc::from_text_at_with_legacy(&bundle.xml, &p, !drawio_agent_renderer::drawio_app_cached()) {
                             Ok(d) => {
                                 r.doc = d;
                                 let _ = r.doc.save();
@@ -539,7 +555,7 @@ fn main() {
                         println!(
                             "已加载会话 {}（{} cells，{} 条记忆消息）",
                             target,
-                            r.doc.cells.len(),
+                            r.doc.cells().len(),
                             r.usage.transcript.len()
                         );
                     });
@@ -648,7 +664,13 @@ async fn run_one_ask(
         }
     }));
     let ReplSession { harness, tools, doc, usage, chat, .. } = &mut *r;
-    let chat: &mut dyn Chat = chat.as_mut().expect("checked above").as_mut();
+    let chat: &mut dyn Chat = match chat.as_mut() {
+        Some(c) => c.as_mut(),
+        None => {
+            eprintln!("chat not available");
+            return Err("LLM 未配置".into());
+        }
+    };
     let outcome = harness
         .run(chat, tools, doc, &line, &ctx, &opts, usage, &progress)
         .await;
@@ -841,8 +863,11 @@ fn config_cli(args: &[String]) {
         }
         "clear" => match config::config_file_path() {
             Some(p) if p.exists() => {
-                std::fs::remove_file(&p).expect("删除配置文件失败");
-                println!("已删除 {}", p.display());
+                if let Err(e) = std::fs::remove_file(&p) {
+                    eprintln!("删除配置文件失败: {e}");
+                } else {
+                    println!("已删除 {}", p.display());
+                }
             }
             Some(p) => {
                 println!("配置文件不存在: {}", p.display());

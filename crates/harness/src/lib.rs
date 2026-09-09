@@ -11,9 +11,14 @@ pub const EMPTY_TEMPLATE: &str = r#"<mxfile host="app.diagrams.net" agent="drawi
 pub mod chat;
 pub mod config;
 pub mod engine;
+pub mod envelope;
+pub mod guards;
 pub mod history;
+pub mod memory;
+pub mod prompt;
 pub mod refs;
 pub mod tools;
+pub mod turn_loop;
 pub mod web;
 pub mod xmlfile;
 
@@ -21,7 +26,12 @@ pub use chat::{CallOpts, Chat, ChatError, Message, OpenAiChat, Reply, Usage};
 pub use config::{LlmSettings, ThinkingMode, mask_secret, usage_cost};
 
 pub mod metrics;
-pub use engine::{parse_envelope, EngineEvent, Harness, ProgressFn, RunOpts, SessionStats, TurnOutcome};
+pub use engine::{EngineEvent, Harness, ProgressFn, RunOpts, SessionStats, TurnOutcome};
+pub use envelope::parse_envelope;
+pub use guards::{check_budget, check_context_limit, price_opts};
+pub use memory::{trim_memory, fold_old_images, fold_old_reads, estimate_tokens, DEFAULT_MEMORY_TOKENS};
+pub use prompt::build_system_prompt;
+pub use turn_loop::HarnessRunExt;
 pub use history::{HistoryRec, SessionBundle};
 pub use refs::{resolve_refs, ResolvedRef};
 pub use tools::Tools;
