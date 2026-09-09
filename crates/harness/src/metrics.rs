@@ -437,6 +437,13 @@ pub fn analyze(xml: &str) -> Result<Report, String> {
     }
     report.stats.errors = report.errors.len();
 
+    let containers: std::collections::HashSet<&str> = cells
+        .iter()
+        .filter(|c| !c.is_edge)
+        .map(|c| c.parent.as_str())
+        .filter(|p| *p != "0" && *p != "1")
+        .collect();
+
     // warnings: 重叠（跳过祖先-后代）
     for i in 0..vertices.len() {
         for j in (i + 1)..vertices.len() {
@@ -526,7 +533,8 @@ pub fn analyze(xml: &str) -> Result<Report, String> {
                 });
             }
         }
-        // edge × vertex 矩形（跳过自己的源/目标）
+        // edge × vertex 矩形（跳过自己的源/目标；跳过容器——泳道内的边
+        // 天然在容器带内，绝对坐标换算后会误报「穿过容器」）
         let (id_e, se) = &segs[i];
         let edge = edges.iter().find(|e| e.id == *id_e).expect("edge from segs must exist in edges");
         for v in &vertices {
@@ -534,6 +542,7 @@ pub fn analyze(xml: &str) -> Result<Report, String> {
                 || edge.target.as_deref() == Some(v.id.as_str())
                 || v.w <= 0.0
                 || v.h <= 0.0
+                || containers.contains(v.id.as_str())
             {
                 continue;
             }

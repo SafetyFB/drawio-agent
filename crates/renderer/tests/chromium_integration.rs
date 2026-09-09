@@ -95,6 +95,26 @@ async fn chromium_hot_path_render_timings() {
     assert!(warm < cold, "warm render should beat cold launch: {warm:.1?} vs {cold:.1?}");
 }
 
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real browser"]
+async fn probe_r6_reroute() {
+    let _port = drawio_agent_renderer::init_static_server().await.unwrap();
+    let driver = HeadlessChromiumDriver::launch().await.unwrap();
+    let renderer = Renderer::new(std::sync::Arc::new(driver));
+    let xml = std::fs::read_to_string("/tmp/e2e/r6.drawio").unwrap();
+    let out = renderer.reroute(&xml).await.unwrap();
+    std::fs::write("/tmp/e2e/r6_rerouted.xml", &out).unwrap();
+    let n = out.matches("<Array").count();
+    let has_fc = out.contains("e_file_canvas") && {
+        // 找 e_file_canvas 的 Array
+        let i = out.find("e_file_canvas").unwrap();
+        let seg = &out[i..out.len().min(i + 600)];
+        seg.contains("<Array")
+    };
+    println!("arrays={n} e_file_canvas_routed={has_fc}");
+}
+
 /// libavoid 避障布线（drawio 内置 LibavoidRouting，headless 经插件执行）。
 /// 直连路径上有障碍节点 → 改写后的 XML 应带正交样式与避障拐点。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

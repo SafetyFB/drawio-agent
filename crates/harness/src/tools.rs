@@ -378,6 +378,23 @@ impl Tools {
     /// layout 调用拒绝（前两次放行，参数不同也算——±40px 换参数绕不过）。
     /// 局部平移解决不了交叉/重叠，模型需要「加拐点 / 重排 / 接受残余」
     /// 的策略提示而不是继续烧轮次（E2E 实测 7 连发）。
+    /// 按需拉起渲染器（view/route 共用）：route 是常被首先调用的工具，
+    /// 不能等 view 先跑一次才具备 libavoid 能力。
+    async fn ensure_renderer(
+        &mut self,
+    ) -> Result<Arc<drawio_agent_renderer::Renderer>, String> {
+        if let Some(r) = &self.renderer {
+            return Ok(r.clone());
+        }
+        let driver = drawio_agent_renderer::HeadlessChromiumDriver::launch().await;
+        let driver = driver.map_err(|e| {
+            format!("chromium 启动失败: {e}（可设 DRAWIO_AGENT_CHROMIUM_PATH 指定路径）")
+        })?;
+        let r = Arc::new(drawio_agent_renderer::Renderer::new(Arc::new(driver)));
+        self.renderer = Some(r.clone());
+        Ok(r)
+    }
+
     fn check_nudge(&mut self, op: &str, ids: &[String]) -> Result<(), String> {
         let mut sorted = ids.to_vec();
         sorted.sort();
@@ -599,31 +616,35 @@ impl Tools {
             if ids.is_empty() {
                 return Err("route ids 不能为空".to_string());
             }
-            if let Some(renderer) = &self.renderer {
-                match renderer.reroute(doc.canonical()).await {
-                    Ok(new_xml) => {
-                        let (start, end) = (1usize, total_lines(doc.canonical()));
-                        return match doc.apply_edit(start, end, &new_xml) {
-                            Ok(report) if report.noop => Ok(ToolOutput::text(
-                                "no-op：libavoid 布线后无变化，布局已是正交且无遮挡。",
-                            )),
-                            Ok(report) => {
-                                doc.save().map_err(|e| format!("保存失败: {e}"))?;
-                                self.edit_streak = 0;
-                                self.last_edit_key = None;
-                                self.nudge_counts.clear();
-                                Ok(ToolOutput::text(format!(
-                                    "已应用 libavoid 避障布线并保存。{}",
-                                    report_summary(&report)
-                                )))
-                            }
-                            Err(e) => Err(format!(
-                                "libavoid 布线结果被拒绝（文件未改动）: {e}\n{}",
-                                reject_hint(&e)
-                            )),
-                        };
+            if self.render {
+                if let Ok(renderer) = self.ensure_renderer().await {
+                    match renderer.reroute(doc.canonical()).await {
+                        Ok(new_xml) => {
+                            let (start, end) = (1usize, total_lines(doc.canonical()));
+                            return match doc.apply_edit(start, end, &new_xml) {
+                                Ok(report) if report.noop => Ok(ToolOutput::text(
+                                    "no-op：libavoid 布线后无变化，布局已是正交且无遮挡。",
+                                )),
+                                Ok(report) => {
+                                    doc.save().map_err(|e| format!("保存失败: {e}"))?;
+                                    self.edit_streak = 0;
+                                    self.last_edit_key = None;
+                                    self.nudge_counts.clear();
+                                    Ok(ToolOutput::text(format!(
+                                        "已应用 libavoid 避障布线并保存。{}",
+                                        report_summary(&report)
+                                    )))
+                                }
+                                Err(e) => Err(format!(
+                                    "libavoid 布线结果被拒绝（文件未改动）: {e}\n{}",
+                                    reject_hint(&e)
+                                )),
+                            };
+                        }
+                        Err(e) => {
+                            eprintln!("libavoid reroute 不可用，回退确定性路由: {e}");
+                        }
                     }
-                    Err(_) => { /* 回退到确定性路由 */ }
                 }
             }
             // 确定性兜底：候选路径逐段与节点矩形求交（无浏览器时可用）。
@@ -635,11 +656,20 @@ impl Tools {
                     .find(|c| c.id == id && !c.is_edge && c.w > 0.0)
                     .map(|c| (c.x, c.y, c.w, c.h))
             };
-            // 障碍 = 除源/目标及其祖先链（泳道容器）外的所有顶点
+            // 障碍 = 除源/目标及其祖先链外的**叶子**顶点。泳道等容器
+            // 不入障碍（跨泳道走线合法；否则容器矩形挡死一切候选路径，
+            // 实测跨泳道边全部无解 → route 永远 no-op）。
+            let containers: std::collections::HashSet<&str> = geom
+                .iter()
+                .filter(|c| !c.is_edge)
+                .map(|c| c.parent.as_str())
+                .filter(|p| *p != "0" && *p != "1")
+                .collect();
             let obstacles_for = |src: &str, dst: &str| -> Vec<(f64, f64, f64, f64)> {
                 geom
                     .iter()
                     .filter(|c| !c.is_edge && c.w > 0.0 && c.id != src && c.id != dst)
+                    .filter(|c| !containers.contains(c.id.as_str()))
                     .filter(|c| {
                         !crate::metrics::is_ancestor(&c.id, src, &geom)
                             && !crate::metrics::is_ancestor(&c.id, dst, &geom)
@@ -1033,23 +1063,7 @@ impl Tools {
                  要看局部细节可加 focus 参数；改动后再 view 会得到新图。",
             ));
         }
-        let renderer = match &self.renderer {
-            Some(r) => r.clone(),
-            None => {
-                let driver = drawio_agent_renderer::HeadlessChromiumDriver::launch().await;
-                let driver = match driver {
-                    Ok(d) => d,
-                    Err(e) => {
-                        return Err(format!(
-                            "chromium 启动失败: {e}（可设 DRAWIO_AGENT_CHROMIUM_PATH 指定路径）"
-                        ))
-                    }
-                };
-                let r = Arc::new(drawio_agent_renderer::Renderer::new(Arc::new(driver)));
-                self.renderer = Some(r.clone());
-                r
-            }
-        };
+        let renderer = self.ensure_renderer().await?;
         match renderer.render(doc.canonical(), &opts).await {
             Ok(png) => {
                 if !open {
