@@ -15,6 +15,9 @@ pub struct HistoryRec {
     /// unix seconds
     pub ts: u64,
     pub user: String,
+    /// 发送时附带选中的 cell ids（UI 徽章用；旧历史无此字段 → 空）
+    #[serde(default)]
+    pub cell_ids: Vec<String>,
     #[serde(default)]
     pub reply: String,
     #[serde(default)]

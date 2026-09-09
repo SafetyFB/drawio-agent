@@ -986,7 +986,7 @@ async fn api_chat_stream(
             };
             let mk_rec = |user: &str, evs: &[serde_json::Value],
                               out: &Result<TurnOutcome, String>,
-                              ui: u64, uo: u64| {
+                              ui: u64, uo: u64, ids: Vec<String>| {
                 let (reply, error) = match out {
                     Ok(o) => (o.reply.clone(), None),
                     Err(e) => (String::new(), Some(e.to_string())),
@@ -998,6 +998,7 @@ async fn api_chat_stream(
                 HistoryRec {
                     ts: history::now_secs(),
                     user: user.to_string(),
+                    cell_ids: ids,
                     reply,
                     tool_calls: calls,
                     usage_in: ui,
@@ -1014,6 +1015,7 @@ async fn api_chat_stream(
                 &outcome,
                 usage_main.0,
                 usage_main.1,
+                req.cell_ids.clone(),
             );
             if let Err(e) = history::append(&history::history_path(&doc.path), &rec1) {
                 eprintln!("history 落盘失败: {e}");
@@ -1029,6 +1031,7 @@ async fn api_chat_stream(
                     o2,
                     self_usage.0,
                     self_usage.1,
+                    Vec::new(),
                 );
                 if let Err(e) = history::append(&history::history_path(&doc.path), &rec2) {
                     eprintln!("history 落盘失败: {e}");

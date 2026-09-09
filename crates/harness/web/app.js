@@ -29,6 +29,23 @@ function guardBusy() {
 
 const $ = (id) => document.getElementById(id);
 
+/// 用户消息气泡：带选中引用时在文本上方加徽章（📎 + ids，悬停看完整清单）
+function logUser(text, ids) {
+  const div = document.createElement('div');
+  div.className = 'msg user';
+  if (ids && ids.length) {
+    const b = document.createElement('span');
+    b.className = 'ref-badge';
+    const list = ids.join(', ');
+    b.textContent = ids.length <= 3 ? '📎 ' + list : '📎 引用 ' + ids.length + ' 个 cell';
+    b.title = '该消息随附的选中引用：' + list;
+    div.appendChild(b);
+  }
+  div.appendChild(document.createTextNode(text));
+  $('chatlog').appendChild(div);
+  $('chatlog').scrollTop = $('chatlog').scrollHeight;
+}
+
 // ---------------------------------------------------------------------------
 // Canvas: load xml -> mxGraph
 // ---------------------------------------------------------------------------
@@ -1175,6 +1192,15 @@ async function handleStreamEvent(ev) {
   }
 }
 
+// Enter 发送（Shift+Enter 换行；输入法组词中不触发；任务运行中 Enter 不误触取消）
+$('input').addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Enter' || ev.shiftKey) return;
+  if (ev.isComposing || ev.keyCode === 229) return; // 中文输入法组词
+  if (busy) return;
+  ev.preventDefault();
+  $('chatform').requestSubmit();
+});
+
 $('chatform').onsubmit = async (ev) => {
   ev.preventDefault();
   if (busy) { await cancelJob(); return; }
@@ -1187,7 +1213,7 @@ $('chatform').onsubmit = async (ev) => {
   $('send').textContent = '停止';
   $('send').classList.add('danger');
   const ids = selectedIds.slice();
-  log('user', text);
+  logUser(text, ids);
   $('input').value = '';
   setSelection([]);
   try {
@@ -1531,7 +1557,7 @@ async function renderHistoryIntoChat() {
   divider.textContent = '── 历史记录 ──';
   $('chatlog').appendChild(divider);
   for (const r of recs) {
-    logMsg('user', r.user);
+    logUser(r.user, r.cell_ids || []);
     for (const ev of r.events || []) {
       const t = ev.type;
       if (t === 'ask_sep') logMsg('tool-note', '── 🔍 自动自检轮（系统追加的成图检查）──');

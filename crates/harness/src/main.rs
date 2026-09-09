@@ -692,6 +692,7 @@ async fn run_one_ask(
     let rec = HistoryRec {
         ts: history::now_secs(),
         user: line.clone(),
+        cell_ids: Vec::new(), // REPL 的引用在文本里（@refs），无独立选择集
         reply,
         tool_calls: tool_calls as u32,
         usage_in: usage.usage.input_tokens,
