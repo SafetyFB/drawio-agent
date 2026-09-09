@@ -18,20 +18,27 @@ pretty-print 的 `.drawio` 文件。局部性靠「文件 + 行区间文本编�
   `{"reply": ..., "done": true}`；工具结果回填下一轮。`view` 会把渲染截图
   作为图像消息直接发给模型（视觉闭环在一条对话里完成）。任意的
   OpenAI-compatible 端点即可接入（需支持视觉时用多模态模型）。
+- **防循环守卫**：模型复读同一操作（同参 no-op、同组微调、无进展连击）
+  会被逐层拦截——只拦原地踏步，真实进展自动清零；任务结束若成图尚未
+  查看（或查看后又改过），系统自动追加一轮自检。
 - **工具五类**：
   - 查询 `read`（`range` 读行区间 / `cells` 批量读多实体 / `query` 按文本搜
-    cell / `outline` 全图概览——每实体一行「行区间 | id | 类型 | 标签」）
+    cell（命中带当前坐标）/ `outline` 全图概览——每实体一行「行区间 | id | 类型 | 标签」）
   - 内容 `edit`（单区间或批量 `ranges`，全或无原子落盘）、`draw`（整图重建）
-  - 几何 `layout`（`move` 批量平移/绝对定位、`align` 对齐/等距；结果带新坐标）
-  - 校验 `check`（结构 + 布局 lint 摘要：重叠/交叉/标签溢出/越界/分支平行）
+  - 几何 `layout`：`move` 批量平移/绝对定位（坐标相对父容器）、`align`
+    对齐/等距、`route` 避障布线（复用 drawio 内置 libavoid 求解器无头
+    运行，保证线不穿节点；缺省全图，无渲染器时回退确定性路由；结果带
+    每个 cell 的新坐标）
+  - 校验 `check`（结构 + 布局 lint 摘要：重叠/连线交叉/穿节点/长直线边/
+    标签溢出/越界/分支平行/孤立节点）
   - 感知 `view`（截图，`annotate` id 徽章标注、`focus` 局部裁剪放大）
 
 ## 构建与首次运行
 
 ```bash
 cargo build
-cargo test -p drawio-harness          # 86 tests
-cargo test -p drawio-agent-renderer   # 校验/渲染测试
+cargo test --workspace                # 132 tests（harness + renderer）
+cargo test -p drawio-agent-renderer --test chromium_integration -- --ignored   # 真浏览器集成测试
 ```
 
 首次使用时会按需下载两个依赖（均为钉住版本 + SHA-256 校验，缓存于
@@ -75,12 +82,16 @@ cargo run -p drawio-harness -- web 4000  # 自定义端口
 
 ### 聊天（AI 画图）
 
-- 输入消息回车发送；模型自主调用 read / edit / draw / check / view / layout
-  工具闭环改图，每轮工具调用与 token 花费**实时流式**渲染，发送中可「停止」。
+- 输入消息回车发送（Shift+Enter 换行）；模型自主调用
+  read / edit / draw / check / view / layout 工具闭环改图，每轮工具调用
+  与 token 花费**实时流式**渲染，发送中可「停止」。
 - **多轮记忆**：每轮随上下文注入（超限自动裁剪），随会话持久化，重启/切换
   会话恢复。
 - **选中即引用**：画布上点选 / 框选的 cell 会随下一条消息自动附带
-  （`@cell:boxA`），历史消息附带当时的选中信息。
+  （`@cell:boxA`）；消息气泡以 📎 徽章标出所带引用，历史消息同样回放。
+- **自动自检轮**：任务结束时若成图从未被 view 查看（或查看后又改过图），
+  系统自动追加一轮「view + 修最明显问题」的质量自检，聊天流中会显示
+  自检分隔条。
 - **用量与预算**：每个会话独立统计 token 与花费，超出预算拒绝执行；页面
   底部实时显示，历史轨迹存 `<name>.history.jsonl`。
 - **历史 = 聊天流**：重新打开或切换会话时，上次对话、工具轨迹、用量按时间
@@ -129,11 +140,18 @@ REPL 常用命令：`/history`（`/history N` 看轨迹）`/ctx-save x.json`
 
 | 路径 | 内容 |
 |---|---|
-| `crates/harness/src/xmlfile.rs` | 规范化 / 解压 / 校验 / span 索引 / 行区间编辑 |
+| `crates/harness/src/xmlfile.rs` | 规范化 / 解压 / 校验 / span 索引 / 行区间编辑（全系统唯一写路径） |
+| `crates/harness/src/metrics.rs` | 几何解析（绝对坐标/容器树）+ 布局 lint（重叠/交叉/穿节点/直线边…） |
 | `crates/harness/src/refs.rs` | @ 引用解析与上下文注入 |
-| `crates/harness/src/tools.rs` | read edit draw check view layout |
+| `crates/harness/src/tools_meta.rs` | 工具名与说明书（prompt 与分派共享的单一来源） |
+| `crates/harness/src/tools.rs` | read edit draw check view layout（libavoid 避障布线在 layout route） |
+| `crates/harness/src/envelope.rs` | JSON 信封解析与纠错（散文收尾抢救也在此） |
+| `crates/harness/src/engine.rs` | Harness 入口与用量/预算/上下文记账、进度事件定义 |
+| `crates/harness/src/turn_loop.rs` | 模型主循环：分派、重试、防循环守卫（同参/同组/无进展连击） |
+| `crates/harness/src/guards.rs` | 守卫判定纯函数 |
+| `crates/harness/src/prompt.rs` | 系统提示词组装（legacy 回退模式切换） |
 | `crates/harness/src/chat.rs` | OpenAI-compatible chat（text + image parts） |
-| `crates/harness/web/` + `web.rs` | Web 入口：多会话、流式进度/打断、历史重放、drawio iframe 编辑器 + sel 插件桥（离线回退 mxGraph 画布） |
-| `crates/harness/src/engine.rs` | JSON 信封循环、用量/预算/上下文守卫 |
+| `crates/harness/src/memory.rs` / `history.rs` / `config.rs` | 多轮记忆 / 轨迹与会话状态落盘 / LLM 配置 |
+| `crates/harness/web/` + `web.rs` | Web 入口：多会话、SSE 流式进度/取消、自检轮、历史重放、drawio iframe 编辑器 + sel 插件桥（离线回退 mxGraph 画布） |
 | `crates/harness/src/main.rs` | CLI 入口（web / REPL / one-shot / new / config） |
-| `crates/renderer` | 无头渲染：drawio webapp 获取（draw.war）+ 原生 export 协议驱动（headless-shell 为宿主） |
+| `crates/renderer` | 无头渲染：drawio webapp 获取（draw.war）+ chrome 下载兜底 + CDP 驱动（`driver/chromium.rs`）；`drawio_server.rs` 内置 wrapper 与 export 插件（截图标注 / libavoid 无头布线共用一条 export 通道） |
