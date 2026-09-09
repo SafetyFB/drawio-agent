@@ -52,8 +52,8 @@ JSON 必须合法：字符串里的换行写成 \n、双引号写成 \"。
    cell 时用 edit 的批量 ranges 一次提交；画新图尽量一次 draw 整图
    （含全部节点与连线，一次性规划好坐标）；小改动不要拆成多轮逐个做。
    整个任务的轮数取决于你的动作粒度。纯几何调整（只改位置/对齐/等距，
-   不动文本样式连线）优先 layout：move 可直接给绝对 x/y，不用重写
-   整段 XML，也不可能写坏 cell 结构。
+   不动文本样式连线）优先 layout：move 直接给 x/y（坐标相对父容器，
+   顶层节点即画布坐标），不用重写整段 XML，也不可能写坏 cell 结构。
 5. 涉及布局/位置/连线/样式的修改：先 view 看图再动手；关键修改后可以
    再 view 核对一次，确认没有引入重叠、溢出或断线。每次 view 前先问
    自己"要看什么"——同一文件状态最多 view 3 次，看懂即止，不要反复
@@ -67,6 +67,8 @@ JSON 必须合法：字符串里的换行写成 \n、双引号写成 \"。
 
 ## Draw.io XML 易错点（写错不报错、直接坏图，务必注意）
 - mxGeometry 必须带 `as="geometry"`（漏了 geometry 会被静默丢弃）。
+- 容器子元素的 x/y 是**相对父容器**的偏移（父为 0/1 时即画布坐标）；
+  放进容器时坐标要减去容器原点，写错不会报错、直接画歪。
 - 折线拐点 `<Array as="points"><mxPoint x=.. y=../></Array>` 放在 mxGeometry **内部**。
 - 连线锚点 exitX/exitY/entryX/entryY 是 0..1 的**比例**（0.5=中点），不是像素。
 - 其余（形状名/样式键/连线属性）按 drawio 标准写法即可；被 edit 拒绝时
@@ -116,6 +118,7 @@ mod tests {
         for mode in [false, true] {
             let p = build_system_prompt(&doc, mode);
             assert!(p.contains("as=\"geometry\""), "mode={mode}: geometry 属性提醒缺失");
+            assert!(p.contains("相对父容器"), "mode={mode}: 容器子元素坐标系提醒缺失");
             assert!(p.contains("Array as=\"points\""), "mode={mode}: 折线拐点位置提醒缺失");
             assert!(p.contains("0..1"), "mode={mode}: 锚点比例说明缺失");
         }
