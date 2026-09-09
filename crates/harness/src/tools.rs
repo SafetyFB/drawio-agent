@@ -84,6 +84,11 @@ pub struct Tools {
     /// nudge（参数每次都变，turn_loop 的同参守卫抓不到），7 连发烧尽
     /// 预算。第 3 次拒绝并给策略建议。
     nudge_counts: std::collections::HashMap<String, u32>,
+    /// 同组连续 edit 守卫：连续触达同一批 cell 的第 3 次 edit 被拒绝。
+    /// E2E 实测：模型给边加锚点后 view 闭环微调，e9/e10 连续 edit 3+ 次
+    /// 烧尽 30 轮（每次参数都不同，其他守卫抓不到）。draw 重画后重置。
+    last_edit_key: Option<String>,
+    edit_streak: u32,
 }
 
 impl std::fmt::Debug for Tools {
@@ -117,13 +122,27 @@ const MAX_READ_LINES: usize = 150;
 
 impl Tools {
     pub fn new(render: bool) -> Self {
-        Self { render, renderer: None, last_view: None, nudge_counts: Default::default() }
+        Self {
+            render,
+            renderer: None,
+            last_view: None,
+            nudge_counts: Default::default(),
+            last_edit_key: None,
+            edit_streak: 0,
+        }
     }
 
     /// Test seam: inject a canned renderer (e.g. built on
     /// `drawio_agent_renderer::MockDriver`) so `view` works without chromium.
     pub fn with_renderer(renderer: drawio_agent_renderer::Renderer) -> Self {
-        Self { render: true, renderer: Some(Arc::new(renderer)), last_view: None, nudge_counts: Default::default() }
+        Self {
+            render: true,
+            renderer: Some(Arc::new(renderer)),
+            last_view: None,
+            nudge_counts: Default::default(),
+            last_edit_key: None,
+            edit_streak: 0,
+        }
     }
 
 /// Tool docs embedded in the system prompt.
@@ -440,9 +459,26 @@ impl Tools {
             let ids_for_key: Vec<String> = items.iter().map(|(id, _)| id.clone()).collect();
             self.check_nudge("move", &ids_for_key)?;
             for (id, spec) in &items {
-                let (x, y, w, h) = doc
-                    .geometry_of(id)
-                    .ok_or_else(|| format!("cell `{id}` 不存在或其几何不可读"))?;
+                let (x, y, w, h) = match doc.geometry_of(id) {
+                    Some(g) => g,
+                    None => {
+                        // 存在但几何不可读 → 多半是边（无绝对坐标），给
+                        // 可执行的替代方案而不是含混的「不可读」
+                        let is_edge = doc.id_to_cell(id).is_some_and(|c| {
+                            let slice =
+                                lines_in(doc.canonical(), c.start_line, c.end_line);
+                            attr_value(&slice, "edge").as_deref() == Some("1")
+                        });
+                        if is_edge {
+                            return Err(format!(
+                                "`{id}` 是边（edge），没有绝对几何，不能参与 layout。\
+                                 调整边路由请用 edit：改锚点（exitX/entryY 全给 0..1 比例）\
+                                 或加拐点 <Array as=\"points\"> 放 mxGeometry 内"
+                            ));
+                        }
+                        return Err(format!("cell `{id}` 不存在或其几何不可读"));
+                    }
+                };
                 let (nx, ny) = match spec {
                     MoveSpec::Delta(dx, dy) => (x + dx, y + dy),
                     MoveSpec::Place(px, py) => (px.unwrap_or(x), py.unwrap_or(y)),
@@ -678,7 +714,9 @@ impl Tools {
                 }
                 Ok(report) => {
                     doc.save().map_err(|e| format!("保存失败: {e}"))?;
-                    // 内容变了：同组微调计数重置（edit 后重新布局是合法的新策略）
+                    // draw = 整图重画，新内容：同组 edit/layout 计数全部重置
+                    self.edit_streak = 0;
+                    self.last_edit_key = None;
                     self.nudge_counts.clear();
                     Ok(ToolOutput::text(format!(
                         "编辑已应用并保存。{}",
@@ -723,6 +761,39 @@ impl Tools {
             vec![(start, end, text.to_string())]
         };
 
+        // 同组连续 edit 守卫（放宽版）：连续触达同一批 cell 的**成功** edit
+        // 计数，第 4 次拒绝。失败的 edit（解析错误→修正重试同区间）不计数，
+        // 属于合法恢复。锚点/样式的视觉微调循环每次参数都不同，只有「触达
+        // 同一批 cell」这个特征稳定；拒绝后状态保留（不重置），持续复读
+        // 会被 turn_loop 的无进展连击终止。
+        let touched: Vec<String> = {
+            let mut ids: Vec<String> = doc
+                .cells()
+                .iter()
+                .filter(|c| {
+                    batch
+                        .iter()
+                        .any(|&(s, e, _)| !(c.end_line < s || c.start_line > e))
+                })
+                .map(|c| c.id.clone())
+                .collect();
+            ids.sort();
+            ids.dedup();
+            ids
+        };
+        let key = touched.join(",");
+        let same_as_last = self.last_edit_key.as_deref() == Some(key.as_str());
+        if same_as_last && self.edit_streak >= 3 {
+            return Err(format!(
+                "同一组 cell（{}）已连续成功 edit {} 次——别再对同一处做第 4 次微调，继续只会烧轮次。换一种做法：\
+                 1) 接受现状，用 reply 收尾（残余视觉瑕疵是可接受的）；\
+                 2) 对边路由问题改锚点组合（exitX/entryY 全部给 0..1 比例）或加拐点 <Array as=\"points\">；\
+                 3) 该区域实在不满意就 draw 重画。注意：本次调用未执行。",
+                touched.join(","),
+                self.edit_streak
+            ));
+        }
+
         // 全或无：内存内一次应用 + 单次校验，通过才原子落盘
         match doc.apply_edits(&batch) {
             Ok(report) if report.noop => Ok(ToolOutput::text(
@@ -731,6 +802,13 @@ impl Tools {
             )),
             Ok(report) => {
                 doc.save().map_err(|e| format!("保存失败: {e}"))?;
+                // 成功的非 no-op edit 才推进同组计数（失败的 edit 是合法恢复）
+                if same_as_last {
+                    self.edit_streak += 1;
+                } else {
+                    self.edit_streak = 1;
+                    self.last_edit_key = Some(key);
+                }
                 // 内容变了：同组微调计数重置（edit 后重新布局是合法的新策略）
                 self.nudge_counts.clear();
                 Ok(ToolOutput::text(format!(
@@ -1315,6 +1393,69 @@ mod tests {
         t.run(&mut d, "layout", &serde_json::json!({
             "move": [{"id": "svc-a", "x": 60, "y": 60}]
         })).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_same_group_guard_rejects_fourth() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        let mk = |v: String| {
+            serde_json::json!({
+                "range": "cell:svc-a",
+                "text": format!(r#"<mxCell id="svc-a" value="{v}" vertex="1" parent="1"><mxGeometry x="40" y="60" width="160" height="60" as="geometry"/></mxCell>"#)
+            })
+        };
+        // 连续 3 次同组成功 edit 放行
+        for v in ["A1", "A2", "A3"] {
+            t.run(&mut d, "edit", &mk(v.into())).await.unwrap();
+        }
+        let err = t.run(&mut d, "edit", &mk("A4".into())).await.unwrap_err();
+        assert!(err.contains("连续成功 edit 3 次"), "{err}");
+        assert!(err.contains("本次调用未执行"), "{err}");
+        // 换另一组：放行且重置同组计数
+        t.run(&mut d, "edit", &serde_json::json!({
+            "range": "cell:svc-b",
+            "text": r#"<mxCell id="svc-b" value="B1" vertex="1" parent="1"><mxGeometry x="260" y="60" width="160" height="60" as="geometry"/></mxCell>"#
+        })).await.unwrap();
+        // 回到 svc-a：新的一轮，放行
+        t.run(&mut d, "edit", &mk("A5".into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_edits_do_not_count_toward_streak() {
+        let mut d = two_cell_doc();
+        let mut t = Tools::new(false);
+        // 解析失败（ill-formed）不计数：之后同组 3 次成功仍放行
+        for _ in 0..2 {
+            assert!(t.run(&mut d, "edit", &serde_json::json!({
+                "range": "cell:svc-a", "text": "<mxCell>"
+            })).await.is_err());
+        }
+        let mk = |v: String| {
+            serde_json::json!({
+                "range": "cell:svc-a",
+                "text": format!(r#"<mxCell id="svc-a" value="{v}" vertex="1" parent="1"><mxGeometry x="40" y="60" width="160" height="60" as="geometry"/></mxCell>"#)
+            })
+        };
+        for v in ["A1", "A2", "A3"] {
+            t.run(&mut d, "edit", &mk(v.into())).await.unwrap();
+        }
+        assert!(t.run(&mut d, "edit", &mk("A4".into())).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn layout_on_edge_gets_specific_error() {
+        let xml = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" vertex="1" parent="1"><mxGeometry x="40" y="60" width="100" height="50" as="geometry"/></mxCell><mxCell id="b" value="B" vertex="1" parent="1"><mxGeometry x="240" y="60" width="100" height="50" as="geometry"/></mxCell><mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle" edge="1" parent="1" source="a" target="b"><mxGeometry relative="1" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+        let mut d = XmlDoc::from_text(xml).unwrap();
+        let mut t = Tools::new(false);
+        let err = t
+            .run(&mut d, "layout", &serde_json::json!({
+                "move": [{"id": "e1", "dx": 10, "dy": 0}]
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("边（edge）"), "{err}");
+        assert!(err.contains("拐点"), "错误应给可执行替代方案: {err}");
     }
 
     #[tokio::test]
