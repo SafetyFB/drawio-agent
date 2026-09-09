@@ -551,10 +551,16 @@ impl Tools {
             return Err("layout 需要 move 或 align 参数".to_string());
         }
         if edits.is_empty() {
-            return Ok(ToolOutput::text("no-op：几何无需调整。"));
+            return Ok(ToolOutput::text(
+                "no-op：目标坐标与现状一致，几何未变。若仍想移动，请给出与当前不同的\
+                 绝对坐标（query 命中里 geo= 就是当前值）；若布局已满意，请继续下一步。",
+            ));
         }
         match doc.apply_edits(&edits) {
-            Ok(report) if report.noop => Ok(ToolOutput::text("no-op：内容与当前文件相同，未修改。")),
+            Ok(report) if report.noop => Ok(ToolOutput::text(
+                "no-op：改动后的内容与现状一致，文件未变。若仍想修改，请给出与当前不同的\
+                 内容；若已满意，请继续下一步（用 {\"reply\": …, \"done\": true} 收尾）。",
+            )),
             Ok(report) => {
                 doc.save().map_err(|e| format!("保存失败: {e}"))?;
                 // 结果坐标直接回报：模型不用再 read 确认（省一轮）。
@@ -665,7 +671,10 @@ impl Tools {
             let (start, end) = (1usize, total_lines(doc.canonical()));
             return match doc.apply_edit(start, end, &xml) {
                 Ok(report) if report.noop => {
-                    Ok(ToolOutput::text("no-op：内容与当前文件相同，未修改。"))
+                    Ok(ToolOutput::text(
+                        "no-op：替换后的内容与现状一致，文件未变。若仍想修改，请给出与当前不同的\
+                         内容；若已满意，请继续下一步（用 {\"reply\": …, \"done\": true} 收尾）。",
+                    ))
                 }
                 Ok(report) => {
                     doc.save().map_err(|e| format!("保存失败: {e}"))?;
@@ -716,7 +725,10 @@ impl Tools {
 
         // 全或无：内存内一次应用 + 单次校验，通过才原子落盘
         match doc.apply_edits(&batch) {
-            Ok(report) if report.noop => Ok(ToolOutput::text("no-op：内容与当前文件相同，未修改。")),
+            Ok(report) if report.noop => Ok(ToolOutput::text(
+                "no-op：替换后的内容与现状一致，文件未变。若仍想修改，请给出与当前不同的\
+                 内容；若已满意，请继续下一步（用 {\"reply\": …, \"done\": true} 收尾）。",
+            )),
             Ok(report) => {
                 doc.save().map_err(|e| format!("保存失败: {e}"))?;
                 // 内容变了：同组微调计数重置（edit 后重新布局是合法的新策略）

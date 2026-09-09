@@ -80,6 +80,12 @@ impl HarnessRunExt for Harness {
         // 同参调用计数（自上次成功改图起算）：模型以 2-3 个查询周期打转
         // 时参数并不连续相同，只有跨轮计数能拦住（E2E 实测烧尽 30 轮）。
         let mut repeat_counts: std::collections::HashMap<String, u32> = Default::default();
+        // 无进展连击：守卫拒绝 / 工具失败 / no-op / view 未变化都算原地
+        // 踏步，任何真实进展清零。连续 6 步主动中止——否则弱模型会复读
+        // 同一调用直到烧满 30 轮（E2E 实测：layout no-op 后拒绝路径循环，
+        // UI 只见轮次递增、不见任何工具执行）。
+        const MAX_NO_PROGRESS: u32 = 6;
+        let mut no_progress = 0u32;
 
         let mut spent: f64 = 0.0;
         let mut usage = Usage::default();
@@ -288,22 +294,59 @@ impl HarnessRunExt for Harness {
             // 结果不会变化，多半是模型在空转兜圈（实测曾以 read query 循环
             // 烧尽 30 轮预算）。拒绝并教学，不计数、不中止。
             if last_ok_call.as_ref() == Some(&(name.to_string(), args_key.clone())) {
-                history.push(Message::assistant(raw.clone()));
-                history.push(Message::user(format!(
-                    "与上一轮完全相同的 `{name}` 调用被拒绝：参数未变，结果也不会变。\
+                let msg = "与上一轮完全相同的调用被拒绝：参数未变，结果也不会变。\
                      要看内容请用 read 的 range/cells/outline（query 命中里已带 geo 坐标），\
-                     要改图请用 edit/layout；若上一步结果不符合预期，请改变参数或换一种做法。"
-                )));
+                     要改图请用 edit/layout；若上一步结果不符合预期，请改变参数或换一种做法。";
+                emit!(EngineEvent::Tool {
+                    name: name.to_string(),
+                    args: args_key.clone(),
+                });
+                emit!(EngineEvent::ToolResult {
+                    name: name.to_string(),
+                    text: format!("（守卫拒绝）{msg}"),
+                    has_image: false,
+                });
+                history.push(Message::assistant(raw.clone()));
+                history.push(Message::user(msg));
+                no_progress += 1;
+                if no_progress >= MAX_NO_PROGRESS {
+                    stats.add(&usage, spent);
+                    remember!();
+                    return Err(format!(
+                        "连续 {no_progress} 步没有产生任何进展（重复调用被拒绝），已中止。\
+                         已完成的修改都保留在文件里。建议：把任务拆小、明确指出目标节点，或换一种问法。"
+                    ));
+                }
                 continue;
             }
             let repeats = repeat_counts.entry(format!("{name} {args_key}")).or_insert(0);
             if *repeats >= 2 {
-                history.push(Message::assistant(raw.clone()));
-                history.push(Message::user(format!(
+                let msg = format!(
                     "`{name}` 已用完全相同的参数成功执行 {} 次，第 {} 次被拒绝：文件未变，结果不会变。\
-                     这通常说明在原地打转——要么直接推进任务（edit/layout 改图），要么换一种查询。"
-                    , *repeats, *repeats + 1
-                )));
+                     这通常说明在原地打转——要么直接推进任务（edit/layout 改图），要么换一种查询。",
+                    *repeats,
+                    *repeats + 1
+                );
+                emit!(EngineEvent::Tool {
+                    name: name.to_string(),
+                    args: args_key.clone(),
+                });
+                emit!(EngineEvent::ToolResult {
+                    name: name.to_string(),
+                    text: format!("（守卫拒绝）{msg}"),
+                    has_image: false,
+                });
+                history.push(Message::assistant(raw.clone()));
+                history.push(Message::user(msg));
+                no_progress += 1;
+                if no_progress >= MAX_NO_PROGRESS {
+                    stats.add(&usage, spent);
+                    remember!();
+                    return Err(format!(
+                        "连续 {no_progress} 步没有产生任何进展（原地打转被拒绝），已中止。\
+                         已完成的修改都保留在文件里。建议：把任务拆小、明确指出目标节点，或换一种问法。"
+                    ));
+                }
                 continue;
             }
             *repeats += 1;
@@ -332,6 +375,21 @@ impl HarnessRunExt for Harness {
                 text: result.text.clone(),
                 has_image: result.image_png.is_some(),
             });
+            // 无进展判定：no-op/失败/未变化算原地踏步，真实进展清零。
+            // 连击达到阈值主动中止（否则复读循环烧满 30 轮）。
+            if is_no_progress_text(&result.text) {
+                no_progress += 1;
+                if no_progress >= MAX_NO_PROGRESS {
+                    stats.add(&usage, spent);
+                    remember!();
+                    return Err(format!(
+                        "连续 {MAX_NO_PROGRESS} 步没有产生任何进展（no-op/失败/内容未变化），已中止。\
+                         已完成的修改都保留在文件里。建议：把任务拆小、明确指出目标节点，或换一种问法。"
+                    ));
+                }
+            } else {
+                no_progress = 0;
+            }
             let mut parts = vec![Part::Text(format!("[工具结果 {name}]\n{}", result.text))];
             if let Some(png) = result.image_png {
                 parts.push(Part::ImagePng(png));
@@ -356,6 +414,15 @@ impl HarnessRunExt for Harness {
 }
 
 use serde_json::{Value, json};
+
+/// 无进展判定：no-op / 工具失败 / view 未变化算原地踏步的一步；
+/// read/check/view(渲染成功) 算有进展——信息增益也是进展。
+fn is_no_progress_text(t: &str) -> bool {
+    t.starts_with("工具执行失败")
+        || t.starts_with("no-op")
+        || t.contains("未变化")
+        || t.contains("未修改")
+}
 
 #[cfg(test)]
 mod tests {
@@ -456,6 +523,47 @@ mod tests {
             .await
             .unwrap();
         assert!(!out2.reply.contains("文件没有被修改"), "{}", out2.reply);
+    }
+
+    #[tokio::test]
+    async fn no_progress_streak_aborts_repeat_loop() {
+        // 用户实测复现：layout no-op 后模型复读同一调用，守卫拒绝循环。
+        // 连击达到 6 应主动中止（而不是烧满 30 轮），错误信息要可操作。
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        let noop_env = r#"{"tool":"layout","args":{"move":[{"id":"a","x":0,"y":0}]}}"#;
+        let mut fake = FakeChat::new(vec![
+            noop_env, noop_env, noop_env, noop_env, noop_env, noop_env,
+        ]);
+        let err = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "调下布局", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("没有产生任何进展"), "{err}");
+        assert!(err.contains("保留在文件里"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn real_progress_resets_no_progress_streak() {
+        // no-op + 拒绝 + 拒绝之后一旦有真实进展（edit 改动成功）即清零，
+        // 正常任务不得被连击中止。
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        let noop_env = r#"{"tool":"layout","args":{"move":[{"id":"a","x":0,"y":0}]}}"#;
+        let edit_env = json!({
+            "tool": "edit",
+            "args": { "range": "cell:a", "text": r#"<mxCell id="a" value="A v2" vertex="1" parent="1"><mxGeometry x="60" y="0" width="100" height="50" as="geometry"/></mxCell>"# }
+        })
+        .to_string();
+        let mut fake = FakeChat::new(vec![
+            noop_env, noop_env, noop_env, &edit_env, r#"{"reply":"完成","done":true}"#,
+        ]);
+        let out = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "调下布局", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert_eq!(out.tool_calls, 2, "no-op layout 与 edit 都真实执行");
+        assert!(doc.text.contains("A v2"));
     }
 
     #[tokio::test]
