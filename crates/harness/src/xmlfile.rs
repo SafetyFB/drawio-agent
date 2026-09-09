@@ -916,7 +916,7 @@ impl XmlDoc {
             }
         }
         for id in &report.changed {
-            let Some(span) = cells.iter().find(|c| &c.id == id) else {
+            let Some(span) = self.cells().iter().find(|c| &c.id == id) else {
                 continue;
             };
             let touches = !(span.end_line < start || span.start_line > end);
@@ -938,9 +938,10 @@ impl XmlDoc {
     /// - 每个范围都按**原始文件**行号解释（模型 read 到的行号）；
     ///   区间按 start 从大到小应用，行号不漂移
     /// - 区间重叠（含相接）视为非法：批量里模型必须给不相交区间
-    /// - 全部应用后**一次** canonicalize/index/diff（含 off_range 用
-    ///   整个批量的并集区间判定）——磁盘只在调用方 save 时落盘，
-    ///   校验失败时磁盘分毫未动（全或无）
+    /// - 全部应用后**一次** canonicalize/index/diff；off_range 用**前置**
+    ///   span 对每个请求区间判定（前置 span 不随本次插入漂移，见
+    ///   span_shift_from_earlier_range_not_flagged_off_range）——磁盘只在
+    ///   调用方 save 时落盘，校验失败时磁盘分毫未动（全或无）
     pub fn apply_edits(
         &mut self,
         edits: &[(usize, usize, String)],
@@ -964,10 +965,6 @@ impl XmlDoc {
                 )));
             }
         }
-        let (lo, hi) = (
-            sorted.first().map(|e| e.0).unwrap_or(1),
-            sorted.last().map(|e| e.1).unwrap_or(0),
-        );
         // 从大到小应用：先改后面的行，前面的行号不受影响
         let mut candidate = self.text.clone();
         let mut desc = sorted;
@@ -1013,11 +1010,17 @@ impl XmlDoc {
                 (None, None) => {}
             }
         }
+        // off_range：changed cell 的**前置** span 是否触及任一请求区间。
+        // 必须用前置 span——本次插入/删除会使后置 span 整体漂移，用后置
+        // span 会把模型明确请求过的 cell 误报为越界（E2E 实测）。
+        let ranges: Vec<(usize, usize)> = edits.iter().map(|(s, e, _)| (*s, *e)).collect();
         for id in &report.changed {
-            let Some(span) = cells.iter().find(|c| &c.id == id) else {
+            let Some(span) = self.cells().iter().find(|c| &c.id == id) else {
                 continue;
             };
-            let touches = !(span.end_line < lo || span.start_line > hi);
+            let touches = ranges
+                .iter()
+                .any(|&(s, e)| !(span.end_line < s || span.start_line > e));
             if !touches {
                 report.off_range.push(id.clone());
             }
@@ -1583,6 +1586,49 @@ mod tests {
             .unwrap();
         assert_eq!(rep.removed, vec!["e1", "svc-a"]);
         assert!(doc.id_to_cell("e1").is_none() && doc.id_to_cell("svc-a").is_none());
+    }
+
+    #[test]
+    fn span_shift_from_earlier_range_not_flagged_off_range() {
+        // E2E 实测误报复现（R2「改动越界 e5」）：批量两区间，前区间插入
+        // 多行使后区间改动的 cell span 整体下移。必须用**前置** span 判定；
+        // 旧实现用后置 span，把模型明确请求过的 cell 误报为越界。
+        let xml = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" vertex="1" parent="1"><mxGeometry x="0" y="0" width="10" height="10" as="geometry"/></mxCell><mxCell id="b" value="B" vertex="1" parent="1"><mxGeometry x="20" y="0" width="10" height="10" as="geometry"/></mxCell><mxCell id="e" edge="1" parent="1" source="a" target="b"><mxGeometry relative="1" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+        let mut doc = XmlDoc::from_text(xml).unwrap();
+        let a = doc.id_to_cell("a").unwrap().clone();
+        let e = doc.id_to_cell("e").unwrap().clone();
+        // 区间 1：a 的 3 行 → a + 新 cell c（6 行，后续 span +3）
+        let a_repl = r#"<mxCell id="a" value="A" vertex="1" parent="1"><mxGeometry x="0" y="0" width="10" height="10" as="geometry"/></mxCell>
+        <mxCell id="c" value="C" vertex="1" parent="1"><mxGeometry x="40" y="0" width="10" height="10" as="geometry"/></mxCell>"#;
+        // 区间 2：e 改 target=a→c（e 在原行号 13-15，编辑后漂移到 16-18）
+        let e_repl = r#"<mxCell id="e" edge="1" parent="1" source="a" target="c"><mxGeometry relative="1" as="geometry"/></mxCell>"#;
+        let rep = doc
+            .apply_edits(&[
+                (a.start_line, a.end_line, a_repl.to_string()),
+                (e.start_line, e.end_line, e_repl.to_string()),
+            ])
+            .unwrap();
+        assert_eq!(rep.added, vec!["c"]);
+        assert_eq!(rep.changed, vec!["e"]);
+        assert!(
+            rep.off_range.is_empty(),
+            "被请求区间明确覆盖的 cell 不应报越界: {:?}",
+            rep.off_range
+        );
+        // 顺带验证：真正的结构破坏（未闭合标签吞噬邻行）走不到 diff——
+        // 解析层直接拒绝。off_range 只是前置 span 下的兜底网，宁可少报
+        // 也不误报（误报会把正确的模型编辑 accuse 成越界，E2E 实测）。
+        let mut doc2 = XmlDoc::from_text(xml).unwrap();
+        let a2 = doc2.id_to_cell("a").unwrap().clone();
+        // 未闭合的 a 会吞掉下一行的 b
+        let bad = r#"<mxCell id="a" value="A2" vertex="1" parent="1">"#;
+        let err = doc2
+            .apply_edit(a2.start_line, a2.end_line, bad)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ill-formed") || err.to_string().contains("解析"),
+            "结构破坏应被解析层拒绝: {err}"
+        );
     }
 
     #[test]
