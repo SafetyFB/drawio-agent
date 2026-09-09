@@ -88,3 +88,52 @@ pub fn parse_envelope(raw: &str) -> Result<Value, String> {
         .expect("non-empty");
     serde_json::from_str(pick).map_err(|e| format!("JSON 解析失败: {e} in {pick}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_prefers_envelope_over_reasoning_json() {
+        // reasoning JSON first, real envelope second
+        let raw = r#"{"reasoning":"先看一下"}{"tool":"read","args":{"query":"a"}}"#;
+        let v = parse_envelope(raw).unwrap();
+        assert_eq!(v["tool"], "read");
+        // two envelopes back to back -> first envelope wins
+        let raw2 = r#"{"tool":"view","args":{}}{"tool":"read","args":{"query":"a"}}"#;
+        let v2 = parse_envelope(raw2).unwrap();
+        assert_eq!(v2["tool"], "view");
+        // surrounding prose + single envelope
+        let raw3 = "让我看看：{\"tool\":\"check\",\"args\":{}} 完毕";
+        let v3 = parse_envelope(raw3).unwrap();
+        assert_eq!(v3["tool"], "check");
+    }
+
+    #[test]
+    fn looks_like_action_detects_request_verbs() {
+        assert!(looks_like_action("把 svc-b 的颜色改成蓝色"));
+        assert!(looks_like_action("加一个节点"));
+        assert!(!looks_like_action("现在图里有几个节点？"));
+        assert!(!looks_like_action("总结一下刚才做了什么"));
+    }
+
+    #[test]
+    fn envelope_parses_plain_and_fenced() {
+        let v = parse_envelope(r#"{"tool":"read","args":{"query":"a"}}"#).unwrap();
+        assert_eq!(v["tool"], "read");
+        let v = parse_envelope("```json\n{\"reply\":\"好\",\"done\":true}\n```").unwrap();
+        assert_eq!(v["reply"], "好");
+    }
+
+    #[test]
+    fn envelope_parses_with_surrounding_text() {
+        let v = parse_envelope("好的，我来查：{\"tool\":\"read\",\"args\":{\"query\":\"订单\"}} 请稍等").unwrap();
+        assert_eq!(v["tool"], "read");
+    }
+
+    #[test]
+    fn envelope_rejects_garbage() {
+        assert!(parse_envelope("抱歉我不知道").is_err());
+        assert!(parse_envelope("{\"tool\": \"edit\"").is_err());
+    }
+}

@@ -318,3 +318,354 @@ impl HarnessRunExt for Harness {
 }
 
 use serde_json::{Value, json};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{Harness, RunOpts, SessionStats, TurnOutcome};
+    use crate::xmlfile::XmlDoc;
+    use std::collections::VecDeque;
+
+    const SAMPLE: &str = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" vertex="1" parent="1"><mxGeometry x="0" y="0" width="100" height="50" as="geometry"/></mxCell><mxCell id="b" value="B" vertex="1" parent="1"><mxGeometry x="200" y="0" width="100" height="50" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+
+    /// Scripted fake: returns envelopes in order, records every transcript
+    /// snapshot it was sent, with configurable usage per call.
+    struct FakeChat {
+        script: VecDeque<(String, Usage)>,
+        snapshots: Vec<Vec<Message>>,
+    }
+
+    impl FakeChat {
+        fn new(script: Vec<&str>) -> Self {
+            Self {
+                script: script
+                    .into_iter()
+                    .map(|s| (s.to_string(), Usage::default()))
+                    .collect(),
+                snapshots: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Chat for FakeChat {
+        async fn complete(
+            &mut self,
+            messages: &[Message],
+            _opts: &CallOpts,
+        ) -> Result<crate::chat::Reply, crate::chat::ChatError> {
+            self.snapshots.push(messages.to_vec());
+            let (text, usage) = self
+                .script
+                .pop_front()
+                .ok_or(crate::chat::ChatError::Empty)?;
+            Ok(crate::chat::Reply { text, usage })
+        }
+    }
+
+    fn contains_image_parts(msgs: &[Message]) -> bool {
+        msgs.iter()
+            .any(|m| m.parts.iter().any(|p| matches!(p, Part::ImagePng(_))))
+    }
+
+    #[tokio::test]
+    async fn correction_message_example_uses_real_tool() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        // 触发纠错：先一次合法工具，再一条坏输出 → 纠错消息进入上下文。
+        let mut fake = FakeChat::new(vec![
+            r#"{"tool":"check","args":{}}"#,
+            "这不是信封",
+            r#"{"reply":"好","done":true}"#,
+        ]);
+        let _ = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "检查图", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await;
+        let sent: Vec<String> = fake
+            .snapshots
+            .iter()
+            .flat_map(|s| s.iter().map(|m| match &m.parts[0] {
+                Part::Text(t) => t.clone(),
+                _ => String::new(),
+            }))
+            .collect();
+        let correction = sent
+            .iter()
+            .find(|t| t.contains("不是合法信封"))
+            .expect("纠错消息应进入上下文");
+        assert!(
+            correction.contains(r#"{"tool": "read""#),
+            "纠错示例必须用真实工具: {correction}"
+        );
+        assert!(!correction.contains("locate"), "纠错示例不得用 locate");
+    }
+
+    #[tokio::test]
+    async fn plain_answer_to_action_ask_warns_nothing_changed() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        let mut fake = FakeChat::new(vec![r#"好的，已经帮你改好了颜色。"#]);
+        let out = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "把节点 b 的颜色改成蓝色", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert_eq!(out.tool_calls, 0);
+        assert!(out.reply.contains("文件没有被修改"), "{}", out.reply);
+        // 纯问答不加警告
+        let mut fake2 = FakeChat::new(vec![r#"图里有 5 个节点。"#]);
+        let out2 = Harness::default()
+            .run(&mut fake2, &mut tools, &mut doc, "图里有几个节点？", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert!(!out2.reply.contains("文件没有被修改"), "{}", out2.reply);
+    }
+
+    #[tokio::test]
+    async fn envelope_missing_fields_gets_one_correction_round() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        // round 1: valid tool; round 2: envelope without tool/reply;
+        // round 3 (after correction): proper reply. Should succeed.
+        let mut fake = FakeChat::new(vec![
+            r#"{"tool":"check","args":{}}"#,
+            r#"{"note":"我还需要看一下"}"#,
+            r#"{"reply":"完成","done":true}"#,
+        ]);
+        let out = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "检查一下图", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "完成");
+        assert_eq!(out.tool_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn view_image_roundtrip_drives_edits() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let replacement = r#"<mxCell id="b" value="B v2" vertex="1" parent="1"><mxGeometry x="220" y="0" width="120" height="50" as="geometry"/></mxCell>"#;
+        let edit_env = json!({
+            "tool": "edit",
+            "args": { "range": "cell:b", "text": replacement }
+        })
+        .to_string();
+        let mut fake = FakeChat::new(vec![
+            r#"{"tool":"view","args":{}}"#,
+            &edit_env,
+            r#"{"reply":"改好了","done":true}"#,
+        ]);
+        let png = vec![0x89, b'P', b'N', b'G'];
+        let mock = drawio_agent_renderer::MockDriver::new().with_bytes(png.clone());
+        let renderer = drawio_agent_renderer::Renderer::new(std::sync::Arc::new(mock));
+        let mut tools = Tools::with_renderer(renderer);
+        let harness = Harness::default();
+        let mut stats = SessionStats::default();
+
+        let outcome = harness
+            .run(&mut fake, &mut tools, &mut doc, "两个节点重叠了，看看并修复 b", "", &RunOpts::default(), &mut stats, &None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.tool_calls, 2);
+        assert_eq!(outcome.reply, "改好了");
+        assert_eq!(fake.snapshots.len(), 3);
+        let after_view = &fake.snapshots[1];
+        assert!(contains_image_parts(after_view), "view 的结果必须带图像 part");
+        let user_img = after_view
+            .iter()
+            .find(|m| m.role == "user" && m.parts.len() == 2)
+            .expect("view 工具结果消息应有 text+image 两个 part");
+        match &user_img.parts[1] {
+            Part::ImagePng(b) => assert_eq!(b, &png),
+            _ => panic!("第二个 part 应为 PNG"),
+        }
+        assert!(doc.canonical().contains("B v2"));
+    }
+
+    #[tokio::test]
+    async fn usage_and_cost_accumulate_and_budget_stops() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut fake = FakeChat {
+            script: VecDeque::new(),
+            snapshots: Vec::new(),
+        };
+        fake.script.push_back((
+            r#"{"reply":"好了","done":true}"#.into(),
+            Usage { input_tokens: 1000, output_tokens: 2000 },
+        ));
+        let mut tools = Tools::new(false);
+        let mut stats = SessionStats::default();
+        // 1 元/百万 in, 2 元/百万 out → 1000/1e6*1 + 2000/1e6*2 = 0.001+0.004
+        let opts = RunOpts {
+            price_input_per_m: 1.0,
+            price_output_per_m: 2.0,
+            ..Default::default()
+        };
+        let outcome = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "hi", "", &opts, &mut stats, &None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.usage.input_tokens, 1000);
+        assert_eq!(outcome.usage.output_tokens, 2000);
+        assert!((outcome.cost_yuan - 0.005).abs() < 1e-9, "{}", outcome.cost_yuan);
+        // engine already accumulated into stats (跨 ask 累计语义)
+        assert!((stats.cost_yuan - 0.005).abs() < 1e-9);
+
+        // Budget smaller than one call's spend: the first call runs, then the
+        // engine refuses to continue (guard sits before the next call).
+        let mut fake2 = FakeChat {
+            script: vec![
+                (r#"{"tool":"check","args":{}}"#.into(), Usage { input_tokens: 1000, output_tokens: 2000 }),
+                (r#"{"reply":"x","done":true}"#.into(), Usage { input_tokens: 10, output_tokens: 5 }),
+            ]
+            .into_iter()
+            .collect(),
+            snapshots: Vec::new(),
+        };
+        let opts_broke = RunOpts {
+            price_input_per_m: 1.0,
+            price_output_per_m: 2.0,
+            budget_remaining: 0.001,
+            ..Default::default()
+        };
+        let err = Harness::default()
+            .run(&mut fake2, &mut tools, &mut doc, "hi", "", &opts_broke, &mut SessionStats::default(), &None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("预算"), "{err}");
+        assert_eq!(fake2.snapshots.len(), 1, "预算用尽后不应再发起调用");
+    }
+
+    #[tokio::test]
+    async fn context_limit_guard_rejects_oversized_prompts() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut fake = FakeChat::new(vec![]);
+        let mut tools = Tools::new(false);
+        let opts = RunOpts {
+            context_limit: Some(10), // tiny: any real prompt exceeds it
+            ..Default::default()
+        };
+        let err = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "hi", "", &opts, &mut SessionStats::default(), &None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("context_length"), "{err}");
+        assert!(fake.snapshots.is_empty(), "超限时不应发起调用");
+    }
+
+    /// Fails the first N calls with a provider-style 500, then succeeds.
+    struct FlakyChat {
+        failures_left: u32,
+        calls: u32,
+    }
+
+    #[async_trait::async_trait]
+    impl Chat for FlakyChat {
+        async fn complete(
+            &mut self,
+            _m: &[Message],
+            _o: &CallOpts,
+        ) -> Result<crate::chat::Reply, crate::chat::ChatError> {
+            self.calls += 1;
+            if self.failures_left > 0 {
+                self.failures_left -= 1;
+                Err(crate::chat::ChatError::Api("HTTP 500 Internal Server Error".into()))
+            } else {
+                Ok(crate::chat::Reply {
+                    text: r#"{"reply":"ok","done":true}"#.into(),
+                    usage: Usage::default(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_llm_500_is_retried_and_ask_survives() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        let mut chat = FlakyChat { failures_left: 1, calls: 0 };
+        let outcome = Harness::default()
+            .run(&mut chat, &mut tools, &mut doc, "hi", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.reply, "ok");
+        assert_eq!(chat.calls, 2, "一次失败 + 一次成功");
+    }
+
+    #[tokio::test]
+    async fn llm_retries_exhausted_reports_and_keeps_partial_work() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        let mut chat = FlakyChat { failures_left: 99, calls: 0 };
+        let h = Harness { max_llm_retries: 1, ..Default::default() };
+        let err = h
+            .run(&mut chat, &mut tools, &mut doc, "hi", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("已重试 1 次"), "{err}");
+        assert_eq!(chat.calls, 2, "初始调用 + 1 次重试后放弃");
+    }
+
+    #[tokio::test]
+    async fn memory_reinjects_prior_asks_across_runs() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        let mut stats = SessionStats::default();
+        // ask 1: user says X; fake replies done without tools.
+        let mut fake = FakeChat::new(vec![r#"{"reply":"收到","done":true}"#]);
+        Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "记住：目标是蓝色主题", "", &RunOpts::default(), &mut stats, &None)
+            .await
+            .unwrap();
+        assert_eq!(stats.transcript.len(), 2, "user ask + assistant reply");
+        // ask 2: the transcript must be visible to the model again.
+        let mut fake2 = FakeChat::new(vec![r#"{"reply":"好","done":true}"#]);
+        Harness::default()
+            .run(&mut fake2, &mut tools, &mut doc, "继续", "", &RunOpts::default(), &mut stats, &None)
+            .await
+            .unwrap();
+        let first_snapshot = &fake2.snapshots[0];
+        let texts: Vec<&str> = first_snapshot
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| match &m.parts[0] {
+                Part::Text(t) => t.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("蓝色主题")),
+            "前一轮的 user 消息应被重新注入: {texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_screenshots_are_folded_after_a_newer_view() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut fake = FakeChat::new(vec![
+            r#"{"tool":"view","args":{}}"#,
+            r#"{"tool":"edit","args":{"range":"cell:b","text":"<mxCell id=\"b\" value=\"B2\" parent=\"1\"/>"}}"#,
+            r#"{"tool":"view","args":{}}"#,
+            r#"{"reply":"done","done":true}"#,
+        ]);
+        let mock = drawio_agent_renderer::MockDriver::new()
+            .with_bytes(vec![0x89, b'P', b'N', b'G', 0x0d]);
+        let renderer = drawio_agent_renderer::Renderer::new(std::sync::Arc::new(mock));
+        let mut tools = Tools::with_renderer(renderer);
+        let outcome = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "检查布局", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.tool_calls, 3);
+        let final_snapshot = fake.snapshots.last().unwrap();
+        let images = final_snapshot
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter(|p| matches!(p, Part::ImagePng(_)))
+            .count();
+        assert_eq!(images, 1, "上下文中最多保留最近一张截图");
+        assert!(final_snapshot.iter().any(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, Part::Text(t) if t.contains("已折叠")))
+        }));
+    }
+}

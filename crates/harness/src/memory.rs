@@ -126,3 +126,133 @@ pub fn estimate_tokens(msgs: &[Message]) -> u64 {
 
 /// Default memory cap when no context_length is configured (tokens, estimate).
 pub const DEFAULT_MEMORY_TOKENS: usize = 24_000;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::SessionStats;
+
+    #[tokio::test]
+    async fn memory_trim_keeps_newest_when_over_cap() {
+        // Direct trim check: a transcript larger than the cap sheds its
+        // oldest messages but keeps the newest ask intact.
+        let mut stats = SessionStats::default();
+        for i in 0..10 {
+            let long = format!(
+                "第 {i} 轮：{}",
+                "这是一段很长的记忆内容，用来撑大 token 估算值。".repeat(300)
+            );
+            stats.transcript.push(Message::user(long));
+            stats.transcript.push(Message::assistant("好。"));
+        }
+        let before = estimate_tokens(&stats.transcript);
+        assert!(before > 10_000, "setup too small: {before}");
+        trim_memory(&mut stats, 3_000);
+        let after = estimate_tokens(&stats.transcript);
+        // Either the cap is met, or we kept only the newest ask (user+reply)
+        // because a single ask alone still exceeds the cap.
+        assert!(after <= 3_000 || stats.transcript.len() <= 2, "trim failed: {after}");
+        let newest_kept = stats.transcript.iter().any(|m| {
+            matches!(&m.parts[0], Part::Text(t) if t.contains("第 9 轮"))
+        });
+        assert!(newest_kept, "最新一轮应保留");
+        let oldest_gone = !stats.transcript.iter().any(|m| {
+            matches!(&m.parts[0], Part::Text(t) if t.contains("第 0 轮"))
+        });
+        assert!(oldest_gone, "最老一轮应被裁剪");
+    }
+
+    #[test]
+    fn memory_trim_never_starts_mid_ask() {
+        // 裁剪必须落在 ask 边界：幸存的 transcript 首条应是真实用户
+        // ask，而不是孤儿工具结果/纠错消息（其信封已被裁掉）。
+        let mut stats = SessionStats::default();
+        // ask 1: 大段内容（工具结果很长，撑爆 cap）
+        stats.transcript.push(Message::user("第一问：把 a 改绿"));
+        stats.transcript.push(Message::assistant(r#"{"tool":"edit","args":{}}"#));
+        stats.transcript
+            .push(Message::user(format!("[工具结果 edit]\n{}", "行".repeat(4_000))));
+        stats.transcript.push(Message::assistant(r#"{"reply":"done","done":true}"#));
+        // ask 2（将被保留）
+        stats.transcript.push(Message::user("第二问：把 b 改蓝"));
+        stats.transcript.push(Message::assistant(r#"{"reply":"ok","done":true}"#));
+        let cap = estimate_tokens(&stats.transcript[4..]); // 恰好容得下 ask 2
+        trim_memory(&mut stats, cap);
+        assert!(
+            !stats.transcript.is_empty(),
+            "cap 至少容得下一轮，不应裁空"
+        );
+        let head = &stats.transcript[0];
+        assert_eq!(head.role, "user", "首条应为用户 ask");
+        match &head.parts[0] {
+            Part::Text(t) => {
+                assert_eq!(t, "第二问：把 b 改蓝", "首条应是第二问完整开头");
+                assert!(!t.starts_with("[工具结果"), "不得以孤儿工具结果开头");
+            }
+            _ => panic!("应为文本 part"),
+        }
+        assert!(stats.transcript.len() == 2, "恰保留一轮 ask: {}", stats.transcript.len());
+    }
+
+    #[test]
+    fn fold_old_reads_keeps_two_newest() {
+        let history: Vec<Message> = vec![
+            Message::user("看下图"),
+            Message::assistant(r#"{"tool":"read","args":{"range":"1-5"}}"#),
+            Message::user(format!("[工具结果 read]\n{}", "旧内容\n".repeat(100))),
+            Message::assistant(r#"{"tool":"check","args":{}}"#),
+            Message::user("[工具结果 check]\ncells=3"),
+            Message::assistant(r#"{"tool":"read","args":{"range":"2-6"}}"#),
+            Message::user(format!("[工具结果 read]\n{}", "较新内容\n".repeat(100))),
+            Message::assistant(r#"{"tool":"read","args":{"range":"3-7"}}"#),
+            Message::user(format!("[工具结果 read]\n{}", "最新内容\n".repeat(100))),
+        ];
+        let mut slice = history.clone();
+        fold_old_reads(&mut slice);
+        let folded = &slice[2];
+        match &folded.parts[0] {
+            Part::Text(t) => {
+                assert!(t.contains("已折叠"), "最老的 read 应被折叠: {t}");
+                assert!(!t.contains("旧内容"), "正文应被移除");
+            }
+            _ => panic!("应为文本 part"),
+        }
+        // 最近两条 read 结果保留原文。
+        assert!(slice[6].parts.iter().any(|p| matches!(p, Part::Text(t) if t.contains("较新内容"))));
+        assert!(slice[8].parts.iter().any(|p| matches!(p, Part::Text(t) if t.contains("最新内容"))));
+        // 非 read 的工具结果不动。
+        assert!(slice[4].parts.iter().any(|p| matches!(p, Part::Text(t) if t.contains("cells=3"))));
+        // 不足 3 条 read 时不折叠。
+        let mut small = history.clone();
+        small.truncate(7); // 只含 2 条 read 结果
+        fold_old_reads(&mut small);
+        assert!(small[2].parts.iter().any(|p| matches!(p, Part::Text(t) if t.contains("旧内容"))));
+    }
+
+    #[test]
+    fn estimate_tokens_uses_png_dimensions() {
+        // 大图按像素面积估（不低于 900 下限）；小 png 字节仍回退 900。
+        let png = minimal_png(1600, 1200);
+        let est = estimate_tokens(&[Message::with_parts(
+            "user",
+            vec![Part::ImagePng(png)],
+        )]);
+        assert!(est >= 1600 * 1200 / 750, "应按面积估算: {est}");
+        let small = estimate_tokens(&[Message::with_parts(
+            "user",
+            vec![Part::ImagePng(minimal_png(100, 80))],
+        )]);
+        assert_eq!(small, 900, "小图回退旧的下限估算");
+    }
+
+    /// PNG signature + IHDR 头（宽高 big-endian），足够 estimate 解析。
+    fn minimal_png(w: u32, h: u32) -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        v.extend_from_slice(&[0, 0, 0, 13]); // IHDR length
+        v.extend_from_slice(b"IHDR");
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&[8, 6, 0, 0, 0]); // bit depth etc.
+        v
+    }
+}
