@@ -685,13 +685,38 @@ impl XmlDoc {
         Ok(doc)
     }
 
-    /// 读 cell 的几何（模型坐标），无则 None。复用 metrics 的解析。
+    /// 读 cell 的几何（**相对父容器的原始坐标**——与文件里的 mxGeometry
+    /// 行、set_geometry_line、layout 参数同一坐标系）。无则 None。
+    /// parse_geom 返回的是绝对坐标（metrics/route 用）；这里沿父链扣回
+    /// 祖先的绝对偏移还原原始值，否则对容器子元素的 layout 会把绝对值
+    /// 写进相对槽位（位置翻倍）。
     pub fn geometry_of(&self, id: &str) -> Option<(f64, f64, f64, f64)> {
         let (cells, _) = crate::metrics::parse_geom(&self.text).ok()?;
-        cells
+        let c = cells
             .iter()
-            .find(|c| c.id == id && !c.is_edge)
-            .map(|c| (c.x, c.y, c.w, c.h))
+            .find(|c| c.id == id && !c.is_edge)?;
+        // 祖先链的绝对坐标之和（不含自身）
+        let mut off = (0.0f64, 0.0f64);
+        let mut cur = Some(c.parent.clone());
+        let mut guard = 0;
+        while let Some(pid) = cur {
+            if pid == "0" || pid == "1" {
+                break;
+            }
+            match cells.iter().find(|p| p.id == pid && !p.is_edge) {
+                Some(p) => {
+                    off.0 += p.x;
+                    off.1 += p.y;
+                    cur = Some(p.parent.clone());
+                }
+                None => break,
+            }
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+        }
+        Some((c.x - off.0, c.y - off.1, c.w, c.h))
     }
 
     /// 把 cell 的 mxGeometry 行整体替换（x/y/width/height 不变则返回 Ok(None)）。

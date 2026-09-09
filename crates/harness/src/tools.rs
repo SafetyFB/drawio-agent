@@ -775,10 +775,24 @@ impl Tools {
             return Err("layout 需要 move / align / route 参数".to_string());
         }
         if edits.is_empty() {
-            return Ok(ToolOutput::text(
-                "no-op：目标坐标与现状一致，几何未变。若仍想移动，请给出与当前不同的\
-                 绝对坐标（query 命中里 geo= 就是当前值）；若布局已满意，请继续下一步。",
-            ));
+            // 回显目标 cell 的当前坐标：把「目标==现状」从抽象结论变成
+            // 可对照的数据——模型没有别的途径观测坐标，抽象纠错对弱模型
+            // 无效，E2E 实测会复读同一 no-op 调用直到预算烧尽。
+            let mut cur = Vec::new();
+            for id in moved_ids.iter().take(8) {
+                if let Some((x, y, _, _)) = doc.geometry_of(id) {
+                    cur.push(format!("{}=({},{})", id, fmt_coord(x), fmt_coord(y)));
+                }
+            }
+            let geo = if cur.is_empty() {
+                String::new()
+            } else {
+                format!(" 当前坐标: {}", cur.join(" "))
+            };
+            return Ok(ToolOutput::text(format!(
+                "no-op：目标坐标与现状一致，几何未变。{geo}\
+                 若仍想移动，请给出与当前不同的坐标；若布局已满意，请继续下一步。"
+            )));
         }
         match doc.apply_edits(&edits) {
             Ok(report) if report.noop => Ok(ToolOutput::text(
