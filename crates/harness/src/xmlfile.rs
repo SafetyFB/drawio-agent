@@ -727,7 +727,17 @@ impl XmlDoc {
         Ok(Some((span.start_line + gi, out_line)))
     }
 
+    /// Sentinel path of memory-only docs ([`Self::from_text`]): they have
+    /// no backing file, so saving must be a no-op — otherwise every test
+    /// that mutates via `Tools::run` leaks a literal `(memory)` file into
+    /// the process CWD. Real paths come from [`Self::from_text_at`].
+    pub const MEMORY_SENTINEL: &str = "(memory)";
+
     pub fn save(&self) -> Result<(), XmlError> {
+        // 内存文档无落盘目标：直接成功（见 MEMORY_SENTINEL 文档）。
+        if self.path == *Self::MEMORY_SENTINEL {
+            return Ok(());
+        }
         // 原子落盘：临时文件 + rename（批量全或无的最后一环）
         // 唯一后缀：多线程测试/多会话并行时避免 tmp 路径相撞
         let nonce: u128 = std::time::SystemTime::now()
@@ -752,7 +762,7 @@ impl XmlDoc {
         let text = canonicalize(text)?;
         let cells = index(&text)?;
         Ok(Self {
-            path: PathBuf::from("(memory)"),
+            path: PathBuf::from(Self::MEMORY_SENTINEL),
             text,
             cells,
             history: Vec::new(),
@@ -1410,6 +1420,24 @@ mod tests {
         assert!(a.end_line > a.start_line);
         // containers are indexed too (used by @refs)
         assert!(cells.iter().any(|x| x.id == "d1"));
+    }
+
+    #[test]
+    fn memory_doc_save_is_a_noop_and_never_creates_a_file() {
+        // 回归：此前每次 cargo test 都会在 CWD 泄漏一个字面 `(memory)`
+        // 文件（测试经 Tools::run 改图成功触发 save）。内存文档的
+        // save 必须是无副作用的 Ok。
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        assert_eq!(doc.path, PathBuf::from(XmlDoc::MEMORY_SENTINEL));
+        let a = doc.id_to_cell("svc-a").unwrap().clone();
+        doc.apply_edit(
+            a.start_line,
+            a.end_line,
+            r#"<mxCell id="svc-a" value="Payments" style="rounded=1" vertex="1" parent="1"><mxGeometry x="40" y="60" width="160" height="60" as="geometry"/></mxCell>"#,
+        )
+        .unwrap();
+        doc.save().unwrap(); // 不得 panic、不得在 CWD 落盘
+        assert!(!Path::new(XmlDoc::MEMORY_SENTINEL).exists());
     }
 
     #[test]
