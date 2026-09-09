@@ -634,6 +634,25 @@ pub fn analyze(xml: &str) -> Result<Report, String> {
     Ok(report)
 }
 
+/// view 截图附带的单行 lint 摘要：视觉确认与确定性检查同屏反馈。
+/// 模型对重叠的视觉感知不可靠（实测渲染明显重叠仍声称无重叠），
+/// 截图配一行确定性结论能兜住「看走眼」。
+pub fn lint_one_liner(report: &Report) -> String {
+    let s = &report.stats;
+    let total = report.warnings.len();
+    if total == 0 {
+        return "布局 lint：无警告".to_string();
+    }
+    format!(
+        "布局 lint：{total} 条警告（重叠 {} · 交叉 {} · 标签溢出 {} · 越界 {} · 分支未平行 {}）——运行 check 看明细",
+        s.overlaps,
+        s.crossings,
+        s.label_overflows,
+        s.out_of_bounds,
+        s.branch_misaligned
+    )
+}
+
 /// check 工具嵌入的布局 lint 摘要（仅 warning 段——error 类的断引用
 /// 与结构校验重复，由 `check_doc` 报告，这里不再重发）。警告截断前 5 条
 /// 并附带「修最明显的即可、不要逐条清零」引导，防 check-edit 死亡循环。

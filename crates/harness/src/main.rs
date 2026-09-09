@@ -10,7 +10,7 @@ use drawio_harness::engine::Harness;
 use drawio_harness::turn_loop::HarnessRunExt;
 use drawio_harness::refs;
 use drawio_harness::tools::Tools;
-use drawio_harness::xmlfile::{check_doc, lines_in, XmlDoc};
+use drawio_harness::xmlfile::{lines_in, XmlDoc};
 
 const HELP: &str = r#"drawio-harness REPL 命令：
   /view            渲染当前文件为 PNG 并打开（需 chromium）
@@ -226,6 +226,13 @@ fn main() {
     }
     print_doc_summary(&doc);
 
+    // CLI（one-shot/REPL）与 web 一样需要静态渲染服务器：view/导出要靠它
+    // 拉起 drawio webapp。失败不致命——view 会报出同样的错误。
+    match rt.block_on(drawio_agent_renderer::driver::drawio_server::init_static_server()) {
+        Ok(p) => println!("静态渲染服务器: http://127.0.0.1:{p}"),
+        Err(e) => eprintln!("警告: 静态渲染服务器启动失败: {e}"),
+    }
+
     let chat: Option<OpenAiChat> = OpenAiChat::from_effective().ok();
     if chat.is_none() {
         println!("提示: LLM 未配置。配置方式: drawio-harness config set --base-url … --model …，或用 DRAWIO_LLM_BASE_URL / DRAWIO_LLM_MODEL / DRAWIO_LLM_API_KEY 环境变量。当前进入本地工具模式（/view /check /xml /sel 仍可用）。");
@@ -337,9 +344,12 @@ fn main() {
                     let st = repl.clone();
                     rt.block_on(async move {
                         let r = st.lock().await;
-                        match check_doc(r.doc.canonical()) {
-                            Ok(cr) => println!("{}", cr.summarize()),
-                            Err(e) => eprintln!("校验失败: {e}"),
+                        let ReplSession { tools, doc, .. } = &*r;
+                        // 走 Tools::check 而非裸 check_doc：附带布局 lint 摘要，
+                        // 与模型看到的 check 结果一致。
+                        match tools.check(doc) {
+                            Ok(out) => println!("{}", out.text),
+                            Err(e) => eprintln!("{e}"),
                         }
                     });
                 }

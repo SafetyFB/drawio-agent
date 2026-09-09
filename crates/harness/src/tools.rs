@@ -569,13 +569,30 @@ impl Tools {
                     .map(|(i, l)| (c.start_line + i, l.to_string()));
                 let value = attr_value(&slice, "value").unwrap_or_default();
                 let style = attr_value(&slice, "style").unwrap_or_default();
+                // 几何坐标一并返回：模型规划 layout/对齐时必需，缺了会
+                // 诱发反复 query 找坐标的空转（实测 30 轮烧尽的根因）。
+                // 只在 mxGeometry 行上取值——attr_value 是朴素子串匹配，
+                // 在整块文本上取 `x` 会命中 vertex="1" 里的 x="1"。
+                let geo_line = slice.lines().find(|l| l.contains("<mxGeometry")).unwrap_or("");
+                let geo = match (
+                    attr_value(geo_line, "x").and_then(|v| v.parse::<f64>().ok()),
+                    attr_value(geo_line, "y").and_then(|v| v.parse::<f64>().ok()),
+                    attr_value(geo_line, "width").and_then(|v| v.parse::<f64>().ok()),
+                    attr_value(geo_line, "height").and_then(|v| v.parse::<f64>().ok()),
+                ) {
+                    (Some(x), Some(y), Some(w), Some(h)) if c.tag == "mxCell" => {
+                        format!(" geo={x},{y} {w}x{h}")
+                    }
+                    _ => String::new(),
+                };
                 let mut s = format!(
-                    "cell `{}` @{}-{}  value={:?}{}{}",
+                    "cell `{}` @{}-{}  value={:?}{}{}{}",
                     c.id,
                     c.start_line,
                     c.end_line,
                     truncate(&value, 40),
                     if style.is_empty() { String::new() } else { format!(" style={:?}", truncate(&style, 30)) },
+                    geo,
                     if c.tag == "mxCell" { String::new() } else { format!(" tag={}", c.tag) }
                 );
                 if let Some((ln, l)) = hit_line {
@@ -678,7 +695,7 @@ impl Tools {
         }
     }
 
-    fn check(&self, doc: &XmlDoc) -> Result<ToolOutput, String> {
+    pub fn check(&self, doc: &XmlDoc) -> Result<ToolOutput, String> {
         let mut text = match check_doc(doc.canonical()) {
             Ok(r) => r.summarize(),
             Err(e) => return Err(format!("校验失败: {e}")),
@@ -752,8 +769,12 @@ impl Tools {
                 if !open {
                     self.last_view = Some(view_hash);
                 }
-                let mut text = format!("渲染成功 ({} bytes, cells={})", png.len(), doc.cells().len());
-                if open {
+                // 截图 + 确定性 lint 同屏：模型视觉对重叠/交叉不可靠，
+                // 用一行确定性结论兜底（详见 metrics::lint_one_liner）。
+                let lint = crate::metrics::analyze(doc.canonical())
+                    .map(|r| crate::metrics::lint_one_liner(&r))
+                    .unwrap_or_default();
+                let mut text = if open {
                     let stem = file_stem(doc).replace(".xml", "").replace(".drawio", "");
                     let png_path = doc
                         .path
@@ -762,8 +783,16 @@ impl Tools {
                         .join(format!("{stem}.png"));
                     if std::fs::write(&png_path, &png).is_ok() {
                         open_with_system_viewer(&png_path);
-                        text = format!("已渲染并打开 {} ({}, cells={})", png_path.display(), png.len(), doc.cells().len());
+                        format!("已渲染并打开 {} ({}, cells={})", png_path.display(), png.len(), doc.cells().len())
+                    } else {
+                        format!("渲染成功 ({} bytes, cells={})", png.len(), doc.cells().len())
                     }
+                } else {
+                    format!("渲染成功 ({} bytes, cells={})", png.len(), doc.cells().len())
+                };
+                if !lint.is_empty() {
+                    text.push('\n');
+                    text.push_str(&lint);
                 }
                 Ok(ToolOutput::with_image(text, png))
             }
@@ -1193,12 +1222,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn view_appends_layout_lint_one_liner() {
+        // 两个重叠的盒子：渲染 mock 不做几何分析，lint 必须补上确定性结论
+        let xml = r#"<mxfile host="x"><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" vertex="1" parent="1"><mxGeometry x="40" y="60" width="160" height="60" as="geometry"/></mxCell><mxCell id="b" value="B" vertex="1" parent="1"><mxGeometry x="120" y="80" width="160" height="60" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+        let d = XmlDoc::from_text(xml).unwrap();
+        let mock = drawio_agent_renderer::MockDriver::new().with_bytes(vec![0x89, b'P', b'N', b'G']);
+        let renderer = drawio_agent_renderer::Renderer::new(std::sync::Arc::new(mock));
+        let mut tools = Tools::with_renderer(renderer);
+        let out = tools.view(&d, &serde_json::json!({})).await.unwrap();
+        assert!(out.text.contains("布局 lint：1 条警告（重叠 1"), "{}", out.text);
+        assert!(out.text.contains("运行 check 看明细"), "{}", out.text);
+    }
+
+    #[tokio::test]
     async fn locate_finds_by_value() {
         let mut d = doc();
         let mut t = Tools::new(false);
         let out = t.run(&mut d, "read", &serde_json::json!({"query": "order"})).await.unwrap();
         assert!(out.text.contains("svc-a"), "{}", out.text);
         assert!(out.text.contains("@"), "{}", out.text);
+        // geo 坐标必须返回：模型规划 layout 依赖它，缺了会诱发 query 空转
+        assert!(out.text.contains("geo=40,60 160x60"), "{}", out.text);
     }
 
     #[tokio::test]

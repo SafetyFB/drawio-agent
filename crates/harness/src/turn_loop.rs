@@ -76,6 +76,10 @@ impl HarnessRunExt for Harness {
         let mut tool_calls = 0usize;
         let mut last_err: Option<String> = None;
         let mut bad_tools = 0usize;
+        let mut last_ok_call: Option<(String, String)> = None;
+        // 同参调用计数（自上次成功改图起算）：模型以 2-3 个查询周期打转
+        // 时参数并不连续相同，只有跨轮计数能拦住（E2E 实测烧尽 30 轮）。
+        let mut repeat_counts: std::collections::HashMap<String, u32> = Default::default();
 
         let mut spent: f64 = 0.0;
         let mut usage = Usage::default();
@@ -279,14 +283,48 @@ impl HarnessRunExt for Harness {
             }
             bad_tools = 0;
             let args = env.get("args").cloned().unwrap_or(json!({}));
+            let args_key = serde_json::to_string(&args).unwrap_or_default();
+            // 同参重复调用守卫：连续两次「同工具同参数且上次成功」的调用
+            // 结果不会变化，多半是模型在空转兜圈（实测曾以 read query 循环
+            // 烧尽 30 轮预算）。拒绝并教学，不计数、不中止。
+            if last_ok_call.as_ref() == Some(&(name.to_string(), args_key.clone())) {
+                history.push(Message::assistant(raw.clone()));
+                history.push(Message::user(format!(
+                    "与上一轮完全相同的 `{name}` 调用被拒绝：参数未变，结果也不会变。\
+                     要看内容请用 read 的 range/cells/outline（query 命中里已带 geo 坐标），\
+                     要改图请用 edit/layout；若上一步结果不符合预期，请改变参数或换一种做法。"
+                )));
+                continue;
+            }
+            let repeats = repeat_counts.entry(format!("{name} {args_key}")).or_insert(0);
+            if *repeats >= 2 {
+                history.push(Message::assistant(raw.clone()));
+                history.push(Message::user(format!(
+                    "`{name}` 已用完全相同的参数成功执行 {} 次，第 {} 次被拒绝：文件未变，结果不会变。\
+                     这通常说明在原地打转——要么直接推进任务（edit/layout 改图），要么换一种查询。"
+                    , *repeats, *repeats + 1
+                )));
+                continue;
+            }
+            *repeats += 1;
             emit!(EngineEvent::Tool {
                 name: name.to_string(),
-                args: serde_json::to_string(&args).unwrap_or_default(),
+                args: args_key.clone(),
             });
             history.push(Message::assistant(raw));
             let result = match tools.run(doc, name, &args).await {
-                Ok(out) => out,
-                Err(text) => ToolOutput::text(format!("工具执行失败: {text}")),
+                Ok(out) => {
+                    last_ok_call = Some((name.to_string(), args_key));
+                    // 改图成功后重置同参计数：编辑后重读同一区间是合法操作
+                    if matches!(name, "edit" | "draw" | "layout") {
+                        repeat_counts.clear();
+                    }
+                    out
+                }
+                Err(text) => {
+                    last_ok_call = None;
+                    ToolOutput::text(format!("工具执行失败: {text}"))
+                }
             };
             tool_calls += 1;
             emit!(EngineEvent::ToolResult {
@@ -418,6 +456,66 @@ mod tests {
             .await
             .unwrap();
         assert!(!out2.reply.contains("文件没有被修改"), "{}", out2.reply);
+    }
+
+    #[tokio::test]
+    async fn identical_consecutive_call_is_rejected_once() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        // 同工具同参数连续两次：第二次应被守卫拦截并教学，然后正常收尾
+        let mut fake = FakeChat::new(vec![
+            r#"{"tool":"check","args":{}}"#,
+            r#"{"tool":"check","args":{}}"#,
+            r#"{"reply":"完成","done":true}"#,
+        ]);
+        let out = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "检查图", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert_eq!(out.tool_calls, 1, "第二次同参调用不应真正执行: {}", out.reply);
+        let sent: Vec<String> = fake
+            .snapshots
+            .iter()
+            .flat_map(|s| s.iter().map(|m| match &m.parts[0] {
+                Part::Text(t) => t.clone(),
+                _ => String::new(),
+            }))
+            .collect();
+        let reject = sent
+            .iter()
+            .find(|t| t.contains("调用被拒绝"))
+            .expect("守卫拒绝消息应进入上下文");
+        assert!(reject.contains("read 的 range/cells/outline"), "{reject}");
+    }
+
+    #[tokio::test]
+    async fn cyclic_identical_calls_are_rejected_at_third() {
+        let mut doc = XmlDoc::from_text(SAMPLE).unwrap();
+        let mut tools = Tools::new(false);
+        // 周期打转：A→B→A→C→A（参数不连续相同，同参计数跨轮生效；
+        // 第 3 次同参调用被拦截）
+        let mut fake = FakeChat::new(vec![
+            r#"{"tool":"read","args":{"query":"order"}}"#,
+            r#"{"tool":"read","args":{"query":"B"}}"#,
+            r#"{"tool":"read","args":{"query":"order"}}"#,
+            r#"{"tool":"read","args":{"query":"id"}}"#,
+            r#"{"tool":"read","args":{"query":"order"}}"#,
+            r#"{"reply":"完成","done":true}"#,
+        ]);
+        let out = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "查查图", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert_eq!(out.tool_calls, 4, "第 3 次同参 read 应被拦截: {}", out.reply);
+        let sent: Vec<String> = fake
+            .snapshots
+            .iter()
+            .flat_map(|s| s.iter().map(|m| match &m.parts[0] {
+                Part::Text(t) => t.clone(),
+                _ => String::new(),
+            }))
+            .collect();
+        assert!(sent.iter().any(|t| t.contains("原地打转")), "{}", sent.join("||"));
     }
 
     #[tokio::test]

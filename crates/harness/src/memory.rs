@@ -66,8 +66,14 @@ pub fn fold_old_images(history: &mut [Message]) {
 /// recent [`KEEP_READS`] results verbatim. Safe by design: line numbers
 /// drift on every edit, so the prompt already tells the model not to trust
 /// stale reads.
+///
+/// 只折叠**大**结果（> [`FOLD_MIN_LINES`] 行）：query 命中只有几行，
+/// 折叠它会把模型刚收集的信息挖掉——实测模型以 3 节点周期反复 query
+/// 时，第 1 条命中总在第 3 条到达时被折叠，stub 还引导它「重新 read」，
+/// 直接喂出烧尽 30 轮的死循环。小结果永久保留。
 pub fn fold_old_reads(history: &mut [Message]) {
     const KEEP_READS: usize = 2;
+    const FOLD_MIN_LINES: usize = 8;
     let read_idx: Vec<usize> = history
         .iter()
         .enumerate()
@@ -80,20 +86,33 @@ pub fn fold_old_reads(history: &mut [Message]) {
         })
         .map(|(i, _)| i)
         .collect();
-    if read_idx.len() <= KEEP_READS {
-        return;
-    }
-    for &i in read_idx.iter().take(read_idx.len() - KEEP_READS) {
-        let lines: usize = history[i]
-            .parts
-            .iter()
-            .filter_map(|p| match p {
-                Part::Text(t) => Some(t.lines().count()),
-                _ => None,
-            })
-            .sum();
+    let line_counts: Vec<usize> = read_idx
+        .iter()
+        .map(|&i| {
+            history[i]
+                .parts
+                .iter()
+                .filter_map(|p| match p {
+                    Part::Text(t) => Some(t.lines().count()),
+                    _ => None,
+                })
+                .sum()
+        })
+        .collect();
+    let keep: Vec<usize> = read_idx
+        .iter()
+        .zip(&line_counts)
+        .rev()
+        .filter(|(_, &n)| n > FOLD_MIN_LINES)
+        .take(KEEP_READS)
+        .map(|(&i, _)| i)
+        .collect();
+    for (&i, &n) in read_idx.iter().zip(&line_counts) {
+        if keep.contains(&i) || n <= FOLD_MIN_LINES {
+            continue;
+        }
         history[i].parts = vec![Part::Text(format!(
-            "（早前的 read 结果已折叠，约 {lines} 行；行号已随编辑漂移，如需请重新 read）"
+            "（早前的 read 结果已折叠，约 {n} 行；行号已随编辑漂移，如需请重新 read）"
         ))];
     }
 }
@@ -227,6 +246,28 @@ mod tests {
         small.truncate(7); // 只含 2 条 read 结果
         fold_old_reads(&mut small);
         assert!(small[2].parts.iter().any(|p| matches!(p, Part::Text(t) if t.contains("旧内容"))));
+    }
+
+    #[test]
+    fn fold_old_reads_never_folds_short_results() {
+        // 短 read 结果（query 命中只有几行）必须原样保留：折叠会挖掉模型
+        // 刚收集的信息并引导「重新 read」，实测喂出 3 节点周期 query 的
+        // 死循环（烧尽 30 轮）。
+        let mut history: Vec<Message> = Vec::new();
+        for i in 0..6 {
+            history.push(Message::assistant(&format!(r#"{{"tool":"read","args":{{"query":"q{i}"}}}}"#)));
+            history.push(Message::user(format!("[工具结果 read]\n命中 1 个 cell:\ncell `n{i}` @1-2 geo=0,0 10x10")));
+        }
+        fold_old_reads(&mut history);
+        for (k, m) in history.iter().enumerate().filter(|(i, _)| i % 2 == 1) {
+            match &m.parts[0] {
+                Part::Text(t) => assert!(
+                    t.contains(&format!("n{}", (k - 1) / 2)),
+                    "短结果不得折叠: idx{k}: {t}"
+                ),
+                _ => panic!("应为文本 part"),
+            }
+        }
     }
 
     #[test]
