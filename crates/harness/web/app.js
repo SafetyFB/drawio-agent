@@ -1138,6 +1138,9 @@ async function cancelJob() {
 
 async function handleStreamEvent(ev) {
   switch (ev.type) {
+    case 'ask_sep':
+      log('tool-note', '── 🔍 自动自检轮（主任务已结束，成图尚未查看或查看后又改过——系统自动追加一次检查）──');
+      break;
     case 'turn':
       log('tool-note', `— 模型轮次 ${ev.index + 1} …`);
       break;
@@ -1531,7 +1534,8 @@ async function renderHistoryIntoChat() {
     logMsg('user', r.user);
     for (const ev of r.events || []) {
       const t = ev.type;
-      if (t === 'tool') logMsg('tool-note', `→ ${ev.name} ${ev.args || ''}`);
+      if (t === 'ask_sep') logMsg('tool-note', '── 🔍 自动自检轮（系统追加的成图检查）──');
+      else if (t === 'tool') logMsg('tool-note', `→ ${ev.name} ${ev.args || ''}`);
       else if (t === 'tool_result') logMsg('tool-note', `↳ ${ev.name}: ${ev.preview || ''}${ev.has_image ? ' 📷' : ''}`);
       else if (t === 'usage') logMsg('tool-note', `  · tokens +${ev.in}/+${ev.out}${ev.cost_yuan > 0 ? ' ≈ ' + fmtCost(ev.cost_yuan) : ''}`);
     }

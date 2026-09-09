@@ -111,6 +111,20 @@ impl WebState {
     }
 }
 
+/// 自检轮判定：是否存在「最后一次 view 之后」的改图（全程无 view 也算）。
+/// 旧判定「全程无 view 才自检」会漏掉 view→edit 的序列——view 之后的
+/// 改动同样没被看过。
+fn needs_selfcheck(evs: &[serde_json::Value]) -> bool {
+    fn name_of(e: &serde_json::Value) -> Option<&str> {
+        e.get("name").and_then(|v| v.as_str())
+    }
+    let last_edit = evs
+        .iter()
+        .rposition(|e| matches!(name_of(e), Some("draw") | Some("edit")));
+    let last_view = evs.iter().rposition(|e| name_of(e) == Some("view"));
+    last_edit.is_some_and(|e| last_view.map_or(true, |v| e > v))
+}
+
 pub async fn serve(dir: PathBuf, port: u16) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建会话目录失败: {e}"))?;
     let chat = OpenAiChat::from_effective().ok();
@@ -858,9 +872,11 @@ async fn api_chat_stream(
                 }
             }
         };
-        // 主 ask；结束后若全程未 view 且改过图，自动追加一次独立自检轮。
+        // 主 ask；结束后若成图尚未查看，自动追加一次独立自检轮。
         const SELFCHECK_TEXT: &str =
-            "（自动自检）你刚才修改了图但全程没有用 view 查看成图。请：调用一次 view 检查布局/箭头/间距是否符合图意；有明显问题（重叠/穿线/缺箭头）修最明显的 1-2 处即可，不必追求完美；然后简短总结收尾。";
+            "（自动自检）你刚才的成图还没有查看过（或查看之后又改过图）。请：调用一次 view 检查布局/箭头/间距是否符合图意；\
+             有明显问题（重叠/穿线/缺箭头）修最明显的 1-2 处即可，不必追求完美；\
+             若没有明显问题，直接简短总结收尾，不要为了修改而修改。";
         let progress_opt: Option<ProgressFn> = Some(progress);
         let run_main = harness.run(
             &mut chat,
@@ -877,16 +893,12 @@ async fn api_chat_stream(
             r = run_main => r,
         };
         let mut outcome2: Option<Result<TurnOutcome, String>> = None;
-        // 自检轮判定：主 ask 成功、改过图（draw/edit）、全程无 view、连接还在
+        // 自检轮判定：主 ask 成功、连接还在、且成图「未被查看」——
+        // 不只看全程有无 view：最后一次改图若发生在最后一次 view 之后，
+        // 那些改动同样没被看过（见 needs_selfcheck）。
         if outcome.is_ok() && !tx.is_closed() {
             let evs = events.lock().map(|v| v.clone()).unwrap_or_default();
-            let has_edit = evs.iter().any(|e| {
-                e.get("name").and_then(|v| v.as_str()).is_some_and(|n| matches!(n, "draw" | "edit"))
-            });
-            let has_view = evs.iter().any(|e| {
-                e.get("name").and_then(|v| v.as_str()) == Some("view")
-            });
-            if has_edit && !has_view {
+            if needs_selfcheck(&evs) {
                 if let Ok(mut v) = events.lock() {
                     v.push(json!({ "type": "ask_sep" }));
                 }
@@ -1427,5 +1439,28 @@ async fn api_manual(
             Json(json!({ "ok": true, "cells": cells, "lines": lines, "xml": ss.doc.canonical() }))
         }
         Err(e) => Json(json!({ "ok": false, "error": format!("同步被拒绝（文件未改动）: {e}") })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_selfcheck;
+
+    fn tool(name: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "tool", "name": name })
+    }
+
+    #[test]
+    fn selfcheck_gate() {
+        // 只改不看 → 自检
+        assert!(needs_selfcheck(&[tool("edit"), tool("check")]));
+        // 改了且看过了（view 在最后）→ 不自检
+        assert!(!needs_selfcheck(&[tool("draw"), tool("view")]));
+        // 看过之后又改 → 那些改动没被看过 → 自检（旧判定漏掉的序列）
+        assert!(needs_selfcheck(&[tool("draw"), tool("view"), tool("edit")]));
+        // 只看没改 → 不自检
+        assert!(!needs_selfcheck(&[tool("view"), tool("read")]));
+        // 空事件 → 不自检
+        assert!(!needs_selfcheck(&[]));
     }
 }
