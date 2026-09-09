@@ -875,8 +875,8 @@ async fn api_chat_stream(
         // 主 ask；结束后若成图尚未查看，自动追加一次独立自检轮。
         const SELFCHECK_TEXT: &str =
             "（自动自检）你刚才的成图还没有查看过（或查看之后又改过图）。请：调用一次 view 检查布局/箭头/间距是否符合图意；\
-             有明显问题（重叠/穿线/缺箭头）修最明显的 1-2 处即可，不必追求完美；\
-             若没有明显问题，直接简短总结收尾，不要为了修改而修改。";
+             有明显问题（重叠/穿线/缺箭头）修最明显的 1-2 处即可——遮挡或穿线优先用 layout route 一次解决，\
+             不要逐边手调锚点，也不必追求完美；若没有明显问题，直接简短总结收尾，不要为了修改而修改。";
         let progress_opt: Option<ProgressFn> = Some(progress);
         let run_main = harness.run(
             &mut chat,

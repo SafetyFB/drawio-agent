@@ -31,7 +31,9 @@ pub const TOOL_META: &[(&str, &str)] = &[
     mxGraphModel 内必须有 <root>（含锚点 0/1）。开闭标签必须逐层配对——
     漏闭标签（如少写 </mxGraphModel>）会被解析拒绝，错误里带正确骨架。
     边建议 style 带 edgeStyle=orthogonalEdgeStyle（正交走线）——裸边是
-    直线，在多层图里会斜穿泳道和其它边造成遮挡。"#,
+    直线，在多层图里会斜穿泳道和其它边造成遮挡。节点较多（≥6）时：
+    画完先排好节点位置（层次/间距），再用 layout route 做一次避障布线，
+    不要逐边手工调锚点。"#,
     ),
     (
         "check",
@@ -44,10 +46,11 @@ pub const TOOL_META: &[(&str, &str)] = &[
         r#"{"move": {"ids": [...], "dx": n, "dy": n}}（统一偏移）
           或 {"move": [{"id": "a", "x": 400, "y": 200}, {"id": "b", "dx": 0, "dy": -40}]}（绝对/相对可混用）
           或 {"align": {"ids": [...], "axis": "x"|"y", "mode": "left"|"right"|"center"|"top"|"bottom"|"middle"|"gap"}}
-          或 {"route": {"ids": ["e1", …]}}（给边批量加正交路由并计算避障拐点——线不再穿过节点；线乱/遮挡时的首选）
-    几何级工具：移动/对齐/等距分布多个 cell，或正交化边。只动 mxGeometry/style，不碰文本与结构（那些用 edit）；整批一次落盘，失败整体回滚；结果报告直接带每个 cell 的新坐标，不用再 read 确认。
+          或 {"route": {"ids": ["e1", …]}}（libavoid 避障布线：保证线不穿过节点）
+    几何级工具：移动/对齐/等距分布多个 cell，或避障布线。只动 mxGeometry/style，不碰文本与结构（那些用 edit）；整批一次落盘，失败整体回滚；结果报告直接带每个 cell 的新坐标，不用再 read 确认。
     align 组合约束：axis=x 配 left/right/center，axis=y 配 top/bottom/middle，gap 两轴均可（沿轴等距分布）。
-    何时用：**纯位置调整（改坐标/对齐/排布）一律优先 layout**，而不是 edit 重写整个 cell——放到哪直接给绝对 x/y，等距对齐交给 align 算，不用自己做算术，也绝不会写坏 cell 结构。线乱/遮挡时优先 route 批量正交化。"#,
+    route 的边界：只管走线、不管布局——它保证不穿节点，但节点本身位置不合理（层次不清/间距拥挤）时布线仍会乱。**先用 move/align 把节点排顺，再 route 一次**；不要靠逐边手调锚点去救乱的布局。
+    何时用：**纯位置调整（改坐标/对齐/排布）一律优先 layout**，而不是 edit 重写整个 cell——放到哪直接给绝对 x/y，等距对齐交给 align 算，不用自己做算术，也绝不会写坏 cell 结构。出现「线穿节点/线乱」：先排布局再 route，一次搞定。"#,
     ),
     (
         "view",

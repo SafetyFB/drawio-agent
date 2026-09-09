@@ -553,7 +553,7 @@ pub fn analyze(xml: &str) -> Result<Report, String> {
                     kind: "crossing",
                     ids: vec![id_e.clone(), v.id.clone()],
                     detail: format!(
-                        "连线 {id_e} 穿过节点 {} 内部（区域 {:.0},{:.0} - {:.0},{:.0}）",
+                        "连线 {id_e} 穿过节点 {} 内部（区域 {:.0},{:.0} - {:.0},{:.0}）——遮挡可先排好节点位置再 layout route 消除",
                         v.id,
                         v.x,
                         v.y,
