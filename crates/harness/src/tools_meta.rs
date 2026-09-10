@@ -33,7 +33,10 @@ pub const TOOL_META: &[(&str, &str)] = &[
     边建议 style 带 edgeStyle=orthogonalEdgeStyle（正交走线）——裸边是
     直线，在多层图里会斜穿泳道和其它边造成遮挡。节点较多（≥6）时：
     画完先排好节点位置（层次/间距），再用 layout route 做一次避障布线，
-    不要逐边手工调锚点。"#,
+    不要逐边手工调锚点。
+    连线密集时两个降密手段：交叉不可避免处给边 style 加
+    jumpStyle=arc（渲染器在交叉点自动画弧避让）；语义次要的边
+    （日志/监控/旁路之类）加 dashed=1 弱化视觉权重。"#,
     ),
     (
         "check",
