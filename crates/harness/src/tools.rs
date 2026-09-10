@@ -419,6 +419,9 @@ impl Tools {
 
     async fn layout(&mut self, doc: &mut XmlDoc, args: &Value) -> Result<ToolOutput, String> {
         let mut edits: Vec<(usize, usize, String)> = Vec::new();
+        // libavoid 失败回退时给模型/用户的可见原因（此前只进 stderr，
+        // web 会话里完全不可见，用户无从知道为何等了很久又没走 libavoid）
+        let mut fallback_note: Option<String> = None;
         // 参与本批移动/对齐的 cell：成功后回报结果坐标，闭环不用重读。
         let mut moved_ids: Vec<String> = Vec::new();
         if let Some(m) = args.get("move") {
@@ -665,6 +668,9 @@ impl Tools {
                         }
                         Err(e) => {
                             eprintln!("libavoid reroute 不可用，回退确定性路由: {e}");
+                            fallback_note = Some(format!(
+                                "（libavoid 不可用，已回退确定性路由：{e}）"
+                            ));
                         }
                     }
                 }
@@ -847,9 +853,10 @@ impl Tools {
                     format!(" 新坐标: {}", coords.join(" "))
                 };
                 Ok(ToolOutput::text(format!(
-                    "布局已应用并保存。{}{}",
+                    "布局已应用并保存。{}{}{}",
                     report_summary(&report),
-                    note
+                    note,
+                    fallback_note.as_deref().unwrap_or("")
                 )))
             }
             Err(e) => Err(format!("布局被拒绝（文件未改动）: {e}")),

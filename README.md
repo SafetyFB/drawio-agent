@@ -12,7 +12,7 @@ pretty-print 的 `.drawio` 文件。局部性靠「文件 + 行区间文本编�
 - **span 索引**：每次保存后重建 `cell id → 行区间`。选中/框选/提及 cell 都经
   它翻译成 `@diagram.xml:120-156` 这类带行号的 xml 片段注入上下文。
 - **局部性靠机制不靠协议**：编辑 = 行区间文本替换，替换后全量校验
-  （XML 可解析 / id 唯一 / 引用完整），其余行字节级不动，diff 报告
+  （XML 可解析 / id 唯一 / 引用完整），其余行不动，diff 报告
   added/removed/changed 精确到 cell。
 - **模型驱动**：每轮一个 JSON 信封 `{"tool": ..., "args": ...}` 或
   `{"reply": ..., "done": true}`；工具结果回填下一轮。`view` 会把渲染截图
@@ -22,13 +22,11 @@ pretty-print 的 `.drawio` 文件。局部性靠「文件 + 行区间文本编�
   会被逐层拦截——只拦原地踏步，真实进展自动清零；任务结束若成图尚未
   查看（或查看后又改过），系统自动追加一轮自检。
 - **工具五类**：
-  - 查询 `read`（`range` 读行区间 / `cells` 批量读多实体 / `query` 按文本搜
-    cell（命中带当前坐标）/ `outline` 全图概览——每实体一行「行区间 | id | 类型 | 标签」）
+  - 查询 `read`（`range` 读行区间 / `cells` 批量读多实体 / `query` 按文本搜cell（命中带当前坐标）/ `outline` 全图概览——每实体一行「行区间 | id | 类型 | 标签」）
   - 内容 `edit`（单区间或批量 `ranges`，全或无原子落盘）、`draw`（整图重建）
   - 几何 `layout`：`move` 批量平移/绝对定位（坐标相对父容器）、`align`
     对齐/等距、`route` 避障布线（复用 drawio 内置 libavoid 求解器无头
-    运行，保证线不穿节点；缺省全图，无渲染器时回退确定性路由；结果带
-    每个 cell 的新坐标）
+    运行，保证线不穿节点；缺省全图，无渲染器时回退确定性路由；结果带每个 cell 的新坐标）
   - 校验 `check`（结构 + 布局 lint 摘要：重叠/连线交叉/穿节点/长直线边/
     标签溢出/越界/分支平行/孤立节点）
   - 感知 `view`（截图，`annotate` id 徽章标注、`focus` 局部裁剪放大）
@@ -45,8 +43,7 @@ cargo test -p drawio-agent-renderer --test chromium_integration -- --ignored   #
 `~/Library/Caches/drawio-agent/`（macOS））：
 
 1. **drawio webapp**（首次运行 web 时）：官方 GitHub release 的
-   `draw.war`（~54MB，解压后完整的最新版 drawio 编辑器），供画布编辑器
-   与无头渲染共用
+   `draw.war`（~54MB，解压后完整的最新版 drawio 编辑器），供画布编辑器与无头渲染共用
 2. **chrome-headless-shell**（~90MB，web 启动时与 war **并行预热**下载，
    避免任务中第一次 view/导出卡网络）：无头渲染宿主。**如果系统已装
    Chrome / Chromium / Edge / Brave，则直接复用、完全不下载**
@@ -67,8 +64,7 @@ cargo run -p drawio-harness -- web 4000  # 自定义端口
 
 打开浏览器地址即可。**会话 = 一个 `.drawio` 文件**：创建会话就是新建文件。
 所有数据统一放在一个目录下（`~/.drawio-agent/`）：`config.json`（配置）与
-`files/`（会话 `.drawio` + `<name>.history.jsonl` 轨迹 + `<name>.state.json`
-记忆/用量）。下拉切换、＋ 新建、🗑 删除。
+`files/`（会话 `.drawio` + `<name>.history.jsonl` 轨迹 +`<name>.state.json`记忆/用量）。下拉切换、＋ 新建、🗑 删除。
 
 ### 首次配置（页内 ⚙ 面板）
 
@@ -82,16 +78,11 @@ cargo run -p drawio-harness -- web 4000  # 自定义端口
 
 ### 聊天（AI 画图）
 
-- 输入消息回车发送（Shift+Enter 换行）；模型自主调用
-  read / edit / draw / check / view / layout 工具闭环改图，每轮工具调用
-  与 token 花费**实时流式**渲染，发送中可「停止」。
+- 输入消息回车发送,模型自主调用read / edit / draw / check / view / layout 工具闭环改图，每轮工具调用与 token 花费**实时流式**渲染，发送中可「停止」。
 - **多轮记忆**：每轮随上下文注入（超限自动裁剪），随会话持久化，重启/切换
   会话恢复。
 - **选中即引用**：画布上点选 / 框选的 cell 会随下一条消息自动附带
-  （`@cell:boxA`）；消息气泡以 📎 徽章标出所带引用，历史消息同样回放。
-- **自动自检轮**：任务结束时若成图从未被 view 查看（或查看后又改过图），
-  系统自动追加一轮「view + 修最明显问题」的质量自检，聊天流中会显示
-  自检分隔条。
+  （`@cell:boxA`）。
 - **用量与预算**：每个会话独立统计 token 与花费，超出预算拒绝执行；页面
   底部实时显示，历史轨迹存 `<name>.history.jsonl`。
 - **历史 = 聊天流**：重新打开或切换会话时，上次对话、工具轨迹、用量按时间
