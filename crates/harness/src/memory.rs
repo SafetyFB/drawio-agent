@@ -71,7 +71,10 @@ pub fn fold_old_images(history: &mut [Message]) {
 /// 折叠它会把模型刚收集的信息挖掉——实测模型以 3 节点周期反复 query
 /// 时，第 1 条命中总在第 3 条到达时被折叠，stub 还引导它「重新 read」，
 /// 直接喂出烧尽 30 轮的死循环。小结果永久保留。
-pub fn fold_old_reads(history: &mut [Message]) {
+/// 折叠旧 read 结果。返回被折叠各次读取的标识（"range:1-12" /
+/// "outline"）——turn_loop 用它给同参守卫发恢复信用：内容已从上下文
+/// 消失，此时重读是 stub 明文允许的恢复动作，不是原地打转。
+pub fn fold_old_reads(history: &mut [Message]) -> Vec<String> {
     const KEEP_READS: usize = 2;
     const FOLD_MIN_LINES: usize = 8;
     let read_idx: Vec<usize> = history
@@ -107,14 +110,34 @@ pub fn fold_old_reads(history: &mut [Message]) {
         .take(KEEP_READS)
         .map(|(&i, _)| i)
         .collect();
+    let mut folded_idents: Vec<String> = Vec::new();
     for (&i, &n) in read_idx.iter().zip(&line_counts) {
         if keep.contains(&i) || n <= FOLD_MIN_LINES {
             continue;
+        }
+        // 折叠前抽取标识：range/cells 批量的首行是 "@file:a-b …"，
+        // outline 是 "全图概览…"（query 命中无固定首行 → 不发信用）。
+        let ident = history[i].parts.iter().find_map(|p| match p {
+            Part::Text(t) => {
+                // 首行是 "[工具结果 read]" 头，正文从第二行开始
+                let first = t.lines().nth(1)?;
+                if first.starts_with("全图概览") {
+                    return Some("outline".to_string());
+                }
+                let rest = first.strip_prefix('@')?;
+                let (_, ab) = rest.split_once(':')?;
+                Some(format!("range:{}", ab.split_whitespace().next()?))
+            }
+            _ => None,
+        });
+        if let Some(id) = ident {
+            folded_idents.push(id);
         }
         history[i].parts = vec![Part::Text(format!(
             "（早前的 read 结果已折叠，约 {n} 行；行号已随编辑漂移，如需请重新 read）"
         ))];
     }
+    folded_idents
 }
 
 /// Rough token estimate for prompt-size guarding (text chars ≈ 0.5 token

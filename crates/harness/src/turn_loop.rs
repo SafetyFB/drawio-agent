@@ -80,6 +80,9 @@ impl HarnessRunExt for Harness {
         // 同参调用计数（自上次成功改图起算）：模型以 2-3 个查询周期打转
         // 时参数并不连续相同，只有跨轮计数能拦住（E2E 实测烧尽 30 轮）。
         let mut repeat_counts: std::collections::HashMap<String, u32> = Default::default();
+        // 已发过恢复信用的 read 标识：每个区间在一次改图前只给一次
+        // （信用第二次触发不再发——反复「重读同一页」仍是打转）。
+        let mut read_recovered: std::collections::HashSet<String> = Default::default();
         // 无进展连击：守卫拒绝 / 工具失败 / no-op / view 未变化都算原地
         // 踏步，任何真实进展清零。连续 6 步主动中止——否则弱模型会复读
         // 同一调用直到烧满 30 轮（E2E 实测：layout no-op 后拒绝路径循环，
@@ -341,7 +344,12 @@ impl HarnessRunExt for Harness {
                 }
                 continue;
             }
-            let repeats = repeat_counts.entry(format!("{name} {args_key}")).or_insert(0);
+            // read 的守卫键用解析后的区间标识：同一内容的两种写法
+            // （"1-12" 与 "cell:x"）算同一次读取，折叠信用也按此复位。
+            let guard_key = crate::tools::read_guard_ident(doc, &args)
+                .map(|ident| format!("read {ident}"))
+                .unwrap_or_else(|| format!("{name} {args_key}"));
+            let repeats = repeat_counts.entry(guard_key.clone()).or_insert(0);
             if *repeats >= 2 {
                 let msg = format!(
                     "`{name}` 已用完全相同的参数成功执行 {} 次，第 {} 次被拒绝：文件未变，结果不会变。\
@@ -383,6 +391,7 @@ impl HarnessRunExt for Harness {
                     // 改图成功后重置同参计数：编辑后重读同一区间是合法操作
                     if matches!(name, "edit" | "draw" | "layout") {
                         repeat_counts.clear();
+                        read_recovered.clear();
                     }
                     out
                 }
@@ -424,7 +433,20 @@ impl HarnessRunExt for Harness {
             // Same for the biggest text payloads: old `read` results are
             // folded to a stub once newer ones arrive — line numbers drift
             // after every edit, so stale reads must be re-read anyway.
-            fold_old_reads(&mut history);
+            for ident in fold_old_reads(&mut history) {
+                // 折叠即失明：被折内容已从上下文消失，重读是 stub 明文
+                // 允许的恢复动作。给同参守卫发一次恢复信用（重置计数→
+                // 恰好允许一次重读，再复读仍拒）；每个标识只发一次，
+                // 改图成功后随 repeat_counts 一起重置。
+                if read_recovered.insert(ident.clone()) {
+                    let prefix = format!("read {ident}");
+                    for (k, v) in repeat_counts.iter_mut() {
+                        if k.starts_with(&prefix) {
+                            *v = 1;
+                                        }
+                    }
+                }
+            }
         }
         stats.add(&usage, spent);
         remember!();
@@ -454,6 +476,7 @@ mod tests {
     use std::collections::VecDeque;
 
     const SAMPLE: &str = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" vertex="1" parent="1"><mxGeometry x="0" y="0" width="100" height="50" as="geometry"/></mxCell><mxCell id="b" value="B" vertex="1" parent="1"><mxGeometry x="200" y="0" width="100" height="50" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
+    const SAMPLE_BIG: &str = r#"<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="n0" value="N0" vertex="1" parent="1"><mxGeometry x="0" y="0" width="120" height="40" as="geometry"/></mxCell><mxCell id="n1" value="N1" vertex="1" parent="1"><mxGeometry x="0" y="60" width="120" height="40" as="geometry"/></mxCell><mxCell id="n2" value="N2" vertex="1" parent="1"><mxGeometry x="0" y="120" width="120" height="40" as="geometry"/></mxCell><mxCell id="n3" value="N3" vertex="1" parent="1"><mxGeometry x="0" y="180" width="120" height="40" as="geometry"/></mxCell><mxCell id="n4" value="N4" vertex="1" parent="1"><mxGeometry x="0" y="240" width="120" height="40" as="geometry"/></mxCell><mxCell id="n5" value="N5" vertex="1" parent="1"><mxGeometry x="0" y="300" width="120" height="40" as="geometry"/></mxCell><mxCell id="n6" value="N6" vertex="1" parent="1"><mxGeometry x="0" y="360" width="120" height="40" as="geometry"/></mxCell><mxCell id="n7" value="N7" vertex="1" parent="1"><mxGeometry x="0" y="420" width="120" height="40" as="geometry"/></mxCell><mxCell id="n8" value="N8" vertex="1" parent="1"><mxGeometry x="0" y="480" width="120" height="40" as="geometry"/></mxCell><mxCell id="n9" value="N9" vertex="1" parent="1"><mxGeometry x="0" y="540" width="120" height="40" as="geometry"/></mxCell><mxCell id="n10" value="N10" vertex="1" parent="1"><mxGeometry x="0" y="600" width="120" height="40" as="geometry"/></mxCell><mxCell id="n11" value="N11" vertex="1" parent="1"><mxGeometry x="0" y="660" width="120" height="40" as="geometry"/></mxCell><mxCell id="n12" value="N12" vertex="1" parent="1"><mxGeometry x="0" y="720" width="120" height="40" as="geometry"/></mxCell><mxCell id="n13" value="N13" vertex="1" parent="1"><mxGeometry x="0" y="780" width="120" height="40" as="geometry"/></mxCell><mxCell id="n14" value="N14" vertex="1" parent="1"><mxGeometry x="0" y="840" width="120" height="40" as="geometry"/></mxCell><mxCell id="n15" value="N15" vertex="1" parent="1"><mxGeometry x="0" y="900" width="120" height="40" as="geometry"/></mxCell><mxCell id="n16" value="N16" vertex="1" parent="1"><mxGeometry x="0" y="960" width="120" height="40" as="geometry"/></mxCell><mxCell id="n17" value="N17" vertex="1" parent="1"><mxGeometry x="0" y="1020" width="120" height="40" as="geometry"/></mxCell><mxCell id="n18" value="N18" vertex="1" parent="1"><mxGeometry x="0" y="1080" width="120" height="40" as="geometry"/></mxCell><mxCell id="n19" value="N19" vertex="1" parent="1"><mxGeometry x="0" y="1140" width="120" height="40" as="geometry"/></mxCell><mxCell id="n20" value="N20" vertex="1" parent="1"><mxGeometry x="0" y="1200" width="120" height="40" as="geometry"/></mxCell><mxCell id="n21" value="N21" vertex="1" parent="1"><mxGeometry x="0" y="1260" width="120" height="40" as="geometry"/></mxCell><mxCell id="n22" value="N22" vertex="1" parent="1"><mxGeometry x="0" y="1320" width="120" height="40" as="geometry"/></mxCell><mxCell id="n23" value="N23" vertex="1" parent="1"><mxGeometry x="0" y="1380" width="120" height="40" as="geometry"/></mxCell><mxCell id="n24" value="N24" vertex="1" parent="1"><mxGeometry x="0" y="1440" width="120" height="40" as="geometry"/></mxCell><mxCell id="n25" value="N25" vertex="1" parent="1"><mxGeometry x="0" y="1500" width="120" height="40" as="geometry"/></mxCell><mxCell id="n26" value="N26" vertex="1" parent="1"><mxGeometry x="0" y="1560" width="120" height="40" as="geometry"/></mxCell><mxCell id="n27" value="N27" vertex="1" parent="1"><mxGeometry x="0" y="1620" width="120" height="40" as="geometry"/></mxCell><mxCell id="n28" value="N28" vertex="1" parent="1"><mxGeometry x="0" y="1680" width="120" height="40" as="geometry"/></mxCell><mxCell id="n29" value="N29" vertex="1" parent="1"><mxGeometry x="0" y="1740" width="120" height="40" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>"#;
 
     /// Scripted fake: returns envelopes in order, records every transcript
     /// snapshot it was sent, with configurable usage per call.
@@ -638,6 +661,33 @@ mod tests {
             .find(|t| t.contains("调用被拒绝"))
             .expect("守卫拒绝消息应进入上下文");
         assert!(reject.contains("read 的 range/cells/outline"), "{reject}");
+    }
+
+    #[tokio::test]
+    async fn folded_read_earns_one_recovery_repeat() {
+        // 折叠即失明：read 结果被 fold 折掉后（内容已不在上下文），按
+        // stub 的指引重读一次应被允许（恢复信用）；同区间第 3 次仍拒。
+        // 构造：大区间读两次（计数=2），再读两次别的大区间把最早的结果
+        // 折掉 → 发信用 → 重读被允许，再读被拒。
+        let mut doc = XmlDoc::from_text(SAMPLE_BIG).unwrap();
+        let mut tools = Tools::new(false);
+        // 注意别让两个相同 read 相邻（会先撞「连续同参」分支）：
+        // 1-20 / 21-40 / 1-20（计数=2）/ 41-60（把最早两次折掉→发信用）
+        // / 1-20（信用内：允许）/ 1-20（第 3 次：拒）
+        let mut fake = FakeChat::new(vec![
+            r#"{"tool":"read","args":{"range":"1-20"}}"#,
+            r#"{"tool":"read","args":{"range":"21-40"}}"#,
+            r#"{"tool":"read","args":{"range":"1-20"}}"#,
+            r#"{"tool":"read","args":{"range":"41-60"}}"#,
+            r#"{"tool":"read","args":{"range":"1-20"}}"#,   // 信用内：允许
+            r#"{"tool":"read","args":{"range":"1-20"}}"#,   // 第 3 次：拒
+            r#"{"reply":"完成","done":true}"#,
+        ]);
+        let out = Harness::default()
+            .run(&mut fake, &mut tools, &mut doc, "读读图", "", &RunOpts::default(), &mut SessionStats::default(), &None)
+            .await
+            .unwrap();
+        assert_eq!(out.tool_calls, 5, "信用重读应执行，第 3 次应被拦截");
     }
 
     #[tokio::test]

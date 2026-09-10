@@ -108,6 +108,19 @@ fn resolve_arg(doc: &XmlDoc, spec: &str) -> Result<(usize, usize), String> {
         .map_err(|e| format!("无法解析范围 `{spec}`: {e}"))
 }
 
+/// read 调用的守卫标识：range 解析成规范 "range:a-b"（同一内容的
+/// "1-12" 与 "cell:x" 两种写法算同一次读取），outline 单列。同参守卫
+/// 与折叠恢复信用共用这个键。非 range/outline 的 read（cells/query）
+/// 返回 None，调用方退回原始参数串作键。
+pub(crate) fn read_guard_ident(doc: &XmlDoc, args: &Value) -> Option<String> {
+    if args.get("outline").and_then(Value::as_bool) == Some(true) {
+        return Some("outline".to_string());
+    }
+    let spec = args.get("range").and_then(Value::as_str)?;
+    let (a, b) = resolve_arg(doc, spec).ok()?;
+    Some(format!("range:{}", range_str(a, b)))
+}
+
 fn numbered(text: &str, start: usize) -> String {
     let mut out = String::new();
     for (i, l) in text.lines().enumerate() {
