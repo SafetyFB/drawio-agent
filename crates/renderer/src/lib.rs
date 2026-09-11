@@ -73,6 +73,12 @@ pub enum RenderError {
 
 /// Pluggable rendering backend. Implementations may drive a real browser
 /// (production) or return canned bytes (tests).
+///
+/// # 子进程清理契约
+/// 启动外部进程的实现必须：构造时 [`crate::driver::chromium::
+/// register_child_process`] 登记、Drop 时摘除——这样 `std::process::exit`
+/// 与 SIGINT/SIGTERM（都不运行 Drop）才能由 `kill_all_browsers()` 兜底。
+/// 纯内存实现（如 MockDriver）无需任何动作。
 #[async_trait]
 pub trait RenderDriver: Send + Sync {
     async fn render(

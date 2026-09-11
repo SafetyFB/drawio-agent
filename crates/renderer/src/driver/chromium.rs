@@ -91,13 +91,26 @@ pub struct HeadlessChromiumDriver {
 /// Pending CDP request id -> oneshot response sender.
 type PendingMap = HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, RenderError>>>;
 
-/// 本进程启动的全部浏览器（pid, profile 目录）。正常路径 Drop 逐个清理；
-/// `std::process::exit` 与 SIGINT/SIGTERM **不运行析构**，这些路径必须
-/// 显式调 [`kill_all_browsers`]（CLI 的 exit 出口、web/REPL 的信号处理）。
+/// 本进程启动的全部**拥有 OS 子进程的渲染后端**（pid, 需清理的目录）。
+///
+/// # 契约（新增渲染后端必读）
+/// 唯一需要登记的是「启动了外部进程」的后端（目前只有 chromium）：
+/// 构造时 `register_child_process`，Drop 时摘除自己；MockDriver 这类
+/// 纯内存后端无需登记。正常路径 Drop 逐个清理；`std::process::exit`
+/// 与 SIGINT/SIGTERM **不运行析构**，这些路径必须显式调
+/// [`kill_all_browsers`]（CLI 的 exit 出口、web/REPL 的信号处理）。
 /// 实测：没有这个登记表，每次 Ctrl-C / exit 泄漏一个浏览器实例
 /// （含 ~10 个 helper 进程与一个 /tmp profile 目录）。
 static LIVE_BROWSERS: std::sync::Mutex<Vec<(u32, std::path::PathBuf)>> =
     std::sync::Mutex::new(Vec::new());
+
+/// 渲染后端启动外部进程时登记（pid + 需随进程清理的目录）。
+/// 与 [`kill_all_browsers`] 配对——见 [`LIVE_BROWSERS`] 的契约。
+pub(crate) fn register_child_process(pid: u32, cleanup_dir: std::path::PathBuf) {
+    if let Ok(mut live) = LIVE_BROWSERS.lock() {
+        live.push((pid, cleanup_dir));
+    }
+}
 
 /// 杀单个浏览器并清理 profile：unix 用 /bin/kill 的绝对路径（不依赖
 /// PATH）；Windows 用 taskkill /F（子进程不会随父进程自动死，必须显式
@@ -306,9 +319,7 @@ impl HeadlessChromiumDriver {
             render_lock: tokio::sync::Mutex::new(()),
         };
         // 登记：exit/信号路径不走 Drop，kill_all_browsers 靠这张表兜底
-        if let Ok(mut live) = LIVE_BROWSERS.lock() {
-            live.push((pid, temp_profile));
-        }
+        register_child_process(pid, temp_profile);
         let driver = Self {
             inner: Arc::new(inner),
         };
