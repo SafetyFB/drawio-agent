@@ -99,25 +99,35 @@ type PendingMap = HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, Render
 static LIVE_BROWSERS: std::sync::Mutex<Vec<(u32, std::path::PathBuf)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// 杀单个浏览器并清理 profile：unix 用 /bin/kill 的绝对路径（不依赖
+/// PATH）；Windows 用 taskkill /F（子进程不会随父进程自动死，必须显式
+/// 杀）。SIGTERM 后 chromium 关闭中还会写 profile——宽限半秒再删，
+/// 必须 join（调用方多在 exit 前，detach 的清理线程活不到跑完）。
+fn terminate_browser(pid: u32, dir: std::path::PathBuf) {
+    #[cfg(unix)]
+    let _ = std::process::Command::new("/bin/kill")
+        .arg(pid.to_string())
+        .output();
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .output();
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
+    let _ = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = std::fs::remove_dir_all(dir);
+    })
+    .join();
+}
+
 /// 尽力杀掉本进程启动且尚未退出的所有浏览器并清掉其 profile 目录。
-/// 幂等；Drop 正常路径已清掉的不会再出现。
+/// 幂等；Drop 正常路径已清掉的不会再出现。exit/信号路径必须显式调用。
 pub fn kill_all_browsers() {
     let Ok(mut live) = LIVE_BROWSERS.lock() else { return };
     let items = std::mem::take(&mut *live);
     for (pid, dir) in items {
-        #[cfg(unix)]
-        let _ = std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .output();
-        #[cfg(not(unix))]
-        let _ = pid; // Windows 无 kill；浏览器随父进程退出是既有约定
-        // SIGTERM 后 chromium 关闭中还会写 profile 文件——立即删会因
-        // 文件被占而残留。等半秒再删（独立线程，不阻塞退出路径）。
-        let _ = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = std::fs::remove_dir_all(dir);
-        })
-        .join();
+        terminate_browser(pid, dir);
     }
 }
 
@@ -148,18 +158,18 @@ impl Drop for ChromiumInner {
         if let Ok(mut live) = LIVE_BROWSERS.lock() {
             live.retain(|(p, _)| *p != self._child_pid);
         }
-        // Best-effort kill + profile cleanup; not in async context here.
-        #[cfg(unix)]
-        let _ = std::process::Command::new("kill")
-            .arg(self._child_pid.to_string())
-            .output();
-        // Non-unix (Windows has no `kill` binary): the child dies with the
-        // parent process in practice; proper Job Objects are out of scope.
-        let _ = std::fs::remove_dir_all(&self.profile_dir);
+        // 与 exit/信号路径同一套终止+清理语义（跨平台 kill、宽限删目录）
+        let dir = std::mem::take(&mut self.profile_dir);
+        terminate_browser(self._child_pid, dir);
     }
 }
 
 impl HeadlessChromiumDriver {
+    /// 本驱动托管的浏览器主进程 pid（诊断/测试用）。
+    pub fn browser_pid(&self) -> u32 {
+        self.inner._child_pid
+    }
+
     /// Locate a Chromium binary and launch it.
     pub async fn launch() -> Result<Self, RenderError> {
         // 解析可能触发首次下载（~90MB），放 blocking 池避免卡住异步运行时

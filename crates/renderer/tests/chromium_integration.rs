@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use drawio_agent_renderer::{
-    find_chromium, HeadlessChromiumDriver, RenderOptions, Renderer,
+    find_chromium, kill_all_browsers, HeadlessChromiumDriver, RenderOptions, Renderer,
 };
 
 const SAMPLE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -138,4 +138,31 @@ async fn chromium_libavoid_reroute_writes_waypoints() {
         "期望正交样式或拐点，输出前 400 字节: {}",
         &out[..out.len().min(400)]
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real browser (cached bundle / system chrome / explicit path)"]
+async fn kill_all_browsers_covers_forgetting_drop() {
+    // 模拟 exit/信号路径：驱动 Arc 被 forget（Drop 永不运行），
+    // 全局登记表 + kill_all_browsers 必须兜底杀掉浏览器进程。
+    let _ = find_chromium();
+    let driver = HeadlessChromiumDriver::launch().await.expect("launch");
+    let pid = driver.browser_pid();
+    std::mem::forget(driver);
+    kill_all_browsers();
+    // SIGTERM 后进程应退出（给 2s 宽限；kill(pid,0) 失败 = 不存在）
+    let mut alive = true;
+    for _ in 0..20 {
+        if std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            alive = false;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(!alive, "browser pid {pid} should be killed by kill_all_browsers");
 }
