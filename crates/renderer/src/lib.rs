@@ -24,8 +24,8 @@ pub use drawio_app::{
 };
 
 pub use driver::{
-    find_chromium, HeadlessChromiumDriver, MockDriver, PINNED_CHROMIUM_VERSION,
-    drawio_server::init_static_server,
+    chromium::kill_all_browsers, find_chromium, HeadlessChromiumDriver, MockDriver,
+    PINNED_CHROMIUM_VERSION, drawio_server::init_static_server,
 };
 
 /// Render options for a single diagram export.

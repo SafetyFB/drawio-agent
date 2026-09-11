@@ -42,20 +42,53 @@ fn print_doc_summary(doc: &XmlDoc) {
     );
 }
 
+
+/// `std::process::exit` 不运行析构——本进程启动的无头浏览器会因此泄漏
+/// （实测积累 60 个实例 / 580 个进程）。所有退出统一走这里：先杀浏览器
+/// 再 exit。错误退出码保持原语义。
+fn exit_clean(code: i32) -> ! {
+    drawio_agent_renderer::kill_all_browsers();
+    std::process::exit(code)
+}
+
+/// Ctrl-C / SIGTERM 同样不走 Drop：装全局处理器，信号到达时清理浏览器
+/// 再退出（web 常驻与 REPL 交互都覆盖；不装的话默认行为是直接终止进程，
+/// 行为不变，只是多了清理）。需要 tokio runtime。
+fn install_signal_cleanup(rt: &tokio::runtime::Runtime) {
+    rt.spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+        exit_clean(0);
+    });
+}
+
 fn main() {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("tokio runtime: {e}");
-            std::process::exit(1);
+            exit_clean(1);
         }
     };
+    install_signal_cleanup(&rt);
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!(
             "用法:\n  drawio-harness <file> [one-shot 消息…]      本地 REPL\n  drawio-harness new <file>                       创建空图\n  drawio-harness web [port]                       浏览器入口：会话=文件 (默认 8787)\n  drawio-harness config show|set|clear|path      查看/保存 LLM 配置"
         );
-        std::process::exit(2);
+        exit_clean(2);
     }
     if args[0] == "config" {
         config_cli(&args[1..]);
@@ -65,7 +98,7 @@ fn main() {
     if args[0] == "metrics" {
         let Some(path) = args.get(1) else {
             eprintln!("用法: drawio-harness metrics <file.drawio>");
-            std::process::exit(2);
+            exit_clean(2);
         };
         match std::fs::read_to_string(path) {
             Ok(xml) => match drawio_harness::metrics::analyze(&xml) {
@@ -113,18 +146,18 @@ fn main() {
     Ok(s) => println!("{}", s),
     Err(e) => {
         eprintln!("json serialize: {e}");
-        std::process::exit(1);
+        exit_clean(1);
     }
 }
                 }
                 Err(e) => {
                     eprintln!("metrics 失败: {e}");
-                    std::process::exit(1);
+                    exit_clean(1);
                 }
             },
             Err(e) => {
                 eprintln!("读文件失败: {e}");
-                std::process::exit(1);
+                exit_clean(1);
             }
         }
         return;
@@ -140,7 +173,7 @@ fn main() {
                 Ok(p) => port = p,
                 Err(_) => {
                     eprintln!("未知参数: {a}");
-                    std::process::exit(2);
+                    exit_clean(2);
                 }
             }
         }
@@ -178,7 +211,7 @@ fn main() {
         }
         if let Err(e) = rt.block_on(drawio_harness::web::serve(dir, port)) {
             eprintln!("{e}");
-            std::process::exit(1);
+            exit_clean(1);
         }
         return;
     }
@@ -187,13 +220,13 @@ fn main() {
         // drawio-harness new <file> [one-shot 消息…]
         let Some(file) = args.get(1) else {
             eprintln!("用法: drawio-harness new <file>");
-            std::process::exit(2);
+            exit_clean(2);
         };
         let path = PathBuf::from(file);
         if !path.exists() {
             if let Err(e) = std::fs::write(&path, drawio_harness::EMPTY_TEMPLATE) {
                 eprintln!("写文件失败: {e}");
-                std::process::exit(1);
+                exit_clean(1);
             }
             println!("已创建空图 {}", path.display());
         }
@@ -209,14 +242,14 @@ fn main() {
             path.display(),
             path.display()
         );
-        std::process::exit(2);
+        exit_clean(2);
     }
 
     let doc = match XmlDoc::load_with_legacy(&path, !drawio_agent_renderer::drawio_app_cached()) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("加载失败: {e}");
-            std::process::exit(1);
+            exit_clean(1);
         }
     };
     // Persist the canonical form immediately (original stays on disk as
@@ -763,7 +796,7 @@ fn config_cli(args: &[String]) {
             }
             None => {
                 eprintln!("未配置 LLM。保存方式: drawio-harness config set --base-url <url> --model <model> [--api-key <key>]");
-                std::process::exit(1);
+                exit_clean(1);
             }
         },
         "set" => {
@@ -826,14 +859,14 @@ fn config_cli(args: &[String]) {
                     }
                     other => {
                         eprintln!("未知参数: {other}");
-                        std::process::exit(2);
+                        exit_clean(2);
                     }
                 }
                 i += 1;
             }
             if base_url.is_empty() || model.is_empty() {
                 eprintln!("需要 --base-url 与 --model。可选: --api-key --context-length --no-think|--think-default --price-in --price-out --budget <元|none>");
-                std::process::exit(2);
+                exit_clean(2);
             }
             let mut s = config::effective_settings().unwrap_or_default();
             s.base_url = base_url.trim_end_matches('/').to_string();
@@ -863,12 +896,12 @@ fn config_cli(args: &[String]) {
                     Ok(()) => println!("已保存: {}\\nbase_url: {}\\nmodel:    {}\\napi_key:  {}", p.display(), s.base_url, s.model, s.api_key_masked()),
                     Err(e) => {
                         eprintln!("保存失败: {e}");
-                        std::process::exit(1);
+                        exit_clean(1);
                     }
                 },
                 None => {
                     eprintln!("找不到配置文件路径");
-                    std::process::exit(1);
+                    exit_clean(1);
                 }
             }
         }
@@ -889,12 +922,12 @@ fn config_cli(args: &[String]) {
             Some(p) => println!("{}", p.display()),
             None => {
                 eprintln!("找不到主目录（HOME/USERPROFILE 未设置）");
-                std::process::exit(1);
+                exit_clean(1);
             }
         },
         other => {
             eprintln!("未知子命令: {other}（可用: show set clear path）");
-            std::process::exit(2);
+            exit_clean(2);
         }
     }
 }

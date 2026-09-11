@@ -91,6 +91,36 @@ pub struct HeadlessChromiumDriver {
 /// Pending CDP request id -> oneshot response sender.
 type PendingMap = HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, RenderError>>>;
 
+/// 本进程启动的全部浏览器（pid, profile 目录）。正常路径 Drop 逐个清理；
+/// `std::process::exit` 与 SIGINT/SIGTERM **不运行析构**，这些路径必须
+/// 显式调 [`kill_all_browsers`]（CLI 的 exit 出口、web/REPL 的信号处理）。
+/// 实测：没有这个登记表，每次 Ctrl-C / exit 泄漏一个浏览器实例
+/// （含 ~10 个 helper 进程与一个 /tmp profile 目录）。
+static LIVE_BROWSERS: std::sync::Mutex<Vec<(u32, std::path::PathBuf)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// 尽力杀掉本进程启动且尚未退出的所有浏览器并清掉其 profile 目录。
+/// 幂等；Drop 正常路径已清掉的不会再出现。
+pub fn kill_all_browsers() {
+    let Ok(mut live) = LIVE_BROWSERS.lock() else { return };
+    let items = std::mem::take(&mut *live);
+    for (pid, dir) in items {
+        #[cfg(unix)]
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .output();
+        #[cfg(not(unix))]
+        let _ = pid; // Windows 无 kill；浏览器随父进程退出是既有约定
+        // SIGTERM 后 chromium 关闭中还会写 profile 文件——立即删会因
+        // 文件被占而残留。等半秒再删（独立线程，不阻塞退出路径）。
+        let _ = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = std::fs::remove_dir_all(dir);
+        })
+        .join();
+    }
+}
+
 #[derive(Debug)]
 struct ChromiumInner {
     /// Keep the child pid so `Drop` can kill the process.
@@ -114,6 +144,10 @@ struct ChromiumInner {
 
 impl Drop for ChromiumInner {
     fn drop(&mut self) {
+        // 从全局登记表摘除自己（kill_all_browsers 不再重复处理）
+        if let Ok(mut live) = LIVE_BROWSERS.lock() {
+            live.retain(|(p, _)| *p != self._child_pid);
+        }
         // Best-effort kill + profile cleanup; not in async context here.
         #[cfg(unix)]
         let _ = std::process::Command::new("kill")
@@ -252,7 +286,7 @@ impl HeadlessChromiumDriver {
 
         let inner = ChromiumInner {
             _child_pid: pid,
-            profile_dir: temp_profile,
+            profile_dir: temp_profile.clone(),
             write: out_tx,
             next_id: Mutex::new(1),
             pending,
@@ -261,6 +295,10 @@ impl HeadlessChromiumDriver {
             page_ready: std::sync::atomic::AtomicBool::new(false),
             render_lock: tokio::sync::Mutex::new(()),
         };
+        // 登记：exit/信号路径不走 Drop，kill_all_browsers 靠这张表兜底
+        if let Ok(mut live) = LIVE_BROWSERS.lock() {
+            live.push((pid, temp_profile));
+        }
         let driver = Self {
             inner: Arc::new(inner),
         };
