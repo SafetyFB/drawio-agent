@@ -1,4 +1,4 @@
-# drawio-harness
+# drawio-agent
 
 一个 Draw.io AI 画图 agent：**浏览器是主入口**，本地 chat + 工具调用
 （read / edit / draw / check / view / layout），唯一工件是磁盘上一个规范
@@ -58,8 +58,8 @@ cargo test -p drawio-agent-renderer --test chromium_integration -- --ignored   #
 ## 用法（Web 主入口）
 
 ```bash
-cargo run -p drawio-harness -- web       # http://127.0.0.1:8787
-cargo run -p drawio-harness -- web 4000  # 自定义端口
+cargo run -p drawio-agent -- web       # http://127.0.0.1:8787
+cargo run -p drawio-agent -- web 4000  # 自定义端口
 ```
 
 打开浏览器地址即可。**会话 = 一个 `.drawio` 文件**：创建会话就是新建文件。
@@ -114,13 +114,13 @@ cargo run -p drawio-harness -- web 4000  # 自定义端口
 
 ```bash
 # 交互 REPL（无 LLM 也能用：/view /check /xml /sel /undo /save /reload）
-cargo run -p drawio-harness -- demo.drawio
+cargo run -p drawio-agent -- demo.drawio
 
 # 新建空图
-cargo run -p drawio-harness -- new demo.drawio
+cargo run -p drawio-agent -- new demo.drawio
 
 # one-shot 对话（模型自主调用工具闭环）
-cargo run -p drawio-harness -- demo.drawio "把 svc-b 改成绿色，加一条到 svc-a 的连线"
+cargo run -p drawio-agent -- demo.drawio "把 svc-b 改成绿色，加一条到 svc-a 的连线"
 ```
 
 REPL 常用命令：`/history`（`/history N` 看轨迹）`/ctx-save x.json`

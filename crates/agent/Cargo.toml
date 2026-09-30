@@ -1,10 +1,10 @@
 [package]
-name = "drawio-harness"
+name = "drawio-agent"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Minimal drawio agent harness: one canonical xml file + @file-style refs + edit/view tools"
+description = "Draw.io AI agent: canonical xml file + tool loop (web entry + CLI)"
 
 [dependencies]
 quick-xml = { workspace = true }

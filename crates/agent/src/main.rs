@@ -1,18 +1,18 @@
-//! REPL entry: `drawio-harness <file.drawio>` — load/expand/save one
+//! REPL entry: `drawio-agent <file.drawio>` — load/expand/save one
 //! canonical xml file, chat with the model, or drive the tools by hand.
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 use std::path::PathBuf;
-use drawio_harness::chat::{Chat, OpenAiChat};
-use drawio_harness::history::{self, HistoryRec, SessionBundle};
-use drawio_harness::engine::Harness;
-use drawio_harness::turn_loop::HarnessRunExt;
-use drawio_harness::refs;
-use drawio_harness::tools::Tools;
-use drawio_harness::xmlfile::{lines_in, XmlDoc};
+use drawio_agent::chat::{Chat, OpenAiChat};
+use drawio_agent::history::{self, HistoryRec, SessionBundle};
+use drawio_agent::engine::Harness;
+use drawio_agent::turn_loop::HarnessRunExt;
+use drawio_agent::refs;
+use drawio_agent::tools::Tools;
+use drawio_agent::xmlfile::{lines_in, XmlDoc};
 
-const HELP: &str = r#"drawio-harness REPL 命令：
+const HELP: &str = r#"drawio-agent REPL 命令：
   /view            渲染当前文件为 PNG 并打开（需 chromium）
   /check           确定性校验（结构 + 布局 lint 摘要）
   /xml [spec]      打印文件行（spec: 行号 / cell:id / @file:lines）
@@ -86,7 +86,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!(
-            "用法:\n  drawio-harness <file> [one-shot 消息…]      本地 REPL\n  drawio-harness new <file>                       创建空图\n  drawio-harness web [port]                       浏览器入口：会话=文件 (默认 8787)\n  drawio-harness config show|set|clear|path      查看/保存 LLM 配置"
+            "用法:\n  drawio-agent <file> [one-shot 消息…]      本地 REPL\n  drawio-agent new <file>                       创建空图\n  drawio-agent web [port]                       浏览器入口：会话=文件 (默认 8787)\n  drawio-agent config show|set|clear|path      查看/保存 LLM 配置"
         );
         exit_clean(2);
     }
@@ -97,11 +97,11 @@ fn main() {
 
     if args[0] == "metrics" {
         let Some(path) = args.get(1) else {
-            eprintln!("用法: drawio-harness metrics <file.drawio>");
+            eprintln!("用法: drawio-agent metrics <file.drawio>");
             exit_clean(2);
         };
         match std::fs::read_to_string(path) {
-            Ok(xml) => match drawio_harness::metrics::analyze(&xml) {
+            Ok(xml) => match drawio_agent::metrics::analyze(&xml) {
                 Ok(report) => {
                     let mut out = serde_json::json!({
                         "stats": report.stats,
@@ -164,7 +164,7 @@ fn main() {
     }
 
     if args[0] == "web" {
-        // drawio-harness web [port]
+        // drawio-agent web [port]
         // 会话目录不再对外暴露：统一在 ~/.drawio-agent/files（DRAWIO_DIR
         // 仅作测试用内部开关，不写入文档）。
         let mut port = 8787u16;
@@ -181,14 +181,14 @@ fn main() {
             .ok()
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                drawio_harness::config::home_dir()
+                drawio_agent::config::home_dir()
                     .unwrap_or_default()
                     .join(".drawio-agent")
                     .join("files")
             });
-        // 老版本把会话放在 ~/.drawio-harness/files：一次性迁到统一目录
+        // 老版本把会话放在 ~/.drawio-agent/files：一次性迁到统一目录
         if !dir.exists() {
-            if let Some(home) = drawio_harness::config::home_dir() {
+            if let Some(home) = drawio_agent::config::home_dir() {
                 let legacy = home.join(".drawio-harness").join("files");
                 if legacy.is_dir() {
                     if let Some(parent) = dir.parent() {
@@ -209,7 +209,7 @@ fn main() {
                 }
             }
         }
-        if let Err(e) = rt.block_on(drawio_harness::web::serve(dir, port)) {
+        if let Err(e) = rt.block_on(drawio_agent::web::serve(dir, port)) {
             eprintln!("{e}");
             exit_clean(1);
         }
@@ -217,14 +217,14 @@ fn main() {
     }
 
     let (path, one_shot_args) = if args[0] == "new" {
-        // drawio-harness new <file> [one-shot 消息…]
+        // drawio-agent new <file> [one-shot 消息…]
         let Some(file) = args.get(1) else {
-            eprintln!("用法: drawio-harness new <file>");
+            eprintln!("用法: drawio-agent new <file>");
             exit_clean(2);
         };
         let path = PathBuf::from(file);
         if !path.exists() {
-            if let Err(e) = std::fs::write(&path, drawio_harness::EMPTY_TEMPLATE) {
+            if let Err(e) = std::fs::write(&path, drawio_agent::EMPTY_TEMPLATE) {
                 eprintln!("写文件失败: {e}");
                 exit_clean(1);
             }
@@ -238,7 +238,7 @@ fn main() {
 
     if !path.exists() {
         eprintln!(
-            "文件不存在: {}。\n  先创建空图: cargo run -p drawio-harness -- new {}",
+            "文件不存在: {}。\n  先创建空图: cargo run -p drawio-agent -- new {}",
             path.display(),
             path.display()
         );
@@ -268,7 +268,7 @@ fn main() {
 
     let chat: Option<OpenAiChat> = OpenAiChat::from_effective().ok();
     if chat.is_none() {
-        println!("提示: LLM 未配置。配置方式: drawio-harness config set --base-url … --model …，或用 DRAWIO_LLM_BASE_URL / DRAWIO_LLM_MODEL / DRAWIO_LLM_API_KEY 环境变量。当前进入本地工具模式（/view /check /xml /sel 仍可用）。");
+        println!("提示: LLM 未配置。配置方式: drawio-agent config set --base-url … --model …，或用 DRAWIO_LLM_BASE_URL / DRAWIO_LLM_MODEL / DRAWIO_LLM_API_KEY 环境变量。当前进入本地工具模式（/view /check /xml /sel 仍可用）。");
     }
 
     // ---- R4: interactive REPL with live trace + /stop -------------------
@@ -278,14 +278,14 @@ fn main() {
     let repl = Arc::new(tokio::sync::Mutex::new(ReplSession {
         harness: {
             let mut h = Harness::default();
-            if let Some(cfg) = drawio_harness::config::effective_settings() {
+            if let Some(cfg) = drawio_agent::config::effective_settings() {
                 h.max_turns = cfg.max_turns.max(1);
             }
             h
         },
         tools: Tools::new(true),
         doc,
-        usage: drawio_harness::SessionStats::default(),
+        usage: drawio_agent::SessionStats::default(),
         pending_ctx: String::new(),
         chat: chat.map(|c| Box::new(c) as Box<dyn Chat>),
     }));
@@ -302,7 +302,7 @@ fn main() {
         return;
     }
 
-    let (tx, rx) = std::sync::mpsc::channel::<Result<drawio_harness::TurnOutcome, String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<drawio_agent::TurnOutcome, String>>();
     let mut running: bool = false;
     let mut abort: Option<tokio::task::AbortHandle> = None;
     let mut stdin = std::io::stdin().lock();
@@ -590,7 +590,7 @@ fn main() {
                             }
                         }
                         r.usage.transcript = SessionBundle::strip_images(&bundle.messages);
-                        r.usage.usage = drawio_harness::chat::Usage {
+                        r.usage.usage = drawio_agent::chat::Usage {
                             input_tokens: bundle.usage_in,
                             output_tokens: bundle.usage_out,
                         };
@@ -611,7 +611,7 @@ fn main() {
         // ---- plain text: start a chat turn in the background -------------
         let has_llm = rt.block_on(async { repl.lock().await.chat.is_some() });
         if !has_llm {
-            eprintln!("未配置 LLM。可用命令: /view /check /xml /sel /undo（或 `drawio-harness config set …`）");
+            eprintln!("未配置 LLM。可用命令: /view /check /xml /sel /undo（或 `drawio-agent config set …`）");
             continue;
         }
         let repl2 = repl.clone();
@@ -629,7 +629,7 @@ struct ReplSession {
     harness: Harness,
     tools: Tools,
     doc: XmlDoc,
-    usage: drawio_harness::SessionStats,
+    usage: drawio_agent::SessionStats,
     pending_ctx: String,
     chat: Option<Box<dyn Chat>>,
 }
@@ -639,8 +639,8 @@ async fn run_one_ask(
     repl: Arc<tokio::sync::Mutex<ReplSession>>,
     line: String,
     trace: bool,
-) -> Result<drawio_harness::TurnOutcome, String> {
-    use drawio_harness::engine::EngineEvent;
+) -> Result<drawio_agent::TurnOutcome, String> {
+    use drawio_agent::engine::EngineEvent;
     let mut r = repl.lock().await;
     let ctx = std::mem::take(&mut r.pending_ctx);
     let ctx = if ctx.is_empty() {
@@ -652,10 +652,10 @@ async fn run_one_ask(
     } else {
         ctx
     };
-    let cfg = drawio_harness::config::effective_settings().unwrap_or_default();
+    let cfg = drawio_agent::config::effective_settings().unwrap_or_default();
     let budget = cfg.budget_yuan;
     let opts = {
-        let mut o = drawio_harness::RunOpts::from_settings(&cfg);
+        let mut o = drawio_agent::RunOpts::from_settings(&cfg);
         o.legacy_viewer = !drawio_agent_renderer::drawio_app_cached();
         if let Some(b) = budget {
             o.budget_remaining = (b - r.usage.cost_yuan).max(0.0);
@@ -667,7 +667,7 @@ async fn run_one_ask(
     }
     let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
     let events_cb = events.clone();
-    let progress: Option<drawio_harness::engine::ProgressFn> = Some(Arc::new(move |ev: EngineEvent| {
+    let progress: Option<drawio_agent::engine::ProgressFn> = Some(Arc::new(move |ev: EngineEvent| {
         let evj = match &ev {
             EngineEvent::Turn { index } => serde_json::json!({ "type": "turn", "index": index }),
             EngineEvent::ModelOutput { raw } => serde_json::json!({ "type": "model", "preview": raw.chars().take(300).collect::<String>() }),
@@ -744,7 +744,7 @@ async fn run_one_ask(
     outcome
 }
 
-fn print_turn_result(res: &Result<drawio_harness::TurnOutcome, String>) {
+fn print_turn_result(res: &Result<drawio_agent::TurnOutcome, String>) {
     match res {
         Ok(outcome) => {
             if !outcome.reply.is_empty() {
@@ -766,11 +766,11 @@ fn print_turn_result(res: &Result<drawio_harness::TurnOutcome, String>) {
 }
 
 // ---------------------------------------------------------------------------
-// `drawio-harness config` subcommand
+// `drawio-agent config` subcommand
 // ---------------------------------------------------------------------------
 
 fn config_cli(args: &[String]) {
-    use drawio_harness::config;
+    use drawio_agent::config;
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("show");
     match cmd {
         "show" => match config::effective_settings() {
@@ -795,7 +795,7 @@ fn config_cli(args: &[String]) {
                 println!("budget:   {:?}", s.budget_yuan);
             }
             None => {
-                eprintln!("未配置 LLM。保存方式: drawio-harness config set --base-url <url> --model <model> [--api-key <key>]");
+                eprintln!("未配置 LLM。保存方式: drawio-agent config set --base-url <url> --model <model> [--api-key <key>]");
                 exit_clean(1);
             }
         },
@@ -878,9 +878,9 @@ fn config_cli(args: &[String]) {
                 s.context_length = context_length;
             }
             if no_think {
-                s.thinking = drawio_harness::ThinkingMode::NoThink;
+                s.thinking = drawio_agent::ThinkingMode::NoThink;
             } else if args.iter().any(|a| a == "--think-default") {
-                s.thinking = drawio_harness::ThinkingMode::Default;
+                s.thinking = drawio_agent::ThinkingMode::Default;
             }
             if let Some(v) = price_in {
                 s.price_input_per_m = v;

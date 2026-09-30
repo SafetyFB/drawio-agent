@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/renderer",
-    "crates/harness",
+    "crates/agent",
 ]
 
 [workspace.package]

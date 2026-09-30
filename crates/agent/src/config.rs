@@ -204,7 +204,7 @@ pub fn effective_source() -> ConfigSource {
 
 /// Guidance shown whenever an LLM call is attempted while unconfigured.
 pub const UNCONFIGURED_MSG: &str = "LLM 未配置：在网页右上角 ⚙ 里填写并保存，或运行 \
-    `drawio-harness config set --base-url … --model …`，或用环境变量 \
+    `drawio-agent config set --base-url … --model …`，或用环境变量 \
     DRAWIO_LLM_BASE_URL / DRAWIO_LLM_MODEL / DRAWIO_LLM_API_KEY";
 
 #[cfg(test)]
@@ -213,7 +213,7 @@ mod tests {
 
     fn tmpfile(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "drawio-harness-cfg-{tag}-{}.json",
+            "drawio-agent-cfg-{tag}-{}.json",
             std::process::id()
         ))
     }
