@@ -1,4 +1,4 @@
-/* drawio harness web shell — mxGraph canvas + selection + one chat.
+/* drawio-agent web shell — mxGraph canvas + selection + one chat.
    Canvas patterns (embed / codec / marquee / bundle patches) are lifted
    from the old server UI and trimmed to this single-file workflow. */
 'use strict';
@@ -1117,7 +1117,7 @@ async function loadState() {
   if (st.build) {
     const b = $('build');
     if (b) b.textContent = st.build;
-    console.log('[drawio-harness] build:', st.build);
+    console.log('[drawio-agent] build:', st.build);
   }
   const cells = $('cells');
   if (cells) cells.textContent = st.cells != null ? `${st.cells} 个元素 / ${st.lines} 行` : '–';
