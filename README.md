@@ -1,5 +1,16 @@
 # drawio-agent
 
+<div align="center">
+
+### 🎓 2026-2027 学年夏季学期《程序设计训练》大作业
+
+**主要学习目标：使用 coding agent 完成一个完整项目的全过程**
+需求、设计与验收由人把关；代码（含测试与文档）主要由 coding agent 生成与迭代。
+
+</div>
+
+---
+
 一个 Draw.io AI 画图 agent：**浏览器是主入口**，本地 chat + 工具调用
 （read / edit / draw / check / view / layout），唯一工件是磁盘上一个规范
 pretty-print 的 `.drawio` 文件。局部性靠「文件 + 行区间文本编辑 + @file
